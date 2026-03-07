@@ -34,6 +34,27 @@ Operate in semi-automation mode by default:
 
 Never skip final human review for live posting.
 
+## Token efficiency policy (mandatory)
+
+Spend reasoning tokens only on high-leverage steps.
+
+- **High-token (deep reasoning required):**
+  - Thesis/angle selection
+  - Multi-source synthesis and contradiction handling
+  - Framework design and judgment calls
+  - Final quality/risk tradeoff decisions
+
+- **Low-token (use existing capability/templates first):**
+  - Bundle initialization and file scaffolding
+  - Format conversion (master → WeChat/XHS)
+  - Repetitive packaging blocks (titles, comment templates, source list skeleton)
+  - Deterministic checklist validation
+
+Execution rule:
+1) Reuse existing scripts/templates/references first.
+2) Avoid regenerating sections that can be copied or transformed.
+3) Escalate to deep reasoning only when output quality would materially improve.
+
 ## Workflow
 
 Use this sequence every time.

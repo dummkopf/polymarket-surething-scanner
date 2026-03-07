@@ -49,3 +49,27 @@ User explicitly corrected: do not ask “if you want, I can also...”. For recu
 - Tags: correction, execution-default, profit-maximization, no-option-friction
 
 ---
+## [LRN-20260307-003] correction
+
+**Logged**: 2026-03-07T23:16:00+08:00
+**Priority**: high
+**Status**: pending
+**Area**: docs
+
+### Summary
+Use token budget intentionally: small tasks should use existing capabilities, deep LLM reasoning should be reserved for high-value decisions.
+
+### Details
+User explicitly requested token optimization: call existing capabilities for trivial work and spend LLM tokens on high-quality reasoning only.
+
+### Suggested Action
+1. Apply a token routing policy (low-token vs high-token tasks).
+2. Default to templates/scripts for repetitive operations.
+3. Use deep reasoning only for synthesis, judgment, and quality-critical decisions.
+
+### Metadata
+- Source: user_feedback
+- Related Files: skills/wechat-deep-article-pipeline/SKILL.md
+- Tags: correction, token-efficiency, reasoning-budget, execution-policy
+
+---
