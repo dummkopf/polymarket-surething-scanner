@@ -2,8 +2,8 @@
 
 ## Daily: Morning Reflection for Kai
 
-- Time window: 08:30–10:30 (Asia/Shanghai)
-- If not sent today, send one concise "晨间反思" update.
+- Fixed send time: 08:00 (Asia/Shanghai)
+- Send one concise "晨间反思" at 08:00 each day; if missed, send at next heartbeat before 09:00.
 - Format:
   1) 昨日关键结果
   2) 做对了什么 / 做错了什么
