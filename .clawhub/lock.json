@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "skills": {
+    "self-improving-agent": {
+      "version": "1.0.11",
+      "installedAt": 1772890355872
+    },
+    "find-skills": {
+      "version": "0.1.0",
+      "installedAt": 1772890357882
+    },
+    "skill-creator": {
+      "version": "0.1.0",
+      "installedAt": 1772890367253
+    },
+    "wechat-mp-writer-skill-mxx": {
+      "version": "1.0.0",
+      "installedAt": 1772895359561
+    },
+    "wechat-publisher": {
+      "version": "0.1.0",
+      "installedAt": 1772895362617
+    },
+    "markdown-publish-share": {
+      "version": "1.0.5",
+      "installedAt": 1772895376240
+    },
+    "xiaohongshu-publish": {
+      "version": "1.0.0",
+      "installedAt": 1772895378946
+    },
+    "wechat-mp-cn": {
+      "version": "1.0.0",
+      "installedAt": 1772895381689
+    }
+  }
+}
