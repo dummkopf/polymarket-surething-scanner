@@ -25,3 +25,27 @@ Prepare and deliver a concise morning report with:
 - Tags: morning-log, reflection, adaptation, improvement
 
 ---
+## [LRN-20260307-002] correction
+
+**Logged**: 2026-03-07T23:02:00+08:00
+**Priority**: high
+**Status**: pending
+**Area**: docs
+
+### Summary
+When proposing strategy options, default to profit-maximizing execution instead of asking optional preference questions.
+
+### Details
+User explicitly corrected: do not ask “if you want, I can also...”. For recurring content decisions, choose the option with the highest expected business upside and execute directly.
+
+### Suggested Action
+1. Default to "reflect -> execute" closure loop.
+2. Auto-produce a sharper propagation variant alongside base longform when it improves reach/conversion potential.
+3. Ask only when risk is irreversible, sensitive, or externally destructive.
+
+### Metadata
+- Source: user_feedback
+- Related Files: output/2026-03-08-ai-delivery-acceptance-v2/wechat-controversial.md
+- Tags: correction, execution-default, profit-maximization, no-option-friction
+
+---

@@ -19,6 +19,7 @@ Always enforce these rules:
 6. Run **fact check + tone check** before handoff.
 7. Output in **Markdown master draft** first, then repurpose.
 8. Provide image plan: **1 cover + 2–4 body images** (prefer chart/flow diagrams).
+9. By default, also generate a **sharper / more controversial propagation variant** if it increases expected reach or conversion.
 
 For detailed checks, read `references/quality-gates.md`.
 For writing tone and rhythm, read `references/style-guide.md`.
@@ -126,6 +127,7 @@ Always provide all of the following (unless user explicitly opts out):
 - First comment + 5 reply templates
 - Source list (with URLs)
 - Image plan (cover + 2–4 body images)
+- Sharper/controversial propagation variant (WeChat + Xiaohongshu)
 - A/B angle suggestion for next iteration
 
 ## Iteration rule (run-to-rule)

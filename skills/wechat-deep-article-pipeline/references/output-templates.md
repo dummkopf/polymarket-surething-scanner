@@ -131,3 +131,26 @@ Use these templates to keep output stable across runs.
    Purpose:
    Prompt:
 ```
+
+## G) Controversial propagation variant template
+
+```markdown
+## Contrarian claim
+[Strong, testable, slightly controversial core claim]
+
+## Stakes
+[What teams lose if they ignore this]
+
+## 3 hard judgments
+1.
+2.
+3.
+
+## Immediate execution checklist
+- [ ]
+- [ ]
+- [ ]
+
+## CTA
+[Low-friction conversion CTA]
+```

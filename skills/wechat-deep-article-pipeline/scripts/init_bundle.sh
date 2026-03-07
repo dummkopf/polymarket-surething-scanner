@@ -122,5 +122,29 @@ cat >"$out_dir/sources.md" <<'EOF'
 3.
 EOF
 
+cat >"$out_dir/wechat-controversial.md" <<'EOF'
+# [争议传播版标题]
+
+[强判断开场]
+
+[3个硬判断]
+
+[立即可执行动作]
+
+[CTA]
+EOF
+
+cat >"$out_dir/xiaohongshu-controversial.md" <<'EOF'
+[争议钩子]
+
+[3-5个高冲突观点]
+
+[行动建议]
+
+[CTA]
+
+#标签A #标签B #标签C
+EOF
+
 echo "Initialized article bundle at: $out_dir"
 ls -1 "$out_dir"
