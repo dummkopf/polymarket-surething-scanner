@@ -55,14 +55,14 @@
       <div class="card">
         <h3 style="margin-top:0">Fresh 持仓明细</h3>
         <table>
-          <thead><tr><th>Market</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Opened</th></tr></thead>
+          <thead><tr><th>City</th><th>Market</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Rationale</th><th>Opened</th></tr></thead>
           <tbody id="positionsBody"></tbody>
         </table>
       </div>
       <div class="card">
         <h3 style="margin-top:0">最新信号</h3>
         <table>
-          <thead><tr><th>Slug</th><th>Side</th><th>Price</th><th>Prob</th><th>Edge</th></tr></thead>
+          <thead><tr><th>City</th><th>Slug</th><th>Side</th><th>Price</th><th>Prob</th><th>Edge</th><th>Rationale</th></tr></thead>
           <tbody id="signalsBody"></tbody>
         </table>
       </div>
@@ -124,19 +124,21 @@ async function refreshAll(){
     document.getElementById('lastRun').textContent=fmtTime(state.last_run);
 
     const pb=document.getElementById('positionsBody'); pb.innerHTML='';
-    if(!open.length) pb.innerHTML='<tr><td colspan="8" class="muted">暂无 fresh 持仓</td></tr>';
+    if(!open.length) pb.innerHTML='<tr><td colspan="10" class="muted">暂无 fresh 持仓</td></tr>';
     open.forEach(p=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td title="${p.question||''}">${p.city_slug||''} ${p.target_date||''}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td>${fmtTime(p.opened_at)}</td>`;
+      const rationale = `edge=${fmt(p.edge,4)} | model_p=${fmt(p.model_prob,4)} | liq=${fmt(p.liquidity,0)} | spread=${fmt(p.yes_spread,4)}`;
+      tr.innerHTML=`<td>${p.city_slug||'-'}</td><td title="${p.question||''}">${p.target_date||''}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
       pb.appendChild(tr);
     });
 
     const sb=document.getElementById('signalsBody'); sb.innerHTML='';
     const sigs=(latest&&latest.signals)?latest.signals:[];
-    if(!sigs.length) sb.innerHTML='<tr><td colspan="5" class="muted">无新信号</td></tr>';
+    if(!sigs.length) sb.innerHTML='<tr><td colspan="7" class="muted">无新信号</td></tr>';
     sigs.forEach(s=>{
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td>${s.slug||''}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td>`;
+      const rationale = `edge=${fmt(s.edge,4)} | p=${fmt(s.side_prob,4)} | liq=${fmt(s.liquidity,0)} | spread=${fmt(s.yes_spread,4)}`;
+      tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${s.slug||''}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
       sb.appendChild(tr);
     });
 
