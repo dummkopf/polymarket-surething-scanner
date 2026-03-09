@@ -1,7 +1,18 @@
+# runtime/state artifacts
 state/*.json
 state/*.jsonl
 state/*.log
 state/*.pid
 !state/.gitkeep
+
+# python cache
 __pycache__/
 *.pyc
+
+# local secrets
+.env
+.env.*
+!.env.example
+credentials/
+*.pem
+*.key

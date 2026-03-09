@@ -98,6 +98,22 @@ Optional env overrides when starting:
 INTERVAL_SEC=120 MIN_HOURS_TO_EXPIRY=0 ./scripts/monitor_ctl.sh restart
 ```
 
+## GitHub publish safety (no env leaks)
+
+Before push:
+
+- Secrets stay in `/home/kai/.openclaw/credentials/polymarket.env` (outside repo)
+- `.env` / `.env.*` / key files are ignored by `.gitignore`
+- Runtime files under `state/*.json` and `state/*.jsonl` are ignored
+- Optional template: `.env.example`
+
+Quick check:
+
+```bash
+git status --short
+# ensure no .env / credentials / state/*.json is staged
+```
+
 ## Backtest status
 
 A robust historical backtest needs historical orderbook/quote time series at entry timestamps.
