@@ -846,9 +846,17 @@ def main() -> None:
         action="store_true",
         help="Apply paper position open/close updates (default: scan only)",
     )
+    parser.add_argument(
+        "--min-hours-to-expiry",
+        type=float,
+        default=None,
+        help="Override expiry buffer in hours (default: Config.min_hours_to_expiry)",
+    )
     args = parser.parse_args()
 
     config = Config()
+    if args.min_hours_to_expiry is not None:
+        config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
 
     env_path = Path(args.env)
     state_path = Path(args.state)
@@ -895,6 +903,9 @@ def main() -> None:
     summary = summarize(signals, state, counters, apply_result, closed_new)
     summary["env_missing_keys"] = missing
     summary["apply_mode"] = bool(args.apply)
+    summary["config"] = {
+        "min_hours_to_expiry": config.min_hours_to_expiry,
+    }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

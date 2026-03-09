@@ -43,6 +43,12 @@ Dry run (scan only):
 python3 paper_runner.py
 ```
 
+Allow paper entries even near expiry (override default 12h buffer):
+
+```bash
+python3 paper_runner.py --apply --min-hours-to-expiry 0
+```
+
 Custom files:
 
 ```bash
@@ -57,6 +63,40 @@ python3 paper_runner.py \
 
 - `state/paper_state.json`: open/closed paper positions and PnL
 - `state/snapshots.jsonl`: market+model snapshots for later replay/backtest
+- `state/monitor.log`: continuous monitor runtime log
+
+## Local dashboard
+
+Open in browser:
+
+```bash
+cd /home/kai/.openclaw/workspace/ops/polymarket-weather-bot
+python3 -m http.server 8787 --bind 127.0.0.1
+# then visit http://localhost:8787/portal.html
+```
+
+## Continuous monitor (paper)
+
+Control script:
+
+```bash
+cd /home/kai/.openclaw/workspace/ops/polymarket-weather-bot
+./scripts/monitor_ctl.sh start
+./scripts/monitor_ctl.sh status
+./scripts/monitor_ctl.sh logs 120
+./scripts/monitor_ctl.sh stop
+```
+
+Default behavior:
+- interval: every 300s
+- apply mode: on (`--apply`)
+- expiry buffer override: `min_hours_to_expiry=0` (paper can still open near expiry)
+
+Optional env overrides when starting:
+
+```bash
+INTERVAL_SEC=120 MIN_HOURS_TO_EXPIRY=0 ./scripts/monitor_ctl.sh restart
+```
 
 ## Backtest status
 
