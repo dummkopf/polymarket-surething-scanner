@@ -658,6 +658,28 @@ def close_expired_positions(state: Dict[str, Any], market_map: Dict[str, Dict[st
     return closed_new
 
 
+def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict[str, Any]]) -> None:
+    ts = iso_now()
+    for p in state.get("open_positions", []):
+        slug = p.get("slug")
+        side = p.get("side")
+        shares = float(p.get("shares", 0.0))
+        entry = float(p.get("entry_price", 0.0))
+
+        m = market_map.get(slug)
+        px = current_price_for_side(m, side) if m else None
+        if px is None:
+            p["mark_price"] = None
+            p["unrealized_pnl_usd"] = None
+            p["mark_updated_at"] = ts
+            continue
+
+        pnl = shares * (px - entry)
+        p["mark_price"] = round(px, 6)
+        p["unrealized_pnl_usd"] = round(pnl, 6)
+        p["mark_updated_at"] = ts
+
+
 def select_signals_for_opening(signals: List[Signal], config: Config, slots_total: int) -> List[Signal]:
     if slots_total <= 0:
         return []
@@ -882,6 +904,8 @@ def main() -> None:
             "realized_today": calc_realized_today(state.get("closed_positions", []), today_cn_str()),
             "unrealized": calc_unrealized(state.get("open_positions", []), market_map),
         }
+
+    update_open_position_marks(state, market_map)
 
     state["last_run"] = iso_now()
     state["last_note"] = {
