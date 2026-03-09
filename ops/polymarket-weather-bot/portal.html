@@ -157,29 +157,45 @@ async function refreshAll(){
       sb.appendChild(tr);
     });
 
-    // Under-radar watchlist: from persisted confirm counters, regardless of quality pass.
+    // Under-radar watchlist: prefer latest full-universe radar from snapshot.
     const rb=document.getElementById('radarBody'); rb.innerHTML='';
-    const confirmMap=(state && state.signal_confirm_counts) ? state.signal_confirm_counts : {};
     const liveSignalSet=new Set(sigs.map(s=>`${s.slug}|${s.side||''}`));
-    const radarRows=Object.entries(confirmMap)
-      .map(([k,v])=>{
-        const [slug,side]=k.split('|');
-        return {slug, side:side||'-', confirm:Number(v)||0, city:cityFromSlug(slug)};
-      })
-      .sort((a,b)=>b.confirm-a.confirm)
-      .slice(0,20);
+    let radarRows=[];
+
+    if(latest && Array.isArray(latest.radar) && latest.radar.length){
+      radarRows = latest.radar.slice(0,50).map(r=>({
+        slug:r.slug,
+        side:r.side||'-',
+        city:r.city_slug||cityFromSlug(r.slug),
+        confirm:'-',
+        status:r.status || (liveSignalSet.has(`${r.slug}|${r.side||''}`)?'quality-pass':'watch-only'),
+        brief:r.brief || `edge=${fmt(r.edge,4)} | p=${fmt(r.side_prob,4)} | liq=${fmt(r.liquidity,0)} | spread=${fmt(r.yes_spread,4)}`,
+      }));
+    } else {
+      const confirmMap=(state && state.signal_confirm_counts) ? state.signal_confirm_counts : {};
+      radarRows=Object.entries(confirmMap)
+        .map(([k,v])=>{
+          const [slug,side]=k.split('|');
+          const inSignal=liveSignalSet.has(`${slug}|${side||''}`);
+          return {
+            slug,
+            side:side||'-',
+            city:cityFromSlug(slug),
+            confirm:Number(v)||0,
+            status: inSignal?'quality-pass':'watch-only',
+            brief: inSignal ? '当前已达质量阈值，可执行' : '仍在观察：未达质量阈值或当期无可执行价格',
+          };
+        })
+        .sort((a,b)=>b.confirm-a.confirm)
+        .slice(0,50);
+    }
 
     if(!radarRows.length){
       rb.innerHTML='<tr><td colspan="6" class="muted">暂无 radar 候选</td></tr>';
     } else {
       radarRows.forEach(r=>{
         const tr=document.createElement('tr');
-        const inSignal=liveSignalSet.has(`${r.slug}|${r.side}`);
-        const status=inSignal?'quality-pass':'watch-only';
-        const brief=inSignal
-          ? '当前已达质量阈值，可执行'
-          : '仍在观察：未达质量阈值或当期无可执行价格';
-        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${inSignal?'ok':'warn'}">${status}</td><td>${brief}</td>`;
+        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
         rb.appendChild(tr);
       });
     }

@@ -399,7 +399,7 @@ def market_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
     return yes_bid, yes_ask, yes_spread, no_px
 
 
-def build_signals(config: Config) -> Tuple[List[Signal], Dict[str, Dict[str, Any]], Dict[str, int]]:
+def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
     market_map: Dict[str, Dict[str, Any]] = {}
@@ -415,6 +415,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], Dict[str, Dict[str, Any
     }
 
     signals: List[Signal] = []
+    radar_rows: List[Dict[str, Any]] = []
     slugs = fetch_weather_slugs(config.request_timeout_sec)
     counters["total_slugs"] = len(slugs)
 
@@ -484,11 +485,35 @@ def build_signals(config: Config) -> Tuple[List[Signal], Dict[str, Dict[str, Any
             side_price = no_price
             edge = no_edge
 
+        category = None
         if side_prob >= config.core_prob_min and edge >= config.core_edge_min:
             category = "core"
         elif side_prob <= config.tail_prob_max and edge >= config.tail_edge_min and side_price <= config.tail_price_max:
             category = "tail"
-        else:
+
+        radar_rows.append(
+            {
+                "slug": slug,
+                "question": str(market.get("question") or ""),
+                "city_slug": parsed.city_slug,
+                "target_date": parsed.target_date,
+                "side": side,
+                "side_prob": round(side_prob, 6),
+                "side_price": round(side_price, 6),
+                "edge": round(edge, 6),
+                "liquidity": round(liquidity, 6),
+                "yes_spread": None if yes_spread is None else round(yes_spread, 6),
+                "end_date": end_date_raw,
+                "status": "quality-pass" if category else "watch-only",
+                "brief": (
+                    "meets quality gates"
+                    if category
+                    else "reliable weather+odds, but below quality threshold"
+                ),
+            }
+        )
+
+        if not category:
             continue
 
         counters["quality_pass"] += 1
@@ -518,7 +543,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], Dict[str, Dict[str, Any
     counters["signals"] = len(signals)
 
     signals.sort(key=lambda s: s.edge, reverse=True)
-    return signals, market_map, counters
+    radar_rows.sort(key=lambda r: float(r.get("edge", 0.0)), reverse=True)
+    return signals, radar_rows, market_map, counters
 
 
 def load_state(path: Path) -> Dict[str, Any]:
@@ -1193,7 +1219,7 @@ def main() -> None:
     env_map = load_env(env_path) if env_path.exists() else {}
     missing = validate_env_has_trading_keys(env_map)
 
-    signals, market_map, counters = build_signals(config)
+    signals, radar_rows, market_map, counters = build_signals(config)
 
     state = load_state(state_path)
     update_signal_confirm_counts(state, signals)
@@ -1233,6 +1259,7 @@ def main() -> None:
         "ts": iso_now(),
         "scan": counters,
         "signals": [asdict(s) for s in signals],
+        "radar": radar_rows,
     }
     append_snapshot(snapshot_path, snapshot_payload)
 
