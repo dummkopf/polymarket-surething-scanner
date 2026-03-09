@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket Weather Portal</title>
+  <style>
+    :root { --bg:#0b1020; --card:#121a33; --text:#e8edff; --muted:#9fb0e0; --ok:#1ec98f; --warn:#ffcc66; --bad:#ff6b6b; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    .wrap { max-width:1200px; margin:0 auto; padding:20px; }
+    h1 { margin:0 0 8px; }
+    .muted { color:var(--muted); font-size:14px; }
+    .grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:12px; margin:16px 0 20px; }
+    .card { background:var(--card); border-radius:12px; padding:14px; border:1px solid rgba(255,255,255,.08); }
+    .k { color:var(--muted); font-size:12px; }
+    .v { font-size:24px; margin-top:6px; font-weight:700; }
+    .ok{ color:var(--ok);} .bad{ color:var(--bad);} .warn{ color:var(--warn);} 
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }
+    th { color:var(--muted); font-weight:600; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    button { background:#2a3a6d; color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    @media (max-width: 900px){ .grid{ grid-template-columns:1fr 1fr; } .row{ grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Polymarket Weather Monitoring Portal</h1>
+    <div class="muted">本地只读监控 | 数据源: <code>state/paper_state.json</code> + <code>state/snapshots.jsonl</code></div>
+    <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+      <button onclick="refreshAll()">手动刷新</button>
+      <label class="muted"><input id="auto" type="checkbox" checked /> 自动刷新(30s)</label>
+      <span id="status" class="muted"></span>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="k">Open Positions</div><div id="openPositions" class="v">-</div></div>
+      <div class="card"><div class="k">Open Exposure (USD)</div><div id="openExposure" class="v">-</div></div>
+      <div class="card"><div class="k">Unrealized PnL (USD)</div><div id="unrealized" class="v">-</div></div>
+      <div class="card"><div class="k">Signals (Latest Scan)</div><div id="signals" class="v">-</div></div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h3>当前持仓</h3>
+        <table>
+          <thead><tr><th>Market</th><th>Side</th><th>Category</th><th>Size</th><th>Entry</th><th>Edge</th><th>End</th></tr></thead>
+          <tbody id="positionsBody"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>最新信号</h3>
+        <table>
+          <thead><tr><th>Slug</th><th>Side</th><th>Price</th><th>Prob</th><th>Edge</th><th>Liquidity</th></tr></thead>
+          <tbody id="signalsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+async function fetchJson(path){ const r=await fetch(path,{cache:'no-store'}); if(!r.ok) throw new Error(path+': '+r.status); return r.json(); }
+async function fetchText(path){ const r=await fetch(path,{cache:'no-store'}); if(!r.ok) throw new Error(path+': '+r.status); return r.text(); }
+const fmt=(n,d=2)=> (n===undefined||n===null||Number.isNaN(+n))?'-':Number(n).toFixed(d);
+function clsPnl(v){ return v>0?'ok':(v<0?'bad':'warn'); }
+
+async function refreshAll(){
+  const status=document.getElementById('status');
+  status.textContent='刷新中...';
+  try {
+    const state=await fetchJson('./state/paper_state.json');
+    const raw=await fetchText('./state/snapshots.jsonl');
+    const lines=raw.trim().split('\n').filter(Boolean);
+    const latest=lines.length?JSON.parse(lines[lines.length-1]):null;
+
+    const open=state.open_positions||[];
+    const exposure=open.reduce((a,p)=>a+(+p.size_usd||0),0);
+
+    document.getElementById('openPositions').textContent=open.length;
+    document.getElementById('openExposure').textContent='$'+fmt(exposure,2);
+
+    const unreal=(latest && latest.paper)? +latest.paper.unrealized_usd : null;
+    const elUn=document.getElementById('unrealized');
+    elUn.textContent= unreal===null ? '-' : ('$'+fmt(unreal,2));
+    elUn.className='v '+(unreal===null?'':clsPnl(unreal));
+
+    document.getElementById('signals').textContent=(latest && latest.scan)? latest.scan.signals : '-';
+
+    const pb=document.getElementById('positionsBody'); pb.innerHTML='';
+    if(!open.length) pb.innerHTML='<tr><td colspan="7" class="muted">无持仓</td></tr>';
+    open.forEach(p=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td title="${p.question||''}">${p.city_slug||''} ${p.target_date||''}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.edge,4)}</td><td>${(p.end_date||'').replace('T',' ').replace('Z',' UTC')}</td>`;
+      pb.appendChild(tr);
+    });
+
+    const sb=document.getElementById('signalsBody'); sb.innerHTML='';
+    const sigs=(latest && latest.signals)? latest.signals:[];
+    if(!sigs.length) sb.innerHTML='<tr><td colspan="6" class="muted">无新信号</td></tr>';
+    sigs.forEach(s=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${s.slug||''}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td>${fmt(s.liquidity,2)}</td>`;
+      sb.appendChild(tr);
+    });
+
+    status.textContent=`已刷新：${new Date().toLocaleString()}`;
+  } catch(e){ status.textContent='刷新失败: '+e.message; }
+}
+
+refreshAll();
+setInterval(()=>{ if(document.getElementById('auto').checked) refreshAll(); }, 30000);
+</script>
+</body>
+</html>
