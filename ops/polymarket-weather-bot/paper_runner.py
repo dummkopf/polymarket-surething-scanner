@@ -86,6 +86,9 @@ class Config:
     exit_edge_floor: float = 0.01
     min_holding_minutes_for_edge_exit: int = 10
 
+    # Signal confirmation + sizing by time-to-expiry
+    confirm_ticks: int = 2
+
     request_timeout_sec: int = 20
 
 
@@ -517,6 +520,7 @@ def load_state(path: Path) -> Dict[str, Any]:
             "created_at": iso_now(),
             "open_positions": [],
             "closed_positions": [],
+            "signal_confirm_counts": {},
             "last_run": None,
             "last_note": None,
         }
@@ -745,6 +749,44 @@ def close_edge_decay_positions(
     return closed_new
 
 
+def update_signal_confirm_counts(state: Dict[str, Any], signals: List[Signal]) -> Dict[str, int]:
+    counts: Dict[str, int] = state.get("signal_confirm_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+
+    current_keys = {f"{s.slug}|{s.side}" for s in signals}
+
+    # reset keys not present in current cycle
+    for k in list(counts.keys()):
+        if k not in current_keys:
+            counts[k] = 0
+
+    # increment present keys
+    for s in signals:
+        k = f"{s.slug}|{s.side}"
+        counts[k] = int(counts.get(k, 0)) + 1
+
+    state["signal_confirm_counts"] = counts
+    return counts
+
+
+def ttl_bucket_and_multiplier(end_date_raw: str) -> Tuple[str, float]:
+    end_date = parse_iso_to_utc(end_date_raw)
+    if not end_date:
+        return "unknown", 1.0
+
+    now = datetime.now(UTC)
+    h = (end_date - now).total_seconds() / 3600
+
+    if h >= 24:
+        return "24h+", 1.0
+    if h >= 12:
+        return "12-24h", 0.7
+    if h >= 6:
+        return "6-12h", 0.4
+    return "<6h", 0.2
+
+
 def select_signals_for_opening(signals: List[Signal], config: Config, slots_total: int) -> List[Signal]:
     if slots_total <= 0:
         return []
@@ -794,18 +836,29 @@ def apply_paper_positions(
     opened = 0
     skipped_existing = 0
     blocked_by_risk = 0
+    blocked_by_confirm = 0
 
     if stop_triggered:
         return {
             "opened": 0,
             "skipped_existing": 0,
             "blocked_by_risk": len(signals),
+            "blocked_by_confirm": 0,
             "stop_triggered": True,
             "realized_today": realized_today,
             "unrealized": unrealized,
         }
 
-    picks = select_signals_for_opening(signals, config, slots_left)
+    confirm_counts: Dict[str, int] = state.get("signal_confirm_counts", {})
+    confirmed_signals: List[Signal] = []
+    for s in signals:
+        k = f"{s.slug}|{s.side}"
+        if int(confirm_counts.get(k, 0)) >= int(config.confirm_ticks):
+            confirmed_signals.append(s)
+        else:
+            blocked_by_confirm += 1
+
+    picks = select_signals_for_opening(confirmed_signals, config, slots_left)
 
     existing_keys = {(p.get("slug"), p.get("side")) for p in open_positions}
     city_counts: Dict[str, int] = {}
@@ -829,7 +882,13 @@ def apply_paper_positions(
             blocked_by_risk += 1
             continue
 
-        shares = config.trade_size_usd / s.side_price
+        ttl_bucket, ttl_mult = ttl_bucket_and_multiplier(s.end_date)
+        size_usd = float(config.trade_size_usd) * float(ttl_mult)
+        if size_usd <= 0:
+            blocked_by_risk += 1
+            continue
+
+        shares = size_usd / s.side_price
 
         pos = {
             "position_id": str(uuid.uuid4()),
@@ -841,7 +900,9 @@ def apply_paper_positions(
             "end_date": s.end_date,
             "side": s.side,
             "category": s.category,
-            "size_usd": config.trade_size_usd,
+            "size_usd": round(size_usd, 6),
+            "ttl_bucket": ttl_bucket,
+            "size_multiplier": round(ttl_mult, 4),
             "entry_price": round(s.side_price, 6),
             "shares": round(shares, 6),
             "model_prob": round(s.side_prob, 6),
@@ -865,6 +926,7 @@ def apply_paper_positions(
         "opened": opened,
         "skipped_existing": skipped_existing,
         "blocked_by_risk": blocked_by_risk,
+        "blocked_by_confirm": blocked_by_confirm,
         "stop_triggered": False,
         "realized_today": realized_today,
         "unrealized": unrealized,
@@ -904,6 +966,7 @@ def summarize(
             "closed_new_expiry": int(closed_new_expiry),
             "closed_new_edge": int(closed_new_edge),
             "opened_new": apply_result.get("opened", 0),
+            "blocked_by_confirm": apply_result.get("blocked_by_confirm", 0),
             "open_positions": len(open_positions),
             "closed_positions": len(closed_positions),
             "open_exposure_usd": round(calc_exposure(open_positions), 6),
@@ -977,6 +1040,12 @@ def main() -> None:
         default=None,
         help="Minimum holding time before edge-decay auto-close can trigger",
     )
+    parser.add_argument(
+        "--confirm-ticks",
+        type=int,
+        default=None,
+        help="Require signal persistence for N cycles before entry",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -988,6 +1057,8 @@ def main() -> None:
         config.exit_edge_floor = max(0.0, float(args.exit_edge_floor))
     if args.min_holding_minutes_for_edge_exit is not None:
         config.min_holding_minutes_for_edge_exit = max(0, int(args.min_holding_minutes_for_edge_exit))
+    if args.confirm_ticks is not None:
+        config.confirm_ticks = max(1, int(args.confirm_ticks))
 
     env_path = Path(args.env)
     state_path = Path(args.state)
@@ -999,6 +1070,7 @@ def main() -> None:
     signals, market_map, counters = build_signals(config)
 
     state = load_state(state_path)
+    update_signal_confirm_counts(state, signals)
 
     closed_new_expiry = close_expired_positions(state, market_map)
     closed_new_edge = 0
@@ -1011,6 +1083,7 @@ def main() -> None:
             "opened": 0,
             "skipped_existing": 0,
             "blocked_by_risk": 0,
+            "blocked_by_confirm": 0,
             "stop_triggered": False,
             "realized_today": calc_realized_today(state.get("closed_positions", []), today_cn_str()),
             "unrealized": calc_unrealized(state.get("open_positions", []), market_map),
@@ -1050,6 +1123,7 @@ def main() -> None:
         "max_positions_per_city": config.max_positions_per_city,
         "exit_edge_floor": config.exit_edge_floor,
         "min_holding_minutes_for_edge_exit": config.min_holding_minutes_for_edge_exit,
+        "confirm_ticks": config.confirm_ticks,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

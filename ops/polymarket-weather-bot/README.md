@@ -58,7 +58,8 @@ python3 paper_runner.py --apply \
   --min-hours-to-expiry 0 \
   --max-positions-per-city 2 \
   --exit-edge-floor 0.01 \
-  --min-holding-minutes-for-edge-exit 10
+  --min-holding-minutes-for-edge-exit 10 \
+  --confirm-ticks 2
 ```
 
 Custom files:
@@ -105,6 +106,7 @@ Default behavior:
 - expiry buffer override: `min_hours_to_expiry=0` (paper can still open near expiry)
 - city diversification: `max_positions_per_city=2`
 - edge decay auto-close: `exit_edge_floor=0.01`
+- signal persistence: `confirm_ticks=2`
 
 Optional env overrides when starting:
 
@@ -114,6 +116,7 @@ MIN_HOURS_TO_EXPIRY=0 \
 MAX_POSITIONS_PER_CITY=2 \
 EXIT_EDGE_FLOOR=0.01 \
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=10 \
+CONFIRM_TICKS=2 \
 ./scripts/monitor_ctl.sh restart
 ```
 
@@ -132,6 +135,16 @@ Quick check:
 git status --short
 # ensure no .env / credentials / state/*.json is staged
 ```
+
+## Research-informed strategy notes
+
+We continuously refine strategy using both practitioner posts (X/community) and academic market-microstructure literature.
+
+Applied takeaways currently implemented:
+- Avoid over-reacting to one-tick dislocations via `confirm_ticks` signal persistence
+- Cap concentration risk via `max_positions_per_city`
+- Enforce deterministic risk exits via `edge_decay` + expiry handling
+- Keep full replayable snapshots for pseudo-backtest and diagnostics
 
 ## Backtest status
 
