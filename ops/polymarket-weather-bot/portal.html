@@ -68,6 +68,15 @@
         </table>
       </div>
     </div>
+
+    <div class="card" style="margin-top:12px;">
+      <h3 style="margin-top:0">Under Radar（含未达质量阈值）</h3>
+      <div class="muted" style="margin-bottom:8px;">来源：signal confirm 计数。即使当前无 quality signal，也会显示持续被监控的候选。</div>
+      <table>
+        <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Confirm Ticks</th><th>Status</th><th>Brief</th></tr></thead>
+        <tbody id="radarBody"></tbody>
+      </table>
+    </div>
   </div>
 
 <script>
@@ -76,6 +85,11 @@ async function fetchText(path){ const r=await fetch(path,{cache:'no-store'}); if
 const fmt=(n,d=2)=> (n===undefined||n===null||Number.isNaN(+n))?'-':Number(n).toFixed(d);
 const fmtTime=(t)=>{ if(!t) return '-'; const d=new Date(t); return Number.isNaN(d.getTime())?String(t):d.toLocaleString(); };
 const cls=(v)=> v>0?'ok':(v<0?'bad':'warn');
+const marketUrl=(slug)=>`https://polymarket.com/market/${encodeURIComponent(slug||'')}`;
+const cityFromSlug=(slug)=>{
+  const m=(slug||'').match(/highest-temperature-in-([a-z-]+)-on-/);
+  return m?m[1]:'-';
+};
 
 function getFreshTs(){
   const x=localStorage.getItem('pm_fresh_ts');
@@ -142,6 +156,33 @@ async function refreshAll(){
       tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${s.slug||''}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
       sb.appendChild(tr);
     });
+
+    // Under-radar watchlist: from persisted confirm counters, regardless of quality pass.
+    const rb=document.getElementById('radarBody'); rb.innerHTML='';
+    const confirmMap=(state && state.signal_confirm_counts) ? state.signal_confirm_counts : {};
+    const liveSignalSet=new Set(sigs.map(s=>`${s.slug}|${s.side||''}`));
+    const radarRows=Object.entries(confirmMap)
+      .map(([k,v])=>{
+        const [slug,side]=k.split('|');
+        return {slug, side:side||'-', confirm:Number(v)||0, city:cityFromSlug(slug)};
+      })
+      .sort((a,b)=>b.confirm-a.confirm)
+      .slice(0,20);
+
+    if(!radarRows.length){
+      rb.innerHTML='<tr><td colspan="6" class="muted">暂无 radar 候选</td></tr>';
+    } else {
+      radarRows.forEach(r=>{
+        const tr=document.createElement('tr');
+        const inSignal=liveSignalSet.has(`${r.slug}|${r.side}`);
+        const status=inSignal?'quality-pass':'watch-only';
+        const brief=inSignal
+          ? '当前已达质量阈值，可执行'
+          : '仍在观察：未达质量阈值或当期无可执行价格';
+        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${inSignal?'ok':'warn'}">${status}</td><td>${brief}</td>`;
+        rb.appendChild(tr);
+      });
+    }
 
     status.textContent='已刷新：'+new Date().toLocaleString();
   }catch(e){
