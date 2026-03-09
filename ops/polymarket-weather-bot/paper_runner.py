@@ -81,6 +81,11 @@ class Config:
     tail_edge_min: float = 0.08
     tail_price_max: float = 0.20
 
+    # Portfolio/risk refinement
+    max_positions_per_city: int = 2
+    exit_edge_floor: float = 0.01
+    min_holding_minutes_for_edge_exit: int = 10
+
     request_timeout_sec: int = 20
 
 
@@ -680,6 +685,66 @@ def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict
         p["mark_updated_at"] = ts
 
 
+def close_edge_decay_positions(
+    state: Dict[str, Any],
+    signals: List[Signal],
+    market_map: Dict[str, Dict[str, Any]],
+    config: Config,
+) -> int:
+    """Close open paper positions when their same-side edge decays below a floor."""
+    now = datetime.now(UTC)
+    signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
+
+    still_open: List[Dict[str, Any]] = []
+    closed_new = 0
+
+    for p in state.get("open_positions", []):
+        slug = str(p.get("slug") or "")
+        side = str(p.get("side") or "")
+        key = (slug, side)
+
+        edge_now = signal_edge.get(key)
+        if edge_now is None:
+            still_open.append(p)
+            continue
+
+        opened_at = parse_iso_to_utc(str(p.get("opened_at") or ""))
+        held_minutes = 0.0
+        if opened_at is not None:
+            held_minutes = max(0.0, (now - opened_at).total_seconds() / 60)
+
+        if held_minutes < float(config.min_holding_minutes_for_edge_exit):
+            still_open.append(p)
+            continue
+
+        if edge_now >= float(config.exit_edge_floor):
+            still_open.append(p)
+            continue
+
+        m = market_map.get(slug)
+        px = current_price_for_side(m, side) if m else None
+        if px is None:
+            still_open.append(p)
+            continue
+
+        shares = float(p.get("shares", 0.0))
+        entry = float(p.get("entry_price", 0.0))
+        pnl = shares * (px - entry)
+
+        p2 = dict(p)
+        p2["closed_at"] = iso_now()
+        p2["settle_price"] = round(px, 6)
+        p2["realized_pnl_usd"] = round(pnl, 6)
+        p2["close_reason"] = "edge_decay"
+        p2["close_edge"] = round(edge_now, 6)
+
+        state["closed_positions"].append(p2)
+        closed_new += 1
+
+    state["open_positions"] = still_open
+    return closed_new
+
+
 def select_signals_for_opening(signals: List[Signal], config: Config, slots_total: int) -> List[Signal]:
     if slots_total <= 0:
         return []
@@ -743,11 +808,21 @@ def apply_paper_positions(
     picks = select_signals_for_opening(signals, config, slots_left)
 
     existing_keys = {(p.get("slug"), p.get("side")) for p in open_positions}
+    city_counts: Dict[str, int] = {}
+    for p in open_positions:
+        c = str(p.get("city_slug") or "")
+        if not c:
+            continue
+        city_counts[c] = city_counts.get(c, 0) + 1
 
     for s in picks:
         key = (s.slug, s.side)
         if key in existing_keys:
             skipped_existing += 1
+            continue
+
+        if city_counts.get(s.city_slug, 0) >= int(config.max_positions_per_city):
+            blocked_by_risk += 1
             continue
 
         if s.side_price <= 0:
@@ -781,6 +856,7 @@ def apply_paper_positions(
         }
         open_positions.append(pos)
         existing_keys.add(key)
+        city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
         opened += 1
 
     state["open_positions"] = open_positions
@@ -795,7 +871,14 @@ def apply_paper_positions(
     }
 
 
-def summarize(signals: List[Signal], state: Dict[str, Any], counters: Dict[str, int], apply_result: Dict[str, Any], closed_new: int) -> Dict[str, Any]:
+def summarize(
+    signals: List[Signal],
+    state: Dict[str, Any],
+    counters: Dict[str, int],
+    apply_result: Dict[str, Any],
+    closed_new_expiry: int,
+    closed_new_edge: int,
+) -> Dict[str, Any]:
     open_positions = state.get("open_positions", [])
     closed_positions = state.get("closed_positions", [])
 
@@ -817,7 +900,9 @@ def summarize(signals: List[Signal], state: Dict[str, Any], counters: Dict[str, 
             for s in signals[:10]
         ],
         "paper": {
-            "closed_new": closed_new,
+            "closed_new": int(closed_new_expiry + closed_new_edge),
+            "closed_new_expiry": int(closed_new_expiry),
+            "closed_new_edge": int(closed_new_edge),
             "opened_new": apply_result.get("opened", 0),
             "open_positions": len(open_positions),
             "closed_positions": len(closed_positions),
@@ -874,11 +959,35 @@ def main() -> None:
         default=None,
         help="Override expiry buffer in hours (default: Config.min_hours_to_expiry)",
     )
+    parser.add_argument(
+        "--max-positions-per-city",
+        type=int,
+        default=None,
+        help="Max concurrent open positions per city (default: Config.max_positions_per_city)",
+    )
+    parser.add_argument(
+        "--exit-edge-floor",
+        type=float,
+        default=None,
+        help="Close open position when same-side edge falls below this floor (default: Config.exit_edge_floor)",
+    )
+    parser.add_argument(
+        "--min-holding-minutes-for-edge-exit",
+        type=int,
+        default=None,
+        help="Minimum holding time before edge-decay auto-close can trigger",
+    )
     args = parser.parse_args()
 
     config = Config()
     if args.min_hours_to_expiry is not None:
         config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
+    if args.max_positions_per_city is not None:
+        config.max_positions_per_city = max(1, int(args.max_positions_per_city))
+    if args.exit_edge_floor is not None:
+        config.exit_edge_floor = max(0.0, float(args.exit_edge_floor))
+    if args.min_holding_minutes_for_edge_exit is not None:
+        config.min_holding_minutes_for_edge_exit = max(0, int(args.min_holding_minutes_for_edge_exit))
 
     env_path = Path(args.env)
     state_path = Path(args.state)
@@ -891,9 +1000,11 @@ def main() -> None:
 
     state = load_state(state_path)
 
-    closed_new = close_expired_positions(state, market_map)
+    closed_new_expiry = close_expired_positions(state, market_map)
+    closed_new_edge = 0
 
     if args.apply:
+        closed_new_edge = close_edge_decay_positions(state, signals, market_map, config)
         apply_result = apply_paper_positions(state, signals, market_map, config)
     else:
         apply_result = {
@@ -924,11 +1035,21 @@ def main() -> None:
     }
     append_snapshot(snapshot_path, snapshot_payload)
 
-    summary = summarize(signals, state, counters, apply_result, closed_new)
+    summary = summarize(
+        signals,
+        state,
+        counters,
+        apply_result,
+        closed_new_expiry,
+        closed_new_edge,
+    )
     summary["env_missing_keys"] = missing
     summary["apply_mode"] = bool(args.apply)
     summary["config"] = {
         "min_hours_to_expiry": config.min_hours_to_expiry,
+        "max_positions_per_city": config.max_positions_per_city,
+        "exit_edge_floor": config.exit_edge_floor,
+        "min_holding_minutes_for_edge_exit": config.min_holding_minutes_for_edge_exit,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))

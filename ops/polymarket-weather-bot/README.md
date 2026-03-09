@@ -28,7 +28,9 @@ Execution-first weather workflow for Polymarket.
 - max open exposure: `$20`
 - daily stop loss: `-$10`
 - position mix target: `70% core / 30% tail`
-- no new position when `<12h` to expiry
+- max positions per city: `2`
+- edge-decay auto-close floor: `0.01` (after min hold 10 minutes)
+- no new position when `<12h` to expiry (can override)
 
 ## Usage
 
@@ -47,6 +49,16 @@ Allow paper entries even near expiry (override default 12h buffer):
 
 ```bash
 python3 paper_runner.py --apply --min-hours-to-expiry 0
+```
+
+Tune strategy controls:
+
+```bash
+python3 paper_runner.py --apply \
+  --min-hours-to-expiry 0 \
+  --max-positions-per-city 2 \
+  --exit-edge-floor 0.01 \
+  --min-holding-minutes-for-edge-exit 10
 ```
 
 Custom files:
@@ -91,11 +103,18 @@ Default behavior:
 - interval: every 300s
 - apply mode: on (`--apply`)
 - expiry buffer override: `min_hours_to_expiry=0` (paper can still open near expiry)
+- city diversification: `max_positions_per_city=2`
+- edge decay auto-close: `exit_edge_floor=0.01`
 
 Optional env overrides when starting:
 
 ```bash
-INTERVAL_SEC=120 MIN_HOURS_TO_EXPIRY=0 ./scripts/monitor_ctl.sh restart
+INTERVAL_SEC=120 \
+MIN_HOURS_TO_EXPIRY=0 \
+MAX_POSITIONS_PER_CITY=2 \
+EXIT_EDGE_FLOOR=0.01 \
+MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=10 \
+./scripts/monitor_ctl.sh restart
 ```
 
 ## GitHub publish safety (no env leaks)
