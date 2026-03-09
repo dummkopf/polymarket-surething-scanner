@@ -49,3 +49,28 @@ Date: 2026-03-09
    - `closed_new_expiry`
    - `closed_new_edge`
 5. Monitor script can configure these controls via env overrides.
+
+## D. External Research Review (Posts + Academic)
+
+### Practitioner observations (X / community)
+- X discussion snapshots often report high win-rate weather traders, but most are survivorship-biased and promotional.
+- Practical takeaway: treat social alpha as hypothesis only; never use as direct entry trigger.
+
+Representative links:
+- https://x.com/Vlad_Web3/status/2030386653408420090
+- https://x.com/mahera777/status/2029877420078088277
+
+### Academic / structural references
+- Makers and Takers: The Economics of the Kalshi Prediction Market (UCD, 2025)
+  - points to favorite–longshot distortions and microstructure effects.
+  - https://www.ucd.ie/economics/t4media/WP2025_19.pdf
+- CEPR summary on Kalshi market economics (2026)
+  - supports time-to-close efficiency increase and behavioral mispricing persistence.
+  - https://cepr.org/voxeu/columns/economics-kalshi-prediction-market
+
+### Strategy implications from research
+1. Require signal persistence (`confirm_ticks`) before entry.
+2. Keep deterministic exits (expiry > stop/risk > edge decay).
+3. Cap concentration (city-level position ceiling).
+4. Track reason-coded closes and daily diagnostics for anti-overfit review.
+5. Avoid headline/cherry-picked wallet copytrading as a primary signal source.

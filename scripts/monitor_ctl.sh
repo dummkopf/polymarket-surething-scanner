@@ -11,6 +11,7 @@ MIN_HOURS_TO_EXPIRY="${MIN_HOURS_TO_EXPIRY:-0}"
 MAX_POSITIONS_PER_CITY="${MAX_POSITIONS_PER_CITY:-2}"
 EXIT_EDGE_FLOOR="${EXIT_EDGE_FLOOR:-0.01}"
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT="${MIN_HOLDING_MINUTES_FOR_EDGE_EXIT:-10}"
+CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p "$STATE_DIR"
@@ -45,6 +46,7 @@ cmd_start() {
         --max-positions-per-city '$MAX_POSITIONS_PER_CITY' \
         --exit-edge-floor '$EXIT_EDGE_FLOOR' \
         --min-holding-minutes-for-edge-exit '$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT' \
+        --confirm-ticks '$CONFIRM_TICKS' \
         >> '$LOG_FILE' 2>&1 || true
       sleep '$INTERVAL_SEC'
     done
@@ -69,7 +71,7 @@ cmd_stop() {
 
 cmd_status() {
   if is_running; then
-    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, exit_edge_floor=${EXIT_EDGE_FLOOR})"
+    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS})"
   else
     echo "monitor: stopped"
   fi
@@ -95,7 +97,8 @@ cmd_run_once() {
     --min-hours-to-expiry "$MIN_HOURS_TO_EXPIRY" \
     --max-positions-per-city "$MAX_POSITIONS_PER_CITY" \
     --exit-edge-floor "$EXIT_EDGE_FLOOR" \
-    --min-holding-minutes-for-edge-exit "$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT"
+    --min-holding-minutes-for-edge-exit "$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT" \
+    --confirm-ticks "$CONFIRM_TICKS"
 }
 
 cmd_logs() {
@@ -137,6 +140,7 @@ Env overrides:
   MAX_POSITIONS_PER_CITY=<int>                     # default 2
   EXIT_EDGE_FLOOR=<float>                          # default 0.01
   MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=<int>          # default 10
+  CONFIRM_TICKS=<int>                              # default 2
   PYTHON_BIN=<python executable>                   # default python3
 USAGE
     exit 1
