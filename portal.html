@@ -8,27 +8,29 @@
     :root { --bg:#0b1020; --card:#121a33; --text:#e8edff; --muted:#9fb0e0; --ok:#1ec98f; --warn:#ffcc66; --bad:#ff6b6b; }
     * { box-sizing:border-box; }
     body { margin:0; font-family: Inter, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width:1200px; margin:0 auto; padding:20px; }
+    .wrap { max-width:1400px; margin:0 auto; padding:20px; }
     h1 { margin:0 0 8px; }
-    .muted { color:var(--muted); font-size:14px; }
-    .grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:12px; margin:16px 0 20px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .grid { display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:12px; margin:16px 0 20px; }
     .card { background:var(--card); border-radius:12px; padding:14px; border:1px solid rgba(255,255,255,.08); }
     .k { color:var(--muted); font-size:12px; }
-    .v { font-size:24px; margin-top:6px; font-weight:700; }
+    .v { font-size:22px; margin-top:6px; font-weight:700; }
     .ok{ color:var(--ok);} .bad{ color:var(--bad);} .warn{ color:var(--warn);} 
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th, td { padding:10px 8px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th, td { padding:8px 6px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; vertical-align:top; }
     th { color:var(--muted); font-weight:600; }
-    .row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .row { display:grid; grid-template-columns: 2fr 1fr; gap:12px; }
     button { background:#2a3a6d; color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; }
-    @media (max-width: 900px){ .grid{ grid-template-columns:1fr 1fr; } .row{ grid-template-columns:1fr; } }
+    code { font-size:12px; }
+    @media (max-width: 1200px){ .grid{ grid-template-columns:1fr 1fr 1fr; } .row{ grid-template-columns:1fr; } }
+    @media (max-width: 720px){ .grid{ grid-template-columns:1fr 1fr; } }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Polymarket Weather Monitoring Portal</h1>
     <div class="muted">本地只读监控 | 数据源: <code>state/paper_state.json</code> + <code>state/snapshots.jsonl</code></div>
-    <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+    <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
       <button onclick="refreshAll()">手动刷新</button>
       <label class="muted"><input id="auto" type="checkbox" checked /> 自动刷新(30s)</label>
       <span id="status" class="muted"></span>
@@ -37,15 +39,21 @@
     <div class="grid">
       <div class="card"><div class="k">Open Positions</div><div id="openPositions" class="v">-</div></div>
       <div class="card"><div class="k">Open Exposure (USD)</div><div id="openExposure" class="v">-</div></div>
-      <div class="card"><div class="k">Unrealized PnL (USD)</div><div id="unrealized" class="v">-</div></div>
+      <div class="card"><div class="k">Unrealized PnL (Live Mark)</div><div id="unrealized" class="v">-</div></div>
       <div class="card"><div class="k">Signals (Latest Scan)</div><div id="signals" class="v">-</div></div>
+      <div class="card"><div class="k">到期待结算</div><div id="pendingSettle" class="v">-</div></div>
+      <div class="card"><div class="k">Last Runner Tick</div><div id="lastRun" class="v" style="font-size:14px; line-height:1.3;">-</div></div>
     </div>
 
     <div class="row">
       <div class="card">
-        <h3>当前持仓</h3>
+        <h3>当前持仓（实时浮盈亏 + 倒计时 + 自动平仓状态）</h3>
         <table>
-          <thead><tr><th>Market</th><th>Side</th><th>Category</th><th>Size</th><th>Entry</th><th>Edge</th><th>End</th></tr></thead>
+          <thead>
+            <tr>
+              <th>Market</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>Float PnL</th><th>倒计时</th><th>自动平仓状态</th>
+            </tr>
+          </thead>
           <tbody id="positionsBody"></tbody>
         </table>
       </div>
@@ -65,6 +73,35 @@ async function fetchText(path){ const r=await fetch(path,{cache:'no-store'}); if
 const fmt=(n,d=2)=> (n===undefined||n===null||Number.isNaN(+n))?'-':Number(n).toFixed(d);
 function clsPnl(v){ return v>0?'ok':(v<0?'bad':'warn'); }
 
+function formatCountdown(endDate){
+  if(!endDate) return '-';
+  const end = new Date(endDate).getTime();
+  if(!Number.isFinite(end)) return '-';
+  const diff = end - Date.now();
+  if(diff <= 0) return '已到期';
+
+  const totalMin = Math.floor(diff / 60000);
+  const d = Math.floor(totalMin / 1440);
+  const h = Math.floor((totalMin % 1440) / 60);
+  const m = totalMin % 60;
+  if(d > 0) return `${d}d ${h}h ${m}m`;
+  return `${h}h ${m}m`;
+}
+
+function autoCloseStatus(p){
+  const end = new Date(p.end_date || '').getTime();
+  if(!Number.isFinite(end)) return {text:'无到期信息', cls:'warn'};
+  if(Date.now() >= end) return {text:'到期待自动平仓', cls:'warn'};
+  return {text:'监控中', cls:'ok'};
+}
+
+function fmtTime(ts){
+  if(!ts) return '-';
+  const d = new Date(ts);
+  if(Number.isNaN(d.getTime())) return String(ts);
+  return d.toLocaleString();
+}
+
 async function refreshAll(){
   const status=document.getElementById('status');
   status.textContent='刷新中...';
@@ -74,24 +111,55 @@ async function refreshAll(){
     const lines=raw.trim().split('\n').filter(Boolean);
     const latest=lines.length?JSON.parse(lines[lines.length-1]):null;
 
-    const open=state.open_positions||[];
+    const open=(state.open_positions||[]).map(p=>{
+      const ac = autoCloseStatus(p);
+      return {
+        ...p,
+        mark: (p.mark_price ?? null),
+        pnl: (p.unrealized_pnl_usd ?? null),
+        countdown: formatCountdown(p.end_date),
+        autoCloseText: ac.text,
+        autoCloseCls: ac.cls,
+      };
+    });
+
     const exposure=open.reduce((a,p)=>a+(+p.size_usd||0),0);
+    const unrealized=open.reduce((s,p)=>s+(Number.isFinite(+p.pnl)?(+p.pnl):0),0);
+    const pendingSettle=open.filter(p=>p.autoCloseText.includes('到期')).length;
+    const markReady=open.filter(p=>Number.isFinite(+p.pnl)).length;
+    const latestMarkTs=open.map(p=>p.mark_updated_at).filter(Boolean).sort().slice(-1)[0] || null;
 
     document.getElementById('openPositions').textContent=open.length;
     document.getElementById('openExposure').textContent='$'+fmt(exposure,2);
 
-    const unreal=(latest && latest.paper)? +latest.paper.unrealized_usd : null;
     const elUn=document.getElementById('unrealized');
-    elUn.textContent= unreal===null ? '-' : ('$'+fmt(unreal,2));
-    elUn.className='v '+(unreal===null?'':clsPnl(unreal));
+    elUn.textContent = open.length ? ('$'+fmt(unrealized,2)) : '-';
+    elUn.className='v '+(open.length?clsPnl(unrealized):'');
 
     document.getElementById('signals').textContent=(latest && latest.scan)? latest.scan.signals : '-';
 
+    const ps = document.getElementById('pendingSettle');
+    ps.textContent = String(pendingSettle);
+    ps.className = 'v ' + (pendingSettle>0 ? 'warn' : 'ok');
+
+    document.getElementById('lastRun').textContent = fmtTime(state.last_run);
+
     const pb=document.getElementById('positionsBody'); pb.innerHTML='';
-    if(!open.length) pb.innerHTML='<tr><td colspan="7" class="muted">无持仓</td></tr>';
+    if(!open.length) pb.innerHTML='<tr><td colspan="9" class="muted">无持仓</td></tr>';
     open.forEach(p=>{
+      const pnlClass = Number.isFinite(+p.pnl) ? clsPnl(+p.pnl) : 'warn';
       const tr=document.createElement('tr');
-      tr.innerHTML=`<td title="${p.question||''}">${p.city_slug||''} ${p.target_date||''}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.edge,4)}</td><td>${(p.end_date||'').replace('T',' ').replace('Z',' UTC')}</td>`;
+      tr.innerHTML=`
+        <td title="${p.question||''}">${p.city_slug||''} ${p.target_date||''}</td>
+        <td>${p.side||''}</td>
+        <td>${p.category||''}</td>
+        <td>$${fmt(p.size_usd,2)}</td>
+        <td>${fmt(p.entry_price,4)}</td>
+        <td>${Number.isFinite(+p.mark)?fmt(p.mark,4):'-'}</td>
+        <td class="${pnlClass}">${Number.isFinite(+p.pnl)?('$'+fmt(p.pnl,4)):'-'}</td>
+        <td>${p.countdown}</td>
+        <td class="${p.autoCloseCls}">${p.autoCloseText}</td>
+      `;
       pb.appendChild(tr);
     });
 
@@ -104,8 +172,10 @@ async function refreshAll(){
       sb.appendChild(tr);
     });
 
-    status.textContent=`已刷新：${new Date().toLocaleString()}`;
-  } catch(e){ status.textContent='刷新失败: '+e.message; }
+    status.textContent=`已刷新：${new Date().toLocaleString()} | mark ${markReady}/${open.length} | mark_ts ${fmtTime(latestMarkTs)}`;
+  } catch(e){
+    status.textContent='刷新失败: '+e.message;
+  }
 }
 
 refreshAll();
