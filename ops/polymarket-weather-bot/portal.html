@@ -28,7 +28,7 @@
 <body>
   <div class="wrap">
     <h2 style="margin:0">Polymarket Weather Dashboard — Fresh Only</h2>
-    <div class="muted">默认只看 fresh baseline 之后的新仓位（避免历史4笔干扰）。</div>
+    <div class="muted">Fresh-only 视图（从当前基线开始统计新仓位）。</div>
 
     <div class="toolbar">
       <button onclick="refreshAll()">刷新</button>
@@ -42,6 +42,7 @@
       <div class="card"><div class="k">Fresh Exposure (USD)</div><div id="openExposure" class="v">-</div></div>
       <div class="card"><div class="k">Fresh Unrealized PnL</div><div id="unrealized" class="v">-</div></div>
       <div class="card"><div class="k">Latest Signals</div><div id="signals" class="v">-</div></div>
+      <div class="card"><div class="k">Starting Fund</div><div id="startingFund" class="v">$1000</div></div>
       <div class="card"><div class="k">Pending Settle</div><div id="pendingSettle" class="v">-</div></div>
       <div class="card"><div class="k">Last Runner Tick</div><div id="lastRun" class="v" style="font-size:13px">-</div></div>
     </div>
