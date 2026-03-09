@@ -1,5 +1,7 @@
 state/*.json
 state/*.jsonl
+state/*.log
+state/*.pid
 !state/.gitkeep
 __pycache__/
 *.pyc
