@@ -24,13 +24,35 @@ Execution-first weather workflow for Polymarket.
 
 ## Risk Parameters (default)
 
-- trade size: `$3`
+- trade size cap: `$3`
 - max open exposure: `$20`
 - daily stop loss: `-$10`
 - position mix target: `70% core / 30% tail`
 - max positions per city: `2`
 - edge-decay auto-close floor: `0.01` (after min hold 10 minutes)
+- signal confirmation gate: `confirm_ticks=2`
+- fractional Kelly sizing:
+  - `kelly_fraction_core=0.20`
+  - `kelly_fraction_tail=0.10`
+  - `max_bet_fraction=0.01`
+  - `min_edge_for_entry=0.01`
 - no new position when `<12h` to expiry (can override)
+
+## Paper Allocation Plan (Starting Fund = $1000)
+
+Execution-first baseline for paper phase:
+
+- bankroll baseline: `$1000` (`--paper-bankroll-usd 1000`)
+- **active risk budget**: `$120` max open exposure (`--max-open-exposure-usd 120`)
+- **per-trade hard cap**: `$10` (`--trade-size-usd 10`, also bounded by Kelly + `max_bet_fraction=0.01`)
+- **daily stop loss**: `-$30` (`--daily-stop-loss-usd -30`)
+- bucket split target: `80% core / 20% tail` (enforced by signal mix + stricter tail filters)
+- tail activation rule: keep `tail_edge_min` high and only take tail when liquidity/spread quality is clean.
+
+Why this shape:
+- keeps most capital in reserve (only 12% active)
+- allows enough sample size for learning vs. the old `$20` total cap
+- still limits single-name/event damage through small per-trade caps and daily stop.
 
 ## Usage
 
@@ -59,7 +81,15 @@ python3 paper_runner.py --apply \
   --max-positions-per-city 2 \
   --exit-edge-floor 0.01 \
   --min-holding-minutes-for-edge-exit 10 \
-  --confirm-ticks 2
+  --confirm-ticks 2 \
+  --trade-size-usd 10 \
+  --max-open-exposure-usd 120 \
+  --daily-stop-loss-usd -30 \
+  --paper-bankroll-usd 1000 \
+  --kelly-fraction-core 0.20 \
+  --kelly-fraction-tail 0.08 \
+  --max-bet-fraction 0.01 \
+  --min-edge-for-entry 0.02
 ```
 
 Custom files:
@@ -107,6 +137,7 @@ Default behavior:
 - city diversification: `max_positions_per_city=2`
 - edge decay auto-close: `exit_edge_floor=0.01`
 - signal persistence: `confirm_ticks=2`
+- fractional Kelly sizing active (core/tail fractions + max bet cap)
 
 Optional env overrides when starting:
 
@@ -117,6 +148,14 @@ MAX_POSITIONS_PER_CITY=2 \
 EXIT_EDGE_FLOOR=0.01 \
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=10 \
 CONFIRM_TICKS=2 \
+TRADE_SIZE_USD=10 \
+MAX_OPEN_EXPOSURE_USD=120 \
+DAILY_STOP_LOSS_USD=-30 \
+PAPER_BANKROLL_USD=1000 \
+KELLY_FRACTION_CORE=0.20 \
+KELLY_FRACTION_TAIL=0.08 \
+MAX_BET_FRACTION=0.01 \
+MIN_EDGE_FOR_ENTRY=0.02 \
 ./scripts/monitor_ctl.sh restart
 ```
 
@@ -144,7 +183,13 @@ Applied takeaways currently implemented:
 - Avoid over-reacting to one-tick dislocations via `confirm_ticks` signal persistence
 - Cap concentration risk via `max_positions_per_city`
 - Enforce deterministic risk exits via `edge_decay` + expiry handling
+- Size entries with fractional Kelly + hard max-bet cap
 - Keep full replayable snapshots for pseudo-backtest and diagnostics
+
+Kelly formula used (binary share):
+- Full Kelly: `f* = (p - q) / (1 - q)`
+- Applied fraction: `f = min(max_bet_fraction, max(0, f*) * kelly_fraction_{core|tail})`
+- Position size: Kelly size after TTL multiplier, then capped by policy limits.
 
 ## Backtest status
 

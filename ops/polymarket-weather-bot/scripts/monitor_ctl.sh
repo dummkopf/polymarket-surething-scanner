@@ -12,6 +12,14 @@ MAX_POSITIONS_PER_CITY="${MAX_POSITIONS_PER_CITY:-2}"
 EXIT_EDGE_FLOOR="${EXIT_EDGE_FLOOR:-0.01}"
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT="${MIN_HOLDING_MINUTES_FOR_EDGE_EXIT:-10}"
 CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
+TRADE_SIZE_USD="${TRADE_SIZE_USD:-3}"
+MAX_OPEN_EXPOSURE_USD="${MAX_OPEN_EXPOSURE_USD:-20}"
+DAILY_STOP_LOSS_USD="${DAILY_STOP_LOSS_USD:--10}"
+PAPER_BANKROLL_USD="${PAPER_BANKROLL_USD:-1000}"
+KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
+KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.10}"
+MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.01}"
+MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.01}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p "$STATE_DIR"
@@ -47,6 +55,14 @@ cmd_start() {
         --exit-edge-floor '$EXIT_EDGE_FLOOR' \
         --min-holding-minutes-for-edge-exit '$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT' \
         --confirm-ticks '$CONFIRM_TICKS' \
+        --trade-size-usd '$TRADE_SIZE_USD' \
+        --max-open-exposure-usd '$MAX_OPEN_EXPOSURE_USD' \
+        --daily-stop-loss-usd '$DAILY_STOP_LOSS_USD' \
+        --paper-bankroll-usd '$PAPER_BANKROLL_USD' \
+        --kelly-fraction-core '$KELLY_FRACTION_CORE' \
+        --kelly-fraction-tail '$KELLY_FRACTION_TAIL' \
+        --max-bet-fraction '$MAX_BET_FRACTION' \
+        --min-edge-for-entry '$MIN_EDGE_FOR_ENTRY' \
         >> '$LOG_FILE' 2>&1 || true
       sleep '$INTERVAL_SEC'
     done
@@ -71,7 +87,7 @@ cmd_stop() {
 
 cmd_status() {
   if is_running; then
-    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS})"
+    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL})"
   else
     echo "monitor: stopped"
   fi
@@ -98,7 +114,15 @@ cmd_run_once() {
     --max-positions-per-city "$MAX_POSITIONS_PER_CITY" \
     --exit-edge-floor "$EXIT_EDGE_FLOOR" \
     --min-holding-minutes-for-edge-exit "$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT" \
-    --confirm-ticks "$CONFIRM_TICKS"
+    --confirm-ticks "$CONFIRM_TICKS" \
+    --trade-size-usd "$TRADE_SIZE_USD" \
+    --max-open-exposure-usd "$MAX_OPEN_EXPOSURE_USD" \
+    --daily-stop-loss-usd "$DAILY_STOP_LOSS_USD" \
+    --paper-bankroll-usd "$PAPER_BANKROLL_USD" \
+    --kelly-fraction-core "$KELLY_FRACTION_CORE" \
+    --kelly-fraction-tail "$KELLY_FRACTION_TAIL" \
+    --max-bet-fraction "$MAX_BET_FRACTION" \
+    --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY"
 }
 
 cmd_logs() {
@@ -141,6 +165,14 @@ Env overrides:
   EXIT_EDGE_FLOOR=<float>                          # default 0.01
   MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=<int>          # default 10
   CONFIRM_TICKS=<int>                              # default 2
+  TRADE_SIZE_USD=<float>                           # default 3
+  MAX_OPEN_EXPOSURE_USD=<float>                    # default 20
+  DAILY_STOP_LOSS_USD=<float>                      # default -10
+  PAPER_BANKROLL_USD=<float>                       # default 1000
+  KELLY_FRACTION_CORE=<float>                      # default 0.20
+  KELLY_FRACTION_TAIL=<float>                      # default 0.10
+  MAX_BET_FRACTION=<float>                         # default 0.01
+  MIN_EDGE_FOR_ENTRY=<float>                       # default 0.01
   PYTHON_BIN=<python executable>                   # default python3
 USAGE
     exit 1

@@ -89,6 +89,13 @@ class Config:
     # Signal confirmation + sizing by time-to-expiry
     confirm_ticks: int = 2
 
+    # Fractional Kelly controls
+    paper_bankroll_usd: float = 1000.0
+    kelly_fraction_core: float = 0.20
+    kelly_fraction_tail: float = 0.10
+    max_bet_fraction: float = 0.01
+    min_edge_for_entry: float = 0.01
+
     request_timeout_sec: int = 20
 
 
@@ -610,6 +617,21 @@ def calc_realized_today(closed_positions: List[Dict[str, Any]], day_cn: str) -> 
     return round(total, 6)
 
 
+def calc_realized_total(closed_positions: List[Dict[str, Any]]) -> float:
+    total = 0.0
+    for p in closed_positions:
+        total += float(p.get("realized_pnl_usd", 0.0))
+    return round(total, 6)
+
+
+def kelly_full_fraction(prob: float, price: float) -> float:
+    # Binary share with unit payout. Full Kelly for long position.
+    # f* = (p - q) / (1 - q)
+    if price <= 0 or price >= 1:
+        return 0.0
+    return (prob - price) / (1.0 - price)
+
+
 def calc_unrealized(open_positions: List[Dict[str, Any]], market_map: Dict[str, Dict[str, Any]]) -> float:
     total = 0.0
     for p in open_positions:
@@ -829,7 +851,11 @@ def apply_paper_positions(
 
     day_cn = today_cn_str()
     realized_today = calc_realized_today(closed_positions, day_cn)
+    realized_total = calc_realized_total(closed_positions)
     unrealized = calc_unrealized(open_positions, market_map)
+
+    # Equity reference for Kelly sizing in paper mode.
+    bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + realized_total + unrealized)
 
     stop_triggered = (realized_today + unrealized) <= config.daily_stop_loss_usd
 
@@ -837,6 +863,8 @@ def apply_paper_positions(
     skipped_existing = 0
     blocked_by_risk = 0
     blocked_by_confirm = 0
+    blocked_by_edge_gate = 0
+    blocked_by_kelly = 0
 
     if stop_triggered:
         return {
@@ -844,6 +872,8 @@ def apply_paper_positions(
             "skipped_existing": 0,
             "blocked_by_risk": len(signals),
             "blocked_by_confirm": 0,
+            "blocked_by_edge_gate": 0,
+            "blocked_by_kelly": 0,
             "stop_triggered": True,
             "realized_today": realized_today,
             "unrealized": unrealized,
@@ -882,10 +912,33 @@ def apply_paper_positions(
             blocked_by_risk += 1
             continue
 
+        if float(s.edge) < float(config.min_edge_for_entry):
+            blocked_by_edge_gate += 1
+            continue
+
+        kelly_frac = (
+            float(config.kelly_fraction_core)
+            if s.category == "core"
+            else float(config.kelly_fraction_tail)
+        )
+        full_kelly = kelly_full_fraction(float(s.side_prob), float(s.side_price))
+        used_kelly = min(
+            float(config.max_bet_fraction),
+            max(0.0, full_kelly) * max(0.0, kelly_frac),
+        )
+        if used_kelly <= 0:
+            blocked_by_kelly += 1
+            continue
+
         ttl_bucket, ttl_mult = ttl_bucket_and_multiplier(s.end_date)
-        size_usd = float(config.trade_size_usd) * float(ttl_mult)
-        if size_usd <= 0:
-            blocked_by_risk += 1
+
+        # Kelly-implied size, then apply TTL multiplier and hard exposure cap.
+        kelly_size_usd = bankroll_equity * used_kelly
+        size_cap_by_policy = float(config.trade_size_usd) * float(ttl_mult)
+        size_usd = min(kelly_size_usd * float(ttl_mult), size_cap_by_policy, free_exposure)
+
+        if size_usd <= 0.25:
+            blocked_by_kelly += 1
             continue
 
         shares = size_usd / s.side_price
@@ -903,6 +956,10 @@ def apply_paper_positions(
             "size_usd": round(size_usd, 6),
             "ttl_bucket": ttl_bucket,
             "size_multiplier": round(ttl_mult, 4),
+            "kelly_full_fraction": round(full_kelly, 6),
+            "kelly_fraction_used": round(used_kelly, 6),
+            "kelly_size_usd_pre_ttl": round(kelly_size_usd, 6),
+            "bankroll_equity_usd_at_entry": round(bankroll_equity, 6),
             "entry_price": round(s.side_price, 6),
             "shares": round(shares, 6),
             "model_prob": round(s.side_prob, 6),
@@ -918,6 +975,7 @@ def apply_paper_positions(
         open_positions.append(pos)
         existing_keys.add(key)
         city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
+        free_exposure = max(0.0, free_exposure - size_usd)
         opened += 1
 
     state["open_positions"] = open_positions
@@ -927,6 +985,8 @@ def apply_paper_positions(
         "skipped_existing": skipped_existing,
         "blocked_by_risk": blocked_by_risk,
         "blocked_by_confirm": blocked_by_confirm,
+        "blocked_by_edge_gate": blocked_by_edge_gate,
+        "blocked_by_kelly": blocked_by_kelly,
         "stop_triggered": False,
         "realized_today": realized_today,
         "unrealized": unrealized,
@@ -967,6 +1027,8 @@ def summarize(
             "closed_new_edge": int(closed_new_edge),
             "opened_new": apply_result.get("opened", 0),
             "blocked_by_confirm": apply_result.get("blocked_by_confirm", 0),
+            "blocked_by_edge_gate": apply_result.get("blocked_by_edge_gate", 0),
+            "blocked_by_kelly": apply_result.get("blocked_by_kelly", 0),
             "open_positions": len(open_positions),
             "closed_positions": len(closed_positions),
             "open_exposure_usd": round(calc_exposure(open_positions), 6),
@@ -1017,6 +1079,24 @@ def main() -> None:
         help="Apply paper position open/close updates (default: scan only)",
     )
     parser.add_argument(
+        "--trade-size-usd",
+        type=float,
+        default=None,
+        help="Hard per-trade size cap in USD (default: Config.trade_size_usd)",
+    )
+    parser.add_argument(
+        "--max-open-exposure-usd",
+        type=float,
+        default=None,
+        help="Max total open exposure in USD (default: Config.max_open_exposure_usd)",
+    )
+    parser.add_argument(
+        "--daily-stop-loss-usd",
+        type=float,
+        default=None,
+        help="Daily stop loss threshold in USD, usually negative (default: Config.daily_stop_loss_usd)",
+    )
+    parser.add_argument(
         "--min-hours-to-expiry",
         type=float,
         default=None,
@@ -1046,9 +1126,45 @@ def main() -> None:
         default=None,
         help="Require signal persistence for N cycles before entry",
     )
+    parser.add_argument(
+        "--paper-bankroll-usd",
+        type=float,
+        default=None,
+        help="Paper bankroll baseline used for fractional Kelly sizing",
+    )
+    parser.add_argument(
+        "--kelly-fraction-core",
+        type=float,
+        default=None,
+        help="Fractional Kelly multiplier for core signals",
+    )
+    parser.add_argument(
+        "--kelly-fraction-tail",
+        type=float,
+        default=None,
+        help="Fractional Kelly multiplier for tail signals",
+    )
+    parser.add_argument(
+        "--max-bet-fraction",
+        type=float,
+        default=None,
+        help="Hard cap of bankroll fraction per trade",
+    )
+    parser.add_argument(
+        "--min-edge-for-entry",
+        type=float,
+        default=None,
+        help="Global minimum edge threshold required for entry",
+    )
     args = parser.parse_args()
 
     config = Config()
+    if args.trade_size_usd is not None:
+        config.trade_size_usd = max(0.25, float(args.trade_size_usd))
+    if args.max_open_exposure_usd is not None:
+        config.max_open_exposure_usd = max(0.25, float(args.max_open_exposure_usd))
+    if args.daily_stop_loss_usd is not None:
+        config.daily_stop_loss_usd = float(args.daily_stop_loss_usd)
     if args.min_hours_to_expiry is not None:
         config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
     if args.max_positions_per_city is not None:
@@ -1059,6 +1175,16 @@ def main() -> None:
         config.min_holding_minutes_for_edge_exit = max(0, int(args.min_holding_minutes_for_edge_exit))
     if args.confirm_ticks is not None:
         config.confirm_ticks = max(1, int(args.confirm_ticks))
+    if args.paper_bankroll_usd is not None:
+        config.paper_bankroll_usd = max(1.0, float(args.paper_bankroll_usd))
+    if args.kelly_fraction_core is not None:
+        config.kelly_fraction_core = max(0.0, float(args.kelly_fraction_core))
+    if args.kelly_fraction_tail is not None:
+        config.kelly_fraction_tail = max(0.0, float(args.kelly_fraction_tail))
+    if args.max_bet_fraction is not None:
+        config.max_bet_fraction = max(0.0, float(args.max_bet_fraction))
+    if args.min_edge_for_entry is not None:
+        config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
 
     env_path = Path(args.env)
     state_path = Path(args.state)
@@ -1084,6 +1210,8 @@ def main() -> None:
             "skipped_existing": 0,
             "blocked_by_risk": 0,
             "blocked_by_confirm": 0,
+            "blocked_by_edge_gate": 0,
+            "blocked_by_kelly": 0,
             "stop_triggered": False,
             "realized_today": calc_realized_today(state.get("closed_positions", []), today_cn_str()),
             "unrealized": calc_unrealized(state.get("open_positions", []), market_map),
@@ -1119,11 +1247,19 @@ def main() -> None:
     summary["env_missing_keys"] = missing
     summary["apply_mode"] = bool(args.apply)
     summary["config"] = {
+        "trade_size_usd": config.trade_size_usd,
+        "max_open_exposure_usd": config.max_open_exposure_usd,
+        "daily_stop_loss_usd": config.daily_stop_loss_usd,
         "min_hours_to_expiry": config.min_hours_to_expiry,
         "max_positions_per_city": config.max_positions_per_city,
         "exit_edge_floor": config.exit_edge_floor,
         "min_holding_minutes_for_edge_exit": config.min_holding_minutes_for_edge_exit,
         "confirm_ticks": config.confirm_ticks,
+        "paper_bankroll_usd": config.paper_bankroll_usd,
+        "kelly_fraction_core": config.kelly_fraction_core,
+        "kelly_fraction_tail": config.kelly_fraction_tail,
+        "max_bet_fraction": config.max_bet_fraction,
+        "min_edge_for_entry": config.min_edge_for_entry,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
