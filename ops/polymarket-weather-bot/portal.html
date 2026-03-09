@@ -71,10 +71,19 @@
 
     <div class="card" style="margin-top:12px;">
       <h3 style="margin-top:0">Under Radar（含未达质量阈值）</h3>
-      <div class="muted" style="margin-bottom:8px;">来源：signal confirm 计数。即使当前无 quality signal，也会显示持续被监控的候选。</div>
+      <div class="muted" style="margin-bottom:8px;">来源：最新扫描的可比对候选（reliable weather + executable odds）。</div>
       <table>
         <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Confirm Ticks</th><th>Status</th><th>Brief</th></tr></thead>
         <tbody id="radarBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <h3 style="margin-top:0">All Scanable Weather Universe</h3>
+      <div class="muted" style="margin-bottom:8px;">全量扫描视图（含 watch-only / data-missing / out-of-window）。</div>
+      <table>
+        <thead><tr><th>City</th><th>Market Link</th><th>Status</th><th>Brief</th></tr></thead>
+        <tbody id="universeBody"></tbody>
       </table>
     </div>
   </div>
@@ -197,6 +206,20 @@ async function refreshAll(){
         const tr=document.createElement('tr');
         tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
         rb.appendChild(tr);
+      });
+    }
+
+    // Full universe board
+    const ub=document.getElementById('universeBody'); ub.innerHTML='';
+    const uni=(latest && Array.isArray(latest.universe)) ? latest.universe.slice(0,80) : [];
+    if(!uni.length){
+      ub.innerHTML='<tr><td colspan="4" class="muted">暂无 universe 数据（跑一次扫描后会出现）</td></tr>';
+    } else {
+      uni.forEach(u=>{
+        const tr=document.createElement('tr');
+        const st=u.status||'watch-only';
+        tr.innerHTML=`<td>${u.city_slug||cityFromSlug(u.slug)}</td><td><a href="${marketUrl(u.slug)}" target="_blank" rel="noreferrer">${u.slug}</a></td><td class="${st==='quality-pass'?'ok':(st==='data-missing'?'bad':'warn')}">${st}</td><td>${u.brief||''}</td>`;
+        ub.appendChild(tr);
       });
     }
 

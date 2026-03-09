@@ -399,7 +399,7 @@ def market_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
     return yes_bid, yes_ask, yes_spread, no_px
 
 
-def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
+def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
     market_map: Dict[str, Dict[str, Any]] = {}
@@ -416,6 +416,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], D
 
     signals: List[Signal] = []
     radar_rows: List[Dict[str, Any]] = []
+    universe_rows: List[Dict[str, Any]] = []
     slugs = fetch_weather_slugs(config.request_timeout_sec)
     counters["total_slugs"] = len(slugs)
 
@@ -431,28 +432,58 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], D
             continue
         counters["parseable"] += 1
 
+        row = {
+            "slug": slug,
+            "question": str(market.get("question") or ""),
+            "city_slug": parsed.city_slug,
+            "target_date": parsed.target_date,
+            "status": "watch-only",
+            "brief": "parseable, pending checks",
+        }
+
         if not market.get("active") or market.get("closed"):
+            row["status"] = "inactive"
+            row["brief"] = "inactive/closed market"
+            universe_rows.append(row)
             continue
 
         end_date_raw = market.get("endDate") or ""
         end_date = parse_iso_to_utc(end_date_raw)
         if not end_date:
+            row["status"] = "data-missing"
+            row["brief"] = "missing endDate"
+            universe_rows.append(row)
             continue
 
+        row["end_date"] = end_date_raw
         hours_to_expiry = (end_date - now).total_seconds() / 3600
         if hours_to_expiry < config.min_hours_to_expiry:
+            row["status"] = "out-of-window"
+            row["brief"] = "outside expiry window"
+            universe_rows.append(row)
             continue
         counters["future_window"] += 1
 
         liquidity = parse_float(market.get("liquidity")) or 0.0
+        row["liquidity"] = round(liquidity, 6)
         if liquidity < config.min_liquidity:
+            row["status"] = "watch-only"
+            row["brief"] = "below liquidity floor"
+            universe_rows.append(row)
             continue
 
         yes_bid, yes_ask, yes_spread, no_price = market_prices(market)
+        row["yes_spread"] = None if yes_spread is None else round(yes_spread, 6)
         if yes_ask is None or no_price is None:
+            row["status"] = "data-missing"
+            row["brief"] = "missing executable prices"
+            universe_rows.append(row)
             continue
 
         if yes_spread is not None and yes_spread > config.max_yes_spread:
+            row["status"] = "watch-only"
+            row["brief"] = "spread too wide"
+            universe_rows.append(row)
             continue
 
         forecast_max_c = fetch_forecast_max_temp_c(
@@ -462,6 +493,9 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], D
             forecast_cache,
         )
         if forecast_max_c is None:
+            row["status"] = "data-missing"
+            row["brief"] = "weather forecast unavailable"
+            universe_rows.append(row)
             continue
         counters["model_ready"] += 1
 
@@ -491,27 +525,27 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], D
         elif side_prob <= config.tail_prob_max and edge >= config.tail_edge_min and side_price <= config.tail_price_max:
             category = "tail"
 
-        radar_rows.append(
-            {
-                "slug": slug,
-                "question": str(market.get("question") or ""),
-                "city_slug": parsed.city_slug,
-                "target_date": parsed.target_date,
-                "side": side,
-                "side_prob": round(side_prob, 6),
-                "side_price": round(side_price, 6),
-                "edge": round(edge, 6),
-                "liquidity": round(liquidity, 6),
-                "yes_spread": None if yes_spread is None else round(yes_spread, 6),
-                "end_date": end_date_raw,
-                "status": "quality-pass" if category else "watch-only",
-                "brief": (
-                    "meets quality gates"
-                    if category
-                    else "reliable weather+odds, but below quality threshold"
-                ),
-            }
-        )
+        candidate_row = {
+            "slug": slug,
+            "question": str(market.get("question") or ""),
+            "city_slug": parsed.city_slug,
+            "target_date": parsed.target_date,
+            "side": side,
+            "side_prob": round(side_prob, 6),
+            "side_price": round(side_price, 6),
+            "edge": round(edge, 6),
+            "liquidity": round(liquidity, 6),
+            "yes_spread": None if yes_spread is None else round(yes_spread, 6),
+            "end_date": end_date_raw,
+            "status": "quality-pass" if category else "watch-only",
+            "brief": (
+                "meets quality gates"
+                if category
+                else "reliable weather+odds, but below quality threshold"
+            ),
+        }
+        radar_rows.append(candidate_row)
+        universe_rows.append(candidate_row)
 
         if not category:
             continue
@@ -544,7 +578,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], D
 
     signals.sort(key=lambda s: s.edge, reverse=True)
     radar_rows.sort(key=lambda r: float(r.get("edge", 0.0)), reverse=True)
-    return signals, radar_rows, market_map, counters
+    return signals, radar_rows, universe_rows, market_map, counters
 
 
 def load_state(path: Path) -> Dict[str, Any]:
@@ -1219,7 +1253,7 @@ def main() -> None:
     env_map = load_env(env_path) if env_path.exists() else {}
     missing = validate_env_has_trading_keys(env_map)
 
-    signals, radar_rows, market_map, counters = build_signals(config)
+    signals, radar_rows, universe_rows, market_map, counters = build_signals(config)
 
     state = load_state(state_path)
     update_signal_confirm_counts(state, signals)
@@ -1260,6 +1294,7 @@ def main() -> None:
         "scan": counters,
         "signals": [asdict(s) for s in signals],
         "radar": radar_rows,
+        "universe": universe_rows,
     }
     append_snapshot(snapshot_path, snapshot_payload)
 
