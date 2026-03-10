@@ -14,7 +14,7 @@ Execution-first weather workflow for Polymarket.
 
 ## What it does now
 
-- Pulls markets from `https://polymarket.com/climate-science/weather`
+- Pulls markets natively from `gamma-api` via pagination (no HTML scraping dependency)
 - Resolves market quotes from `gamma-api`
 - Parses `highest-temperature-...` weather contracts
 - Uses Open-Meteo daily max temperature forecast as model baseline
@@ -116,6 +116,7 @@ python3 paper_runner.py \
 
 - `state/paper_state.json`: open/closed paper positions and PnL, including model audit fields on entry
 - `state/snapshots.jsonl`: market+model snapshots for later replay/backtest
+- universe discovery now comes straight from Gamma pagination, reducing webpage blind spots
 - `state/monitor.log`: continuous monitor runtime log
 
 Audit fields now include:

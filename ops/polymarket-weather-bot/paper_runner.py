@@ -197,16 +197,92 @@ def ensure_dirs(paths: List[Path]) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
 
 
+def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
+    """Fetch weather markets natively from Gamma API.
+
+    Discovery flow:
+    1) paginate Gamma `series`
+    2) keep `*-daily-weather` series
+    3) for active/open events in those series, fetch exact `events?slug=...`
+       and read the embedded `markets`
+
+    This avoids HTML scraping blind spots and avoids scanning the entire open
+    market universe just to find weather contracts.
+    """
+    series_limit = 300
+    offset = 0
+    weather_series: List[Dict[str, Any]] = []
+    seen_series = set()
+
+    while True:
+        resp = requests.get(
+            "https://gamma-api.polymarket.com/series",
+            params={"closed": "false", "limit": series_limit, "offset": offset},
+            timeout=timeout_sec,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not isinstance(batch, list) or not batch:
+            break
+
+        for series in batch:
+            slug = str(series.get("slug") or "")
+            if not slug.endswith("-daily-weather"):
+                continue
+            if slug in seen_series:
+                continue
+            seen_series.add(slug)
+            weather_series.append(series)
+
+        if len(batch) < series_limit:
+            break
+        offset += series_limit
+        if offset > 5000:
+            break
+
+    markets: List[Dict[str, Any]] = []
+    seen_market_slugs = set()
+    for series in weather_series:
+        for event_stub in (series.get("events") or []):
+            if not isinstance(event_stub, dict):
+                continue
+            if not event_stub.get("active") or event_stub.get("closed"):
+                continue
+            event_slug = str(event_stub.get("slug") or "")
+            if not event_slug:
+                continue
+
+            try:
+                event_resp = requests.get(
+                    "https://gamma-api.polymarket.com/events",
+                    params={"slug": event_slug, "limit": 1},
+                    timeout=timeout_sec,
+                )
+                event_resp.raise_for_status()
+                event_rows = event_resp.json()
+            except Exception:
+                continue
+
+            if not isinstance(event_rows, list) or not event_rows:
+                continue
+            event = event_rows[0]
+            for market in (event.get("markets") or []):
+                if not isinstance(market, dict):
+                    continue
+                market_slug = str(market.get("slug") or "")
+                if not market_slug.startswith("highest-temperature-in-"):
+                    continue
+                if market_slug in seen_market_slugs:
+                    continue
+                seen_market_slugs.add(market_slug)
+                markets.append(market)
+
+    markets.sort(key=lambda m: str(m.get("slug") or ""))
+    return markets
+
+
 def fetch_weather_slugs(timeout_sec: int) -> List[str]:
-    html = requests.get(WEATHER_SECTION_URL, timeout=timeout_sec).text
-
-    slugs = set()
-    slugs.update(re.findall(r"marketSlug=([a-z0-9\-]+)", html))
-    slugs.update(re.findall(r"/event/[a-z0-9\-]+/([a-z0-9\-]+)", html))
-
-    # Keep weather contract slugs only (temperature bins for now).
-    filtered = sorted(s for s in slugs if s.startswith("highest-temperature-in-"))
-    return filtered
+    return [str(m.get("slug") or "") for m in fetch_weather_markets(timeout_sec)]
 
 
 def fetch_market_by_slug(slug: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
@@ -570,12 +646,12 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
     signals: List[Signal] = []
     radar_rows: List[Dict[str, Any]] = []
     universe_rows: List[Dict[str, Any]] = []
-    slugs = fetch_weather_slugs(config.request_timeout_sec)
-    counters["total_slugs"] = len(slugs)
+    weather_markets = fetch_weather_markets(config.request_timeout_sec)
+    counters["total_slugs"] = len(weather_markets)
 
-    for slug in slugs:
-        market = fetch_market_by_slug(slug, config.request_timeout_sec)
-        if not market:
+    for market in weather_markets:
+        slug = str(market.get("slug") or "")
+        if not slug:
             continue
         counters["fetched"] += 1
         market_map[slug] = market
