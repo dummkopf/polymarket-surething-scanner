@@ -191,6 +191,34 @@ ROBUSTNESS_MIN_EDGE=0.0 \
 ./scripts/monitor_ctl.sh restart
 ```
 
+## Systemd auto-restart (recommended)
+
+Use user-level systemd so paper monitor auto-starts and auto-recovers if it crashes.
+
+Install + enable:
+
+```bash
+cd /home/kai/.openclaw/workspace/ops/polymarket-weather-bot
+./scripts/install_systemd_monitor.sh
+```
+
+Check status:
+
+```bash
+systemctl --user status polymarket-weather-monitor.service
+```
+
+Control:
+
+```bash
+systemctl --user restart polymarket-weather-monitor.service
+systemctl --user stop polymarket-weather-monitor.service
+systemctl --user start polymarket-weather-monitor.service
+```
+
+Unit source in repo:
+- `systemd/polymarket-weather-monitor.service`
+
 ## GitHub publish safety (no env leaks)
 
 Before push:

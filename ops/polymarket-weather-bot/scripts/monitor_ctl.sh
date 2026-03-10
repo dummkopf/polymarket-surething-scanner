@@ -27,8 +27,19 @@ ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
 ROBUSTNESS_SIGMA_SCALE_HIGH="${ROBUSTNESS_SIGMA_SCALE_HIGH:-1.15}"
 ROBUSTNESS_MIN_EDGE="${ROBUSTNESS_MIN_EDGE:-0.0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+SYSTEMD_UNIT="${SYSTEMD_UNIT:-polymarket-weather-monitor.service}"
 
 mkdir -p "$STATE_DIR"
+
+has_systemd_unit() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user status "$SYSTEMD_UNIT" >/dev/null 2>&1
+}
+
+systemd_is_active() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user is-active --quiet "$SYSTEMD_UNIT"
+}
 
 is_running() {
   if [[ ! -f "$PID_FILE" ]]; then
@@ -46,6 +57,12 @@ is_running() {
 }
 
 cmd_start() {
+  if has_systemd_unit; then
+    systemctl --user start "$SYSTEMD_UNIT"
+    echo "monitor started via systemd ($SYSTEMD_UNIT)"
+    return 0
+  fi
+
   if is_running; then
     echo "monitor already running (pid=$(cat "$PID_FILE"))"
     return 0
@@ -85,6 +102,12 @@ cmd_start() {
 }
 
 cmd_stop() {
+  if has_systemd_unit; then
+    systemctl --user stop "$SYSTEMD_UNIT"
+    echo "monitor stopped via systemd ($SYSTEMD_UNIT)"
+    return 0
+  fi
+
   if ! is_running; then
     rm -f "$PID_FILE"
     echo "monitor not running"
@@ -98,10 +121,18 @@ cmd_stop() {
 }
 
 cmd_status() {
-  if is_running; then
-    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE})"
+  if has_systemd_unit; then
+    if systemd_is_active; then
+      echo "monitor: running via systemd ($SYSTEMD_UNIT)"
+    else
+      echo "monitor: stopped via systemd ($SYSTEMD_UNIT)"
+    fi
   else
-    echo "monitor: stopped"
+    if is_running; then
+      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE})"
+    else
+      echo "monitor: stopped"
+    fi
   fi
 
   if [[ -f "$ROOT_DIR/state/paper_state.json" ]]; then
@@ -145,6 +176,12 @@ cmd_run_once() {
 
 cmd_logs() {
   local n="${2:-120}"
+
+  if has_systemd_unit; then
+    journalctl --user -u "$SYSTEMD_UNIT" -n "$n" --no-pager
+    return 0
+  fi
+
   if [[ -f "$LOG_FILE" ]]; then
     tail -n "$n" "$LOG_FILE"
   else
@@ -198,6 +235,9 @@ Env overrides:
   ROBUSTNESS_SIGMA_SCALE_HIGH=<float>              # default 1.15
   ROBUSTNESS_MIN_EDGE=<float>                      # default 0.0
   PYTHON_BIN=<python executable>                   # default python3
+  SYSTEMD_UNIT=<unit name>                         # default polymarket-weather-monitor.service
+
+If SYSTEMD_UNIT exists in user systemd, start/stop/status/logs will route through systemd.
 USAGE
     exit 1
     ;;
