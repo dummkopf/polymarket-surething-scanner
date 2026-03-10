@@ -99,6 +99,19 @@ const cityFromSlug=(slug)=>{
   const m=(slug||'').match(/highest-temperature-in-([a-z-]+)-on-/);
   return m?m[1]:'-';
 };
+const specFromSlug=(slug)=>{
+  const m=(slug||'').match(/highest-temperature-in-[a-z-]+-on-(\d{4}-\d{2}-\d{2})-(.+)$/);
+  if(!m) return '';
+  const [,date,raw]=m;
+  let token=(raw||'').toLowerCase();
+  let mm;
+  if((mm=token.match(/^(-?\d+)-(-?\d+)(f|c)$/))) return `${date} | ${mm[1]}-${mm[2]}°${mm[3].toUpperCase()}`;
+  if((mm=token.match(/^(-?\d+)(f|c)orhigher$/))) return `${date} | ≥${mm[1]}°${mm[2].toUpperCase()}`;
+  if((mm=token.match(/^(-?\d+)(f|c)orbelow$/))) return `${date} | ≤${mm[1]}°${mm[2].toUpperCase()}`;
+  if((mm=token.match(/^(-?\d+)(f|c)$/))) return `${date} | =${mm[1]}°${mm[2].toUpperCase()}`;
+  return date;
+};
+const marketLabel=(x)=> specFromSlug(x?.slug) || x?.target_date || x?.slug || '-';
 
 function getFreshTs(){
   const x=localStorage.getItem('pm_fresh_ts');
@@ -152,7 +165,7 @@ async function refreshAll(){
     open.forEach(p=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(p.edge,4)} | model_p=${fmt(p.model_prob,4)} | liq=${fmt(p.liquidity,0)} | spread=${fmt(p.yes_spread,4)}`;
-      const pLabel=(p.target_date||p.slug||'').toString();
+      const pLabel=marketLabel(p);
       const pLink=(p.slug?`<a href="${marketUrl(p.slug)}" target="_blank" rel="noreferrer" title="${p.question||''}">${pLabel}</a>`:'-');
       tr.innerHTML=`<td>${p.city_slug||'-'}</td><td>${pLink}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
       pb.appendChild(tr);
@@ -164,7 +177,7 @@ async function refreshAll(){
     sigs.forEach(s=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(s.edge,4)} | p=${fmt(s.side_prob,4)} | liq=${fmt(s.liquidity,0)} | spread=${fmt(s.yes_spread,4)}`;
-      const sLink=(s.slug?`<a href="${marketUrl(s.slug)}" target="_blank" rel="noreferrer">${s.slug}</a>`:'-');
+      const sLink=(s.slug?`<a href="${marketUrl(s.slug)}" target="_blank" rel="noreferrer">${marketLabel(s)}</a>`:'-');
       tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${sLink}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
       sb.appendChild(tr);
     });
@@ -207,7 +220,7 @@ async function refreshAll(){
     } else {
       radarRows.forEach(r=>{
         const tr=document.createElement('tr');
-        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
+        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${specFromSlug(r.slug)||r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
         rb.appendChild(tr);
       });
     }
@@ -221,7 +234,7 @@ async function refreshAll(){
       uni.forEach(u=>{
         const tr=document.createElement('tr');
         const st=u.status||'watch-only';
-        tr.innerHTML=`<td>${u.city_slug||cityFromSlug(u.slug)}</td><td><a href="${marketUrl(u.slug)}" target="_blank" rel="noreferrer">${u.slug}</a></td><td class="${st==='quality-pass'?'ok':(st==='data-missing'?'bad':'warn')}">${st}</td><td>${u.brief||''}</td>`;
+        tr.innerHTML=`<td>${u.city_slug||cityFromSlug(u.slug)}</td><td><a href="${marketUrl(u.slug)}" target="_blank" rel="noreferrer">${specFromSlug(u.slug)||u.slug}</a></td><td class="${st==='quality-pass'?'ok':(st==='data-missing'?'bad':'warn')}">${st}</td><td>${u.brief||''}</td>`;
         ub.appendChild(tr);
       });
     }
