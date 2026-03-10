@@ -85,6 +85,7 @@ class Config:
 
     # Portfolio/risk refinement
     max_positions_per_city: int = 2
+    max_event_cluster_exposure_usd: float = 10.0
     exit_edge_floor: float = 0.01
     min_holding_minutes_for_edge_exit: int = 10
 
@@ -1247,6 +1248,10 @@ def signal_open_score(s: Signal, config: Config) -> float:
     return full_kelly * category_k * robustness_ratio * float(ttl_mult)
 
 
+def event_cluster_key(city_slug: str, target_date: str) -> str:
+    return f"{city_slug}|{target_date}"
+
+
 def select_signals_for_opening(signals: List[Signal], config: Config, slots_total: int) -> List[Signal]:
     if slots_total <= 0:
         return []
@@ -1294,6 +1299,7 @@ def apply_paper_positions(
             "opened": 0,
             "skipped_existing": 0,
             "blocked_by_risk": len(signals),
+            "blocked_by_cluster": 0,
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
@@ -1315,11 +1321,15 @@ def apply_paper_positions(
 
     existing_keys = {(p.get("slug"), p.get("side")) for p in open_positions}
     city_counts: Dict[str, int] = {}
+    cluster_exposure: Dict[str, float] = {}
+    blocked_by_cluster = 0
     for p in open_positions:
         c = str(p.get("city_slug") or "")
         if not c:
             continue
         city_counts[c] = city_counts.get(c, 0) + 1
+        cluster_key_existing = event_cluster_key(c, str(p.get("target_date") or ""))
+        cluster_exposure[cluster_key_existing] = cluster_exposure.get(cluster_key_existing, 0.0) + float(p.get("size_usd", 0.0))
 
     for s in picks:
         key = (s.slug, s.side)
@@ -1339,6 +1349,12 @@ def apply_paper_positions(
             blocked_by_edge_gate += 1
             continue
 
+        cluster_key = event_cluster_key(s.city_slug, s.target_date)
+        cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure.get(cluster_key, 0.0))
+        if cluster_remaining <= 0.25:
+            blocked_by_cluster += 1
+            continue
+
         kelly_frac = (
             float(config.kelly_fraction_core)
             if s.category == "core"
@@ -1355,10 +1371,12 @@ def apply_paper_positions(
 
         ttl_bucket, ttl_mult = ttl_bucket_and_multiplier(s.end_date)
 
-        # Kelly-implied size, then apply TTL multiplier and hard exposure cap.
+        # Kelly-implied size, then apply TTL multiplier and hard exposure caps.
         kelly_size_usd = bankroll_equity * used_kelly
         size_cap_by_policy = float(config.trade_size_usd) * float(ttl_mult)
-        size_usd = min(kelly_size_usd * float(ttl_mult), size_cap_by_policy, free_exposure)
+        if s.category == "tail":
+            size_cap_by_policy *= float(config.tail_size_cap_fraction)
+        size_usd = min(kelly_size_usd * float(ttl_mult), size_cap_by_policy, free_exposure, cluster_remaining)
 
         if size_usd <= 0.25:
             blocked_by_kelly += 1
@@ -1376,11 +1394,14 @@ def apply_paper_positions(
             "city_slug": s.city_slug,
             "target_date": s.target_date,
             "end_date": s.end_date,
+            "event_cluster_key": cluster_key,
             "side": s.side,
             "category": s.category,
             "size_usd": round(size_usd, 6),
             "ttl_bucket": ttl_bucket,
             "size_multiplier": round(ttl_mult, 4),
+            "cluster_remaining_usd_before_entry": round(cluster_remaining, 6),
+            "size_cap_by_policy_usd": round(size_cap_by_policy, 6),
             "kelly_full_fraction": round(full_kelly, 6),
             "kelly_fraction_used": round(used_kelly, 6),
             "kelly_size_usd_pre_ttl": round(kelly_size_usd, 6),
@@ -1412,6 +1433,7 @@ def apply_paper_positions(
         open_positions.append(pos)
         existing_keys.add(key)
         city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
+        cluster_exposure[cluster_key] = cluster_exposure.get(cluster_key, 0.0) + size_usd
         free_exposure = max(0.0, free_exposure - size_usd)
         opened += 1
 
@@ -1421,6 +1443,7 @@ def apply_paper_positions(
         "opened": opened,
         "skipped_existing": skipped_existing,
         "blocked_by_risk": blocked_by_risk,
+        "blocked_by_cluster": blocked_by_cluster,
         "blocked_by_confirm": blocked_by_confirm,
         "blocked_by_edge_gate": blocked_by_edge_gate,
         "blocked_by_kelly": blocked_by_kelly,
@@ -1550,6 +1573,12 @@ def main() -> None:
         help="Max concurrent open positions per city (default: Config.max_positions_per_city)",
     )
     parser.add_argument(
+        "--max-event-cluster-exposure-usd",
+        type=float,
+        default=None,
+        help="Max total exposure for one city/date event cluster",
+    )
+    parser.add_argument(
         "--exit-edge-floor",
         type=float,
         default=None,
@@ -1590,6 +1619,12 @@ def main() -> None:
         type=float,
         default=None,
         help="Hard cap of bankroll fraction per trade",
+    )
+    parser.add_argument(
+        "--tail-size-cap-fraction",
+        type=float,
+        default=None,
+        help="Tail max size as a fraction of normal policy cap",
     )
     parser.add_argument(
         "--min-edge-for-entry",
@@ -1634,6 +1669,8 @@ def main() -> None:
         config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
     if args.max_positions_per_city is not None:
         config.max_positions_per_city = max(1, int(args.max_positions_per_city))
+    if args.max_event_cluster_exposure_usd is not None:
+        config.max_event_cluster_exposure_usd = max(0.25, float(args.max_event_cluster_exposure_usd))
     if args.exit_edge_floor is not None:
         config.exit_edge_floor = max(0.0, float(args.exit_edge_floor))
     if args.min_holding_minutes_for_edge_exit is not None:
@@ -1648,6 +1685,8 @@ def main() -> None:
         config.kelly_fraction_tail = max(0.0, float(args.kelly_fraction_tail))
     if args.max_bet_fraction is not None:
         config.max_bet_fraction = max(0.0, float(args.max_bet_fraction))
+    if args.tail_size_cap_fraction is not None:
+        config.tail_size_cap_fraction = max(0.0, float(args.tail_size_cap_fraction))
     if args.min_edge_for_entry is not None:
         config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
     if args.robustness_mu_shift_c is not None:
@@ -1728,6 +1767,7 @@ def main() -> None:
         "daily_stop_loss_usd": config.daily_stop_loss_usd,
         "min_hours_to_expiry": config.min_hours_to_expiry,
         "max_positions_per_city": config.max_positions_per_city,
+        "max_event_cluster_exposure_usd": config.max_event_cluster_exposure_usd,
         "exit_edge_floor": config.exit_edge_floor,
         "min_holding_minutes_for_edge_exit": config.min_holding_minutes_for_edge_exit,
         "confirm_ticks": config.confirm_ticks,
@@ -1735,6 +1775,7 @@ def main() -> None:
         "kelly_fraction_core": config.kelly_fraction_core,
         "kelly_fraction_tail": config.kelly_fraction_tail,
         "max_bet_fraction": config.max_bet_fraction,
+        "tail_size_cap_fraction": config.tail_size_cap_fraction,
         "min_edge_for_entry": config.min_edge_for_entry,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,

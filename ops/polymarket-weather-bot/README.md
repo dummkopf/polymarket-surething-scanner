@@ -29,6 +29,8 @@ Execution-first weather workflow for Polymarket.
 - max open exposure: `$120`
 - daily stop loss: `-$30`
 - no hard fixed core/tail capital split; allocation is driven by risk-adjusted Kelly ranking
+- event cluster cap: `$10` max per city/date cluster
+- tail single-position cap: `50%` of normal policy cap (guardrail, not allocation quota)
 - max positions per city: `2`
 - edge-decay auto-close floor: `0.01` (after min hold 10 minutes)
 - signal confirmation gate: `confirm_ticks=2`
@@ -85,6 +87,7 @@ Tune strategy controls:
 python3 paper_runner.py --apply \
   --min-hours-to-expiry 0 \
   --max-positions-per-city 2 \
+  --max-event-cluster-exposure-usd 10 \
   --exit-edge-floor 0.01 \
   --min-holding-minutes-for-edge-exit 10 \
   --confirm-ticks 2 \
@@ -95,6 +98,7 @@ python3 paper_runner.py --apply \
   --kelly-fraction-core 0.20 \
   --kelly-fraction-tail 0.08 \
   --max-bet-fraction 0.01 \
+  --tail-size-cap-fraction 0.5 \
   --min-edge-for-entry 0.02 \
   --robustness-mu-shift-c 0.7 \
   --robustness-sigma-scale-low 0.85 \
@@ -157,6 +161,8 @@ Default behavior:
 - signal persistence: `confirm_ticks=2`
 - fractional Kelly sizing active (core/tail fractions + max bet cap)
 - opening priority now follows risk-adjusted Kelly score, not a fixed core/tail slot quota
+- event-cluster concentration is capped per city/date
+- tail position size is capped below core policy size as a risk guardrail
 - robustness gate active (`mu ± 0.7°C`, `sigma × {0.85, 1.0, 1.15}` by default)
 
 Optional env overrides when starting:
@@ -165,6 +171,7 @@ Optional env overrides when starting:
 INTERVAL_SEC=120 \
 MIN_HOURS_TO_EXPIRY=0 \
 MAX_POSITIONS_PER_CITY=2 \
+MAX_EVENT_CLUSTER_EXPOSURE_USD=10 \
 EXIT_EDGE_FLOOR=0.01 \
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=10 \
 CONFIRM_TICKS=2 \
@@ -175,6 +182,7 @@ PAPER_BANKROLL_USD=1000 \
 KELLY_FRACTION_CORE=0.20 \
 KELLY_FRACTION_TAIL=0.08 \
 MAX_BET_FRACTION=0.01 \
+TAIL_SIZE_CAP_FRACTION=0.5 \
 MIN_EDGE_FOR_ENTRY=0.02 \
 ROBUSTNESS_MU_SHIFT_C=0.7 \
 ROBUSTNESS_SIGMA_SCALE_LOW=0.85 \

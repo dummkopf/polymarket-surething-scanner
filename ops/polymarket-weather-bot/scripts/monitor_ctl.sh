@@ -9,6 +9,7 @@ LOG_FILE="$STATE_DIR/monitor.log"
 INTERVAL_SEC="${INTERVAL_SEC:-300}"
 MIN_HOURS_TO_EXPIRY="${MIN_HOURS_TO_EXPIRY:-0}"
 MAX_POSITIONS_PER_CITY="${MAX_POSITIONS_PER_CITY:-2}"
+MAX_EVENT_CLUSTER_EXPOSURE_USD="${MAX_EVENT_CLUSTER_EXPOSURE_USD:-10}"
 EXIT_EDGE_FLOOR="${EXIT_EDGE_FLOOR:-0.01}"
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT="${MIN_HOLDING_MINUTES_FOR_EDGE_EXIT:-10}"
 CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
@@ -19,6 +20,7 @@ PAPER_BANKROLL_USD="${PAPER_BANKROLL_USD:-1000}"
 KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
 KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.08}"
 MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.01}"
+TAIL_SIZE_CAP_FRACTION="${TAIL_SIZE_CAP_FRACTION:-0.5}"
 MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.02}"
 ROBUSTNESS_MU_SHIFT_C="${ROBUSTNESS_MU_SHIFT_C:-0.7}"
 ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
@@ -56,6 +58,7 @@ cmd_start() {
       '$PYTHON_BIN' '$ROOT_DIR/paper_runner.py' --apply \
         --min-hours-to-expiry '$MIN_HOURS_TO_EXPIRY' \
         --max-positions-per-city '$MAX_POSITIONS_PER_CITY' \
+        --max-event-cluster-exposure-usd '$MAX_EVENT_CLUSTER_EXPOSURE_USD' \
         --exit-edge-floor '$EXIT_EDGE_FLOOR' \
         --min-holding-minutes-for-edge-exit '$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT' \
         --confirm-ticks '$CONFIRM_TICKS' \
@@ -66,6 +69,7 @@ cmd_start() {
         --kelly-fraction-core '$KELLY_FRACTION_CORE' \
         --kelly-fraction-tail '$KELLY_FRACTION_TAIL' \
         --max-bet-fraction '$MAX_BET_FRACTION' \
+        --tail-size-cap-fraction '$TAIL_SIZE_CAP_FRACTION' \
         --min-edge-for-entry '$MIN_EDGE_FOR_ENTRY' \
         --robustness-mu-shift-c '$ROBUSTNESS_MU_SHIFT_C' \
         --robustness-sigma-scale-low '$ROBUSTNESS_SIGMA_SCALE_LOW' \
@@ -95,7 +99,7 @@ cmd_stop() {
 
 cmd_status() {
   if is_running; then
-    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE})"
+    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE})"
   else
     echo "monitor: stopped"
   fi
@@ -120,6 +124,7 @@ cmd_run_once() {
   "$PYTHON_BIN" "$ROOT_DIR/paper_runner.py" --apply \
     --min-hours-to-expiry "$MIN_HOURS_TO_EXPIRY" \
     --max-positions-per-city "$MAX_POSITIONS_PER_CITY" \
+    --max-event-cluster-exposure-usd "$MAX_EVENT_CLUSTER_EXPOSURE_USD" \
     --exit-edge-floor "$EXIT_EDGE_FLOOR" \
     --min-holding-minutes-for-edge-exit "$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT" \
     --confirm-ticks "$CONFIRM_TICKS" \
@@ -130,6 +135,7 @@ cmd_run_once() {
     --kelly-fraction-core "$KELLY_FRACTION_CORE" \
     --kelly-fraction-tail "$KELLY_FRACTION_TAIL" \
     --max-bet-fraction "$MAX_BET_FRACTION" \
+    --tail-size-cap-fraction "$TAIL_SIZE_CAP_FRACTION" \
     --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY" \
     --robustness-mu-shift-c "$ROBUSTNESS_MU_SHIFT_C" \
     --robustness-sigma-scale-low "$ROBUSTNESS_SIGMA_SCALE_LOW" \
@@ -174,6 +180,7 @@ Env overrides:
   INTERVAL_SEC=<seconds>                           # default 300
   MIN_HOURS_TO_EXPIRY=<hours>                      # default 0 (paper can still open near expiry)
   MAX_POSITIONS_PER_CITY=<int>                     # default 2
+  MAX_EVENT_CLUSTER_EXPOSURE_USD=<float>           # default 10
   EXIT_EDGE_FLOOR=<float>                          # default 0.01
   MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=<int>          # default 10
   CONFIRM_TICKS=<int>                              # default 2
@@ -184,6 +191,7 @@ Env overrides:
   KELLY_FRACTION_CORE=<float>                      # default 0.20
   KELLY_FRACTION_TAIL=<float>                      # default 0.08
   MAX_BET_FRACTION=<float>                         # default 0.01
+  TAIL_SIZE_CAP_FRACTION=<float>                   # default 0.5
   MIN_EDGE_FOR_ENTRY=<float>                       # default 0.02
   ROBUSTNESS_MU_SHIFT_C=<float>                    # default 0.7
   ROBUSTNESS_SIGMA_SCALE_LOW=<float>               # default 0.85
