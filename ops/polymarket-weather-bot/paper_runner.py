@@ -997,9 +997,15 @@ def calc_exposure(open_positions: List[Dict[str, Any]]) -> float:
     return round(sum(float(p.get("size_usd", 0.0)) for p in open_positions), 6)
 
 
+def exclude_from_model_cohort(p: Dict[str, Any]) -> bool:
+    return bool(p.get("exclude_from_model_cohort")) or str(p.get("close_reason") or "") == "manual_close_legacy_reset"
+
+
 def calc_realized_today(closed_positions: List[Dict[str, Any]], day_cn: str) -> float:
     total = 0.0
     for p in closed_positions:
+        if exclude_from_model_cohort(p):
+            continue
         closed_at = p.get("closed_at")
         if not closed_at:
             continue
@@ -1011,6 +1017,8 @@ def calc_realized_today(closed_positions: List[Dict[str, Any]], day_cn: str) -> 
 def calc_realized_total(closed_positions: List[Dict[str, Any]]) -> float:
     total = 0.0
     for p in closed_positions:
+        if exclude_from_model_cohort(p):
+            continue
         total += float(p.get("realized_pnl_usd", 0.0))
     return round(total, 6)
 
