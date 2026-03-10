@@ -56,7 +56,7 @@
       <div class="card">
         <h3 style="margin-top:0">Fresh 持仓明细</h3>
         <table>
-          <thead><tr><th>City</th><th>Market</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Rationale</th><th>Opened</th></tr></thead>
+          <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Rationale</th><th>Opened</th></tr></thead>
           <tbody id="positionsBody"></tbody>
         </table>
       </div>
@@ -152,7 +152,9 @@ async function refreshAll(){
     open.forEach(p=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(p.edge,4)} | model_p=${fmt(p.model_prob,4)} | liq=${fmt(p.liquidity,0)} | spread=${fmt(p.yes_spread,4)}`;
-      tr.innerHTML=`<td>${p.city_slug||'-'}</td><td title="${p.question||''}">${p.target_date||''}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
+      const pLabel=(p.target_date||p.slug||'').toString();
+      const pLink=(p.slug?`<a href="${marketUrl(p.slug)}" target="_blank" rel="noreferrer" title="${p.question||''}">${pLabel}</a>`:'-');
+      tr.innerHTML=`<td>${p.city_slug||'-'}</td><td>${pLink}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
       pb.appendChild(tr);
     });
 
@@ -162,7 +164,8 @@ async function refreshAll(){
     sigs.forEach(s=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(s.edge,4)} | p=${fmt(s.side_prob,4)} | liq=${fmt(s.liquidity,0)} | spread=${fmt(s.yes_spread,4)}`;
-      tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${s.slug||''}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
+      const sLink=(s.slug?`<a href="${marketUrl(s.slug)}" target="_blank" rel="noreferrer">${s.slug}</a>`:'-');
+      tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${sLink}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
       sb.appendChild(tr);
     });
 
