@@ -99,16 +99,41 @@ const cityFromSlug=(slug)=>{
   const m=(slug||'').match(/highest-temperature-in-([a-z-]+)-on-/);
   return m?m[1]:'-';
 };
+const normalizeDateToken=(token)=>{
+  const t=(token||'').replace(/^-+|-+$/g,'').toLowerCase();
+  if(!t) return '';
+  let m=t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if(m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m=t.match(/^([a-z]+)-(\d{1,2})-(\d{4})$/);
+  if(m){
+    const monthMap={
+      january:'01',jan:'01',february:'02',feb:'02',march:'03',mar:'03',april:'04',apr:'04',may:'05',
+      june:'06',jun:'06',july:'07',jul:'07',august:'08',aug:'08',september:'09',sep:'09',sept:'09',
+      october:'10',oct:'10',november:'11',nov:'11',december:'12',dec:'12'
+    };
+    const mm=monthMap[m[1]];
+    if(mm) return `${m[3]}-${mm}-${String(m[2]).padStart(2,'0')}`;
+  }
+  return (token||'').replace(/^-+|-+$/g,'');
+};
+
 const specFromSlug=(slug)=>{
-  const m=(slug||'').match(/highest-temperature-in-[a-z-]+-on-(\d{4}-\d{2}-\d{2})-(.+)$/);
+  const m=(slug||'').match(/highest-temperature-in-[a-z-]+-on-(.+)$/);
   if(!m) return '';
-  const [,date,raw]=m;
-  let token=(raw||'').toLowerCase();
+  const rest=(m[1]||'').toLowerCase();
+
+  const dm=rest.match(/^([a-z]+-\d{1,2}-\d{4}|\d{4}-\d{2}-\d{2})-(.+)$/);
+  if(!dm) return normalizeDateToken(rest);
+
+  const date=normalizeDateToken(dm[1]);
+  const cond=dm[2]||'';
   let mm;
-  if((mm=token.match(/^(-?\d+)-(-?\d+)(f|c)$/))) return `${date} | ${mm[1]}-${mm[2]}°${mm[3].toUpperCase()}`;
-  if((mm=token.match(/^(-?\d+)(f|c)orhigher$/))) return `${date} | ≥${mm[1]}°${mm[2].toUpperCase()}`;
-  if((mm=token.match(/^(-?\d+)(f|c)orbelow$/))) return `${date} | ≤${mm[1]}°${mm[2].toUpperCase()}`;
-  if((mm=token.match(/^(-?\d+)(f|c)$/))) return `${date} | =${mm[1]}°${mm[2].toUpperCase()}`;
+
+  if((mm=cond.match(/^(-?\d+)-(-?\d+)(f|c)$/))) return `${date} | ${mm[1]}-${mm[2]}°${mm[3].toUpperCase()}`;
+  if((mm=cond.match(/^(-?\d+)(f|c)orhigher$/))) return `${date} | ≥${mm[1]}°${mm[2].toUpperCase()}`;
+  if((mm=cond.match(/^(-?\d+)(f|c)orbelow$/))) return `${date} | ≤${mm[1]}°${mm[2].toUpperCase()}`;
+  if((mm=cond.match(/^(-?\d+)(f|c)$/))) return `${date} | =${mm[1]}°${mm[2].toUpperCase()}`;
+
   return date;
 };
 const marketLabel=(x)=> specFromSlug(x?.slug) || x?.target_date || x?.slug || '-';
