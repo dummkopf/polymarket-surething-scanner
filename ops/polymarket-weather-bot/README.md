@@ -25,18 +25,18 @@ Execution-first weather workflow for Polymarket.
 
 ## Risk Parameters (default)
 
-- trade size cap: `$3`
-- max open exposure: `$20`
-- daily stop loss: `-$10`
-- position mix target: `70% core / 30% tail`
+- trade size cap: `$10`
+- max open exposure: `$120`
+- daily stop loss: `-$30`
+- no hard fixed core/tail capital split; allocation is driven by risk-adjusted Kelly ranking
 - max positions per city: `2`
 - edge-decay auto-close floor: `0.01` (after min hold 10 minutes)
 - signal confirmation gate: `confirm_ticks=2`
 - fractional Kelly sizing:
   - `kelly_fraction_core=0.20`
-  - `kelly_fraction_tail=0.10`
+  - `kelly_fraction_tail=0.08`
   - `max_bet_fraction=0.01`
-  - `min_edge_for_entry=0.01`
+  - `min_edge_for_entry=0.02`
 - robustness gate defaults:
   - `robustness_mu_shift_c=0.7`
   - `robustness_sigma_scale_low=0.85`
@@ -52,7 +52,7 @@ Execution-first baseline for paper phase:
 - **active risk budget**: `$120` max open exposure (`--max-open-exposure-usd 120`)
 - **per-trade hard cap**: `$10` (`--trade-size-usd 10`, also bounded by Kelly + `max_bet_fraction=0.01`)
 - **daily stop loss**: `-$30` (`--daily-stop-loss-usd -30`)
-- bucket split target: `80% core / 20% tail` (enforced by signal mix + stricter tail filters)
+- no hard bucket split target in capital allocation; core/tail remains a signal taxonomy, while dollars are allocated by risk-adjusted Kelly, robustness, and TTL.
 - tail activation rule: keep `tail_edge_min` high and only take tail when liquidity/spread quality is clean.
 
 Why this shape:
@@ -156,6 +156,7 @@ Default behavior:
 - edge decay auto-close: `exit_edge_floor=0.01`
 - signal persistence: `confirm_ticks=2`
 - fractional Kelly sizing active (core/tail fractions + max bet cap)
+- opening priority now follows risk-adjusted Kelly score, not a fixed core/tail slot quota
 - robustness gate active (`mu ± 0.7°C`, `sigma × {0.85, 1.0, 1.15}` by default)
 
 Optional env overrides when starting:

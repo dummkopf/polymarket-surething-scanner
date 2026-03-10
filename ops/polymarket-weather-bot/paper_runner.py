@@ -63,10 +63,12 @@ CITY_COORDS = {
 
 @dataclass
 class Config:
-    trade_size_usd: float = 3.0
-    max_open_exposure_usd: float = 20.0
-    daily_stop_loss_usd: float = -10.0
+    trade_size_usd: float = 10.0
+    max_open_exposure_usd: float = 120.0
+    daily_stop_loss_usd: float = -30.0
 
+    # Legacy slot-mix knobs kept for compatibility only.
+    # Capital allocation is no longer driven by fixed core/tail quotas.
     target_core_ratio: float = 0.7
     target_tail_ratio: float = 0.3
 
@@ -92,9 +94,9 @@ class Config:
     # Fractional Kelly controls
     paper_bankroll_usd: float = 1000.0
     kelly_fraction_core: float = 0.20
-    kelly_fraction_tail: float = 0.10
+    kelly_fraction_tail: float = 0.08
     max_bet_fraction: float = 0.01
-    min_edge_for_entry: float = 0.01
+    min_edge_for_entry: float = 0.02
 
     # Model robustness gate: require edge to remain positive under
     # small forecast mean shifts and sigma perturbations.
@@ -1221,31 +1223,40 @@ def ttl_bucket_and_multiplier(end_date_raw: str) -> Tuple[str, float]:
     return "<6h", 0.2
 
 
+def signal_open_score(s: Signal, config: Config) -> float:
+    """Risk-adjusted score used for capital allocation.
+
+    Capital is allocated by expected growth / robustness, not by a fixed
+    core-vs-tail quota. Components:
+    - Kelly edge (`full_kelly`)
+    - category risk appetite (`kelly_fraction_core/tail`)
+    - robustness retention (`robustness_min_edge / edge`)
+    - time-to-expiry multiplier (execution + forecast fragility)
+    """
+    if float(s.side_price) <= 0:
+        return 0.0
+
+    full_kelly = max(0.0, kelly_full_fraction(float(s.side_prob), float(s.side_price)))
+    category_k = float(config.kelly_fraction_core) if s.category == "core" else float(config.kelly_fraction_tail)
+    ttl_bucket, ttl_mult = ttl_bucket_and_multiplier(s.end_date)
+    _ = ttl_bucket
+
+    base_edge = max(1e-9, float(s.edge))
+    robustness_ratio = clamp01(float(s.robustness_min_edge) / base_edge)
+
+    return full_kelly * category_k * robustness_ratio * float(ttl_mult)
+
+
 def select_signals_for_opening(signals: List[Signal], config: Config, slots_total: int) -> List[Signal]:
     if slots_total <= 0:
         return []
 
-    core = [s for s in signals if s.category == "core"]
-    tail = [s for s in signals if s.category == "tail"]
-
-    core_slots = max(0, min(slots_total, round(slots_total * config.target_core_ratio)))
-    tail_slots = max(0, slots_total - core_slots)
-
-    picks = core[:core_slots] + tail[:tail_slots]
-
-    # Fill remaining slots by global edge ranking.
-    if len(picks) < slots_total:
-        picked_keys = {(s.slug, s.side) for s in picks}
-        for s in signals:
-            key = (s.slug, s.side)
-            if key in picked_keys:
-                continue
-            picks.append(s)
-            picked_keys.add(key)
-            if len(picks) >= slots_total:
-                break
-
-    return picks[:slots_total]
+    ranked = sorted(
+        signals,
+        key=lambda s: (signal_open_score(s, config), float(s.edge), float(s.side_prob)),
+        reverse=True,
+    )
+    return ranked[:slots_total]
 
 
 def apply_paper_positions(
@@ -1355,6 +1366,8 @@ def apply_paper_positions(
 
         shares = size_usd / s.side_price
 
+        selection_score = signal_open_score(s, config)
+
         pos = {
             "position_id": str(uuid.uuid4()),
             "opened_at": iso_now(),
@@ -1371,6 +1384,7 @@ def apply_paper_positions(
             "kelly_full_fraction": round(full_kelly, 6),
             "kelly_fraction_used": round(used_kelly, 6),
             "kelly_size_usd_pre_ttl": round(kelly_size_usd, 6),
+            "selection_score": round(selection_score, 8),
             "bankroll_equity_usd_at_entry": round(bankroll_equity, 6),
             "entry_price": round(s.side_price, 6),
             "shares": round(shares, 6),
@@ -1423,6 +1437,7 @@ def summarize(
     apply_result: Dict[str, Any],
     closed_new_expiry: int,
     closed_new_edge: int,
+    config: Config,
 ) -> Dict[str, Any]:
     open_positions = state.get("open_positions", [])
     closed_positions = state.get("closed_positions", [])
@@ -1438,6 +1453,7 @@ def summarize(
                 "edge": round(s.edge, 6),
                 "prob": round(s.side_prob, 6),
                 "price": round(s.side_price, 6),
+                "selection_score": round(signal_open_score(s, config), 8),
                 "robust_min_edge": round(s.robustness_min_edge, 6),
                 "robust_pass": bool(s.robustness_pass),
                 "target_date": s.target_date,
@@ -1702,6 +1718,7 @@ def main() -> None:
         apply_result,
         closed_new_expiry,
         closed_new_edge,
+        config,
     )
     summary["env_missing_keys"] = missing
     summary["apply_mode"] = bool(args.apply)
