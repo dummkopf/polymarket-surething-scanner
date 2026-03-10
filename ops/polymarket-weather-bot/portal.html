@@ -41,6 +41,9 @@
       <div class="card"><div class="k">Fresh Open Positions</div><div id="openPositions" class="v">-</div></div>
       <div class="card"><div class="k">Fresh Exposure (USD)</div><div id="openExposure" class="v">-</div></div>
       <div class="card"><div class="k">Fresh Unrealized PnL</div><div id="unrealized" class="v">-</div></div>
+      <div class="card"><div class="k">Fresh Realized PnL</div><div id="realized" class="v">-</div></div>
+      <div class="card"><div class="k">Fresh Total PnL</div><div id="totalPnl" class="v">-</div></div>
+      <div class="card"><div class="k">Today Realized PnL</div><div id="todayRealized" class="v">-</div></div>
       <div class="card"><div class="k">Latest Signals</div><div id="signals" class="v">-</div></div>
       <div class="card"><div class="k">Starting Fund</div><div id="startingFund" class="v">$1000</div></div>
       <div class="card"><div class="k">Pending Settle</div><div id="pendingSettle" class="v">-</div></div>
@@ -137,6 +140,12 @@ const specFromSlug=(slug)=>{
   return date;
 };
 const marketLabel=(x)=> specFromSlug(x?.slug) || x?.target_date || x?.slug || '-';
+const shanghaiDay=(t)=>{
+  if(!t) return '';
+  const d=new Date(t);
+  if(Number.isNaN(d.getTime())) return '';
+  return new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit' }).format(d);
+};
 
 function getFreshTs(){
   const x=localStorage.getItem('pm_fresh_ts');
@@ -165,13 +174,24 @@ async function refreshAll(){
     document.getElementById('freshBaseline').textContent = fmtTime(freshTs);
 
     const openAll=(state.open_positions||[]);
+    const closedAll=(state.closed_positions||[]);
     const open=openAll.filter(p=>{
       const t=new Date(p.opened_at||0).getTime();
+      return Number.isFinite(t) && t>=freshMs;
+    });
+    const closedFresh=closedAll.filter(p=>{
+      const t=new Date(p.closed_at||0).getTime();
       return Number.isFinite(t) && t>=freshMs;
     });
 
     const exposure=open.reduce((a,p)=>a+(+p.size_usd||0),0);
     const unrealized=open.reduce((a,p)=>a+(+p.unrealized_pnl_usd||0),0);
+    const realized=closedFresh.reduce((a,p)=>a+(+p.realized_pnl_usd||0),0);
+    const totalPnl=realized+unrealized;
+    const todayKey=shanghaiDay(new Date());
+    const todayRealized=closedAll
+      .filter(p=>shanghaiDay(p.closed_at)===todayKey)
+      .reduce((a,p)=>a+(+p.realized_pnl_usd||0),0);
     const pendingSettle=open.filter(p=>new Date(p.end_date||0).getTime()<=Date.now()).length;
 
     document.getElementById('openPositions').textContent=open.length;
@@ -179,6 +199,15 @@ async function refreshAll(){
     const un=document.getElementById('unrealized');
     un.textContent=open.length?('$'+fmt(unrealized,2)):'-';
     un.className='v '+(open.length?cls(unrealized):'');
+    const rz=document.getElementById('realized');
+    rz.textContent='$'+fmt(realized,2);
+    rz.className='v '+cls(realized);
+    const tp=document.getElementById('totalPnl');
+    tp.textContent='$'+fmt(totalPnl,2);
+    tp.className='v '+cls(totalPnl);
+    const tr=document.getElementById('todayRealized');
+    tr.textContent='$'+fmt(todayRealized,2);
+    tr.className='v '+cls(todayRealized);
     document.getElementById('signals').textContent=(latest&&latest.scan)?latest.scan.signals:'-';
     const ps=document.getElementById('pendingSettle');
     ps.textContent=String(pendingSettle);
