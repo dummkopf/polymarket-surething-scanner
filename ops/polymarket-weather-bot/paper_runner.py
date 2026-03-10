@@ -123,9 +123,12 @@ class Signal:
     edge: float
 
     yes_price: float
+    # Executable NO ask used for entry/edge comparisons.
     no_price: float
     yes_bid: Optional[float]
     yes_ask: Optional[float]
+    no_bid: Optional[float]
+    no_ask: Optional[float]
     yes_spread: Optional[float]
 
     forecast_max_c: float
@@ -146,6 +149,10 @@ def parse_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
 def norm_cdf(x: float, mu: float, sigma: float) -> float:
@@ -311,7 +318,8 @@ def fetch_forecast_max_temp_c(
                 "latitude": lat,
                 "longitude": lon,
                 "daily": "temperature_2m_max",
-                "timezone": "UTC",
+                # Contract date is city-local. Using auto timezone avoids UTC date skew.
+                "timezone": "auto",
                 "forecast_days": 16,
             },
             timeout=timeout_sec,
@@ -367,7 +375,20 @@ def parse_iso_to_utc(ts: str) -> Optional[datetime]:
         return None
 
 
-def market_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def market_prices(
+    market: Dict[str, Any],
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Return executable price tuple:
+      yes_bid, yes_ask, yes_spread, no_bid, no_ask, no_mid
+
+    Notes:
+    - bestBid/bestAsk are treated as YES-side executable book levels.
+    - NO executable levels are derived via complement when possible:
+        no_ask ~= 1 - yes_bid
+        no_bid ~= 1 - yes_ask
+    - outcomePrices are used as midpoint fallback only.
+    """
     yes_bid = parse_float(market.get("bestBid"))
     yes_ask = parse_float(market.get("bestAsk"))
 
@@ -378,25 +399,52 @@ def market_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[flo
         except Exception:
             outcome_prices = None
 
-    yes_px = None
-    no_px = None
+    yes_mid_from_outcome = None
+    no_mid_from_outcome = None
     if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
-        yes_px = parse_float(outcome_prices[0])
-        no_px = parse_float(outcome_prices[1])
+        yes_mid_from_outcome = parse_float(outcome_prices[0])
+        no_mid_from_outcome = parse_float(outcome_prices[1])
 
     if yes_ask is None:
-        yes_ask = yes_px
+        yes_ask = yes_mid_from_outcome
     if yes_bid is None:
-        yes_bid = yes_px
+        yes_bid = yes_mid_from_outcome
 
-    if no_px is None and yes_px is not None:
-        no_px = max(0.0, min(1.0, 1 - yes_px))
+    yes_mid = None
+    if yes_bid is not None and yes_ask is not None:
+        yes_mid = (yes_bid + yes_ask) / 2
+    elif yes_mid_from_outcome is not None:
+        yes_mid = yes_mid_from_outcome
+    elif yes_bid is not None:
+        yes_mid = yes_bid
+    elif yes_ask is not None:
+        yes_mid = yes_ask
+
+    no_mid = None
+    if no_mid_from_outcome is not None:
+        no_mid = no_mid_from_outcome
+    elif yes_mid is not None:
+        no_mid = 1 - yes_mid
+
+    no_ask = (1 - yes_bid) if yes_bid is not None else no_mid
+    no_bid = (1 - yes_ask) if yes_ask is not None else no_mid
+
+    if yes_bid is not None:
+        yes_bid = clamp01(yes_bid)
+    if yes_ask is not None:
+        yes_ask = clamp01(yes_ask)
+    if no_bid is not None:
+        no_bid = clamp01(no_bid)
+    if no_ask is not None:
+        no_ask = clamp01(no_ask)
+    if no_mid is not None:
+        no_mid = clamp01(no_mid)
 
     yes_spread = None
     if yes_ask is not None and yes_bid is not None:
-        yes_spread = yes_ask - yes_bid
+        yes_spread = max(0.0, yes_ask - yes_bid)
 
-    return yes_bid, yes_ask, yes_spread, no_px
+    return yes_bid, yes_ask, yes_spread, no_bid, no_ask, no_mid
 
 
 def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
@@ -472,9 +520,9 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             universe_rows.append(row)
             continue
 
-        yes_bid, yes_ask, yes_spread, no_price = market_prices(market)
+        yes_bid, yes_ask, yes_spread, no_bid, no_ask, no_mid = market_prices(market)
         row["yes_spread"] = None if yes_spread is None else round(yes_spread, 6)
-        if yes_ask is None or no_price is None:
+        if yes_ask is None or no_ask is None:
             row["status"] = "data-missing"
             row["brief"] = "missing executable prices"
             universe_rows.append(row)
@@ -499,13 +547,14 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             continue
         counters["model_ready"] += 1
 
-        horizon_days = max(0.0, (datetime.fromisoformat(parsed.target_date).replace(tzinfo=UTC) - now).total_seconds() / 86400)
+        # Sigma should be anchored to actual time-to-resolution (endDate), not target-date midnight.
+        horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
         sigma_c = sigma_by_horizon_days(horizon_days)
         p_yes = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
 
         yes_edge = p_yes - yes_ask
         no_prob = 1 - p_yes
-        no_edge = no_prob - no_price
+        no_edge = no_prob - no_ask
 
         # Pick side with stronger positive edge.
         if yes_edge >= no_edge:
@@ -516,7 +565,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         else:
             side = "NO"
             side_prob = no_prob
-            side_price = no_price
+            side_price = no_ask
             edge = no_edge
 
         category = None
@@ -536,6 +585,9 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "edge": round(edge, 6),
             "liquidity": round(liquidity, 6),
             "yes_spread": None if yes_spread is None else round(yes_spread, 6),
+            "no_bid": None if no_bid is None else round(no_bid, 6),
+            "no_ask": None if no_ask is None else round(no_ask, 6),
+            "no_mid": None if no_mid is None else round(no_mid, 6),
             "end_date": end_date_raw,
             "status": "quality-pass" if category else "watch-only",
             "brief": (
@@ -563,9 +615,11 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             side_price=side_price,
             edge=edge,
             yes_price=yes_ask,
-            no_price=no_price,
+            no_price=no_ask,
             yes_bid=yes_bid,
             yes_ask=yes_ask,
+            no_bid=no_bid,
+            no_ask=no_ask,
             yes_spread=yes_spread,
             forecast_max_c=forecast_max_c,
             sigma_c=sigma_c,
@@ -616,7 +670,8 @@ def today_cn_str(ts_utc: Optional[str] = None) -> str:
 
 
 def current_price_for_side(market: Dict[str, Any], side: str) -> Optional[float]:
-    yes_bid, yes_ask, _, no_price = market_prices(market)
+    yes_bid, yes_ask, _, no_bid, no_ask, no_mid = market_prices(market)
+
     yes_mid = None
     if yes_bid is not None and yes_ask is not None:
         yes_mid = (yes_bid + yes_ask) / 2
@@ -627,12 +682,63 @@ def current_price_for_side(market: Dict[str, Any], side: str) -> Optional[float]
 
     if side == "YES":
         return yes_mid
+
     if side == "NO":
-        if no_price is not None:
-            return no_price
+        if no_bid is not None and no_ask is not None:
+            return (no_bid + no_ask) / 2
+        if no_mid is not None:
+            return no_mid
         if yes_mid is not None:
             return 1 - yes_mid
+
     return None
+
+
+def current_edge_for_position(
+    slug: str,
+    side: str,
+    market: Dict[str, Any],
+    config: Config,
+    forecast_cache: Dict[Tuple[str, str], Optional[float]],
+    now: datetime,
+) -> Optional[float]:
+    parsed = parse_temperature_slug(slug)
+    if parsed is None:
+        return None
+
+    _, yes_ask, _, _, no_ask, _ = market_prices(market)
+    if side == "YES":
+        side_ask = yes_ask
+    elif side == "NO":
+        side_ask = no_ask
+    else:
+        return None
+
+    if side_ask is None:
+        return None
+
+    forecast_max_c = fetch_forecast_max_temp_c(
+        parsed.city_slug,
+        parsed.target_date,
+        config.request_timeout_sec,
+        forecast_cache,
+    )
+    if forecast_max_c is None:
+        return None
+
+    end_date = parse_iso_to_utc(str(market.get("endDate") or ""))
+    if end_date is not None:
+        horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
+    else:
+        horizon_days = max(
+            0.0,
+            (datetime.fromisoformat(parsed.target_date).replace(tzinfo=UTC) - now).total_seconds() / 86400,
+        )
+
+    sigma_c = sigma_by_horizon_days(horizon_days)
+    p_yes = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+    side_prob = p_yes if side == "YES" else (1 - p_yes)
+    return float(side_prob - side_ask)
 
 
 def settle_price_for_side(market: Dict[str, Any], side: str) -> Optional[float]:
@@ -780,6 +886,7 @@ def close_edge_decay_positions(
     """Close open paper positions when their same-side edge decays below a floor."""
     now = datetime.now(UTC)
     signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
+    forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
 
     still_open: List[Dict[str, Any]] = []
     closed_new = 0
@@ -790,6 +897,18 @@ def close_edge_decay_positions(
         key = (slug, side)
 
         edge_now = signal_edge.get(key)
+        if edge_now is None:
+            m = market_map.get(slug)
+            if m is not None:
+                edge_now = current_edge_for_position(
+                    slug=slug,
+                    side=side,
+                    market=m,
+                    config=config,
+                    forecast_cache=forecast_cache,
+                    now=now,
+                )
+
         if edge_now is None:
             still_open.append(p)
             continue

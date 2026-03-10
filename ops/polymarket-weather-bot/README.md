@@ -183,6 +183,9 @@ Applied takeaways currently implemented:
 - Avoid over-reacting to one-tick dislocations via `confirm_ticks` signal persistence
 - Cap concentration risk via `max_positions_per_city`
 - Enforce deterministic risk exits via `edge_decay` + expiry handling
+- Use city-local forecast-day alignment (`timezone=auto`) to avoid UTC date skew in weather contracts
+- Use executable-side pricing for both sides (YES ask, NO ask-equivalent) instead of midpoint-only NO pricing
+- Anchor forecast uncertainty (`sigma`) to actual time-to-resolution (`endDate - now`)
 - Size entries with fractional Kelly + hard max-bet cap
 - Keep full replayable snapshots for pseudo-backtest and diagnostics
 
