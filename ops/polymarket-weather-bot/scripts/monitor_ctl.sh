@@ -20,6 +20,10 @@ KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
 KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.10}"
 MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.01}"
 MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.01}"
+ROBUSTNESS_MU_SHIFT_C="${ROBUSTNESS_MU_SHIFT_C:-0.7}"
+ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
+ROBUSTNESS_SIGMA_SCALE_HIGH="${ROBUSTNESS_SIGMA_SCALE_HIGH:-1.15}"
+ROBUSTNESS_MIN_EDGE="${ROBUSTNESS_MIN_EDGE:-0.0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p "$STATE_DIR"
@@ -63,6 +67,10 @@ cmd_start() {
         --kelly-fraction-tail '$KELLY_FRACTION_TAIL' \
         --max-bet-fraction '$MAX_BET_FRACTION' \
         --min-edge-for-entry '$MIN_EDGE_FOR_ENTRY' \
+        --robustness-mu-shift-c '$ROBUSTNESS_MU_SHIFT_C' \
+        --robustness-sigma-scale-low '$ROBUSTNESS_SIGMA_SCALE_LOW' \
+        --robustness-sigma-scale-high '$ROBUSTNESS_SIGMA_SCALE_HIGH' \
+        --robustness-min-edge '$ROBUSTNESS_MIN_EDGE' \
         >> '$LOG_FILE' 2>&1 || true
       sleep '$INTERVAL_SEC'
     done
@@ -87,7 +95,7 @@ cmd_stop() {
 
 cmd_status() {
   if is_running; then
-    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL})"
+    echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE})"
   else
     echo "monitor: stopped"
   fi
@@ -122,7 +130,11 @@ cmd_run_once() {
     --kelly-fraction-core "$KELLY_FRACTION_CORE" \
     --kelly-fraction-tail "$KELLY_FRACTION_TAIL" \
     --max-bet-fraction "$MAX_BET_FRACTION" \
-    --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY"
+    --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY" \
+    --robustness-mu-shift-c "$ROBUSTNESS_MU_SHIFT_C" \
+    --robustness-sigma-scale-low "$ROBUSTNESS_SIGMA_SCALE_LOW" \
+    --robustness-sigma-scale-high "$ROBUSTNESS_SIGMA_SCALE_HIGH" \
+    --robustness-min-edge "$ROBUSTNESS_MIN_EDGE"
 }
 
 cmd_logs() {
@@ -173,6 +185,10 @@ Env overrides:
   KELLY_FRACTION_TAIL=<float>                      # default 0.10
   MAX_BET_FRACTION=<float>                         # default 0.01
   MIN_EDGE_FOR_ENTRY=<float>                       # default 0.01
+  ROBUSTNESS_MU_SHIFT_C=<float>                    # default 0.7
+  ROBUSTNESS_SIGMA_SCALE_LOW=<float>               # default 0.85
+  ROBUSTNESS_SIGMA_SCALE_HIGH=<float>              # default 1.15
+  ROBUSTNESS_MIN_EDGE=<float>                      # default 0.0
   PYTHON_BIN=<python executable>                   # default python3
 USAGE
     exit 1

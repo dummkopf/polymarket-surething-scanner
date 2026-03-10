@@ -19,6 +19,7 @@ Execution-first weather workflow for Polymarket.
 - Parses `highest-temperature-...` weather contracts
 - Uses Open-Meteo daily max temperature forecast as model baseline
 - Converts model forecast to contract probabilities
+- Runs a robustness gate across small mean/sigma perturbations before promoting signals
 - Generates edge-ranked signals (core/tail buckets)
 - Opens/updates **paper** positions under your risk constraints
 
@@ -36,6 +37,11 @@ Execution-first weather workflow for Polymarket.
   - `kelly_fraction_tail=0.10`
   - `max_bet_fraction=0.01`
   - `min_edge_for_entry=0.01`
+- robustness gate defaults:
+  - `robustness_mu_shift_c=0.7`
+  - `robustness_sigma_scale_low=0.85`
+  - `robustness_sigma_scale_high=1.15`
+  - `robustness_min_edge=0.0`
 - no new position when `<12h` to expiry (can override)
 
 ## Paper Allocation Plan (Starting Fund = $1000)
@@ -89,7 +95,11 @@ python3 paper_runner.py --apply \
   --kelly-fraction-core 0.20 \
   --kelly-fraction-tail 0.08 \
   --max-bet-fraction 0.01 \
-  --min-edge-for-entry 0.02
+  --min-edge-for-entry 0.02 \
+  --robustness-mu-shift-c 0.7 \
+  --robustness-sigma-scale-low 0.85 \
+  --robustness-sigma-scale-high 1.15 \
+  --robustness-min-edge 0.0
 ```
 
 Custom files:
@@ -104,9 +114,16 @@ python3 paper_runner.py \
 
 ## Output files
 
-- `state/paper_state.json`: open/closed paper positions and PnL
+- `state/paper_state.json`: open/closed paper positions and PnL, including model audit fields on entry
 - `state/snapshots.jsonl`: market+model snapshots for later replay/backtest
 - `state/monitor.log`: continuous monitor runtime log
+
+Audit fields now include:
+- forecast mean (`forecast_max_c`)
+- sigma (`sigma_c`)
+- bucket bounds (`bucket_lower`, `bucket_upper`)
+- side price source (`side_price_source`)
+- robustness ranges (`robustness_min_prob/max_prob`, `robustness_min_edge/max_edge`, `robustness_pass`)
 
 ## Local dashboard
 
@@ -138,6 +155,7 @@ Default behavior:
 - edge decay auto-close: `exit_edge_floor=0.01`
 - signal persistence: `confirm_ticks=2`
 - fractional Kelly sizing active (core/tail fractions + max bet cap)
+- robustness gate active (`mu ± 0.7°C`, `sigma × {0.85, 1.0, 1.15}` by default)
 
 Optional env overrides when starting:
 
@@ -156,6 +174,10 @@ KELLY_FRACTION_CORE=0.20 \
 KELLY_FRACTION_TAIL=0.08 \
 MAX_BET_FRACTION=0.01 \
 MIN_EDGE_FOR_ENTRY=0.02 \
+ROBUSTNESS_MU_SHIFT_C=0.7 \
+ROBUSTNESS_SIGMA_SCALE_LOW=0.85 \
+ROBUSTNESS_SIGMA_SCALE_HIGH=1.15 \
+ROBUSTNESS_MIN_EDGE=0.0 \
 ./scripts/monitor_ctl.sh restart
 ```
 
@@ -186,6 +208,8 @@ Applied takeaways currently implemented:
 - Use city-local forecast-day alignment (`timezone=auto`) to avoid UTC date skew in weather contracts
 - Use executable-side pricing for both sides (YES ask, NO ask-equivalent) instead of midpoint-only NO pricing
 - Anchor forecast uncertainty (`sigma`) to actual time-to-resolution (`endDate - now`)
+- Reject brittle signals with a robustness gate across mean/sigma perturbations
+- Store audit fields so every entry can be inspected after the fact
 - Size entries with fractional Kelly + hard max-bet cap
 - Keep full replayable snapshots for pseudo-backtest and diagnostics
 

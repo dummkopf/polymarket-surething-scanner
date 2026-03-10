@@ -96,6 +96,13 @@ class Config:
     max_bet_fraction: float = 0.01
     min_edge_for_entry: float = 0.01
 
+    # Model robustness gate: require edge to remain positive under
+    # small forecast mean shifts and sigma perturbations.
+    robustness_mu_shift_c: float = 0.7
+    robustness_sigma_scale_low: float = 0.85
+    robustness_sigma_scale_high: float = 1.15
+    robustness_min_edge: float = 0.0
+
     request_timeout_sec: int = 20
 
 
@@ -133,6 +140,17 @@ class Signal:
 
     forecast_max_c: float
     sigma_c: float
+    bucket_lower: Optional[float]
+    bucket_upper: Optional[float]
+    side_price_source: str
+    robustness_mu_shift_c: float
+    robustness_sigma_low_c: float
+    robustness_sigma_high_c: float
+    robustness_min_prob: float
+    robustness_max_prob: float
+    robustness_min_edge: float
+    robustness_max_edge: float
+    robustness_pass: bool
 
     end_date: str
     liquidity: float
@@ -366,6 +384,93 @@ def prob_yes_from_contract(
     return max(0.0, min(1.0, p))
 
 
+def side_prob_from_p_yes(p_yes: float, side: str) -> float:
+    return p_yes if side == "YES" else (1.0 - p_yes)
+
+
+def side_price_source_label(market: Dict[str, Any], side: str) -> str:
+    yes_bid = parse_float(market.get("bestBid"))
+    yes_ask = parse_float(market.get("bestAsk"))
+
+    outcome_prices = market.get("outcomePrices")
+    if isinstance(outcome_prices, str):
+        try:
+            outcome_prices = json.loads(outcome_prices)
+        except Exception:
+            outcome_prices = None
+
+    yes_mid_from_outcome = None
+    no_mid_from_outcome = None
+    if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+        yes_mid_from_outcome = parse_float(outcome_prices[0])
+        no_mid_from_outcome = parse_float(outcome_prices[1])
+
+    if side == "YES":
+        if yes_ask is not None:
+            return "yes_ask_direct"
+        if yes_mid_from_outcome is not None:
+            return "yes_mid_outcome_fallback"
+        if yes_bid is not None:
+            return "yes_bid_fallback"
+        return "unavailable"
+
+    if side == "NO":
+        if yes_bid is not None:
+            return "no_ask_synthetic_from_yes_bid"
+        if no_mid_from_outcome is not None:
+            return "no_mid_outcome_fallback"
+        if yes_ask is not None or yes_mid_from_outcome is not None:
+            return "no_synthetic_from_yes_mid"
+        return "unavailable"
+
+    return "unknown"
+
+
+def calc_robustness_metrics(
+    forecast_max_c: float,
+    sigma_c: float,
+    contract: ParsedContract,
+    side: str,
+    side_price: float,
+    config: Config,
+) -> Dict[str, Any]:
+    mu_shift_c = max(0.0, float(config.robustness_mu_shift_c))
+    sigma_base_c = max(0.05, float(sigma_c))
+    sigma_low_c = max(0.05, sigma_base_c * max(0.01, float(config.robustness_sigma_scale_low)))
+    sigma_high_c = max(0.05, sigma_base_c * max(0.01, float(config.robustness_sigma_scale_high)))
+
+    sigma_candidates = []
+    for candidate in (sigma_low_c, sigma_base_c, sigma_high_c):
+        if not any(abs(candidate - existing) < 1e-9 for existing in sigma_candidates):
+            sigma_candidates.append(candidate)
+
+    probs: List[float] = []
+    edges: List[float] = []
+    for mu_shift in (-mu_shift_c, 0.0, mu_shift_c):
+        mu_candidate_c = forecast_max_c + mu_shift
+        for sigma_candidate_c in sigma_candidates:
+            p_yes = prob_yes_from_contract(mu_candidate_c, sigma_candidate_c, contract)
+            side_prob = side_prob_from_p_yes(p_yes, side)
+            probs.append(side_prob)
+            edges.append(side_prob - side_price)
+
+    min_prob = min(probs) if probs else 0.0
+    max_prob = max(probs) if probs else 0.0
+    min_edge = min(edges) if edges else -1.0
+    max_edge = max(edges) if edges else -1.0
+
+    return {
+        "mu_shift_c": mu_shift_c,
+        "sigma_low_c": sigma_low_c,
+        "sigma_high_c": sigma_high_c,
+        "min_prob": min_prob,
+        "max_prob": max_prob,
+        "min_edge": min_edge,
+        "max_edge": max_edge,
+        "pass": min_edge >= float(config.robustness_min_edge),
+    }
+
+
 def parse_iso_to_utc(ts: str) -> Optional[datetime]:
     if not ts:
         return None
@@ -568,11 +673,35 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             side_price = no_ask
             edge = no_edge
 
+        side_price_source = side_price_source_label(market, side)
+        robustness = calc_robustness_metrics(
+            forecast_max_c=forecast_max_c,
+            sigma_c=sigma_c,
+            contract=parsed,
+            side=side,
+            side_price=side_price,
+            config=config,
+        )
+
+        base_core = side_prob >= config.core_prob_min and edge >= config.core_edge_min
+        base_tail = (
+            side_prob <= config.tail_prob_max
+            and edge >= config.tail_edge_min
+            and side_price <= config.tail_price_max
+        )
+
         category = None
-        if side_prob >= config.core_prob_min and edge >= config.core_edge_min:
+        if base_core and robustness["pass"]:
             category = "core"
-        elif side_prob <= config.tail_prob_max and edge >= config.tail_edge_min and side_price <= config.tail_price_max:
+        elif base_tail and robustness["pass"]:
             category = "tail"
+
+        if category:
+            brief = "meets quality + robustness gates"
+        elif base_core or base_tail:
+            brief = "fails robustness gate"
+        else:
+            brief = "reliable weather+odds, but below quality threshold"
 
         candidate_row = {
             "slug": slug,
@@ -583,6 +712,19 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "side_prob": round(side_prob, 6),
             "side_price": round(side_price, 6),
             "edge": round(edge, 6),
+            "forecast_max_c": round(forecast_max_c, 6),
+            "sigma_c": round(sigma_c, 6),
+            "bucket_lower": parsed.lower,
+            "bucket_upper": parsed.upper,
+            "side_price_source": side_price_source,
+            "robustness_mu_shift_c": round(float(robustness["mu_shift_c"]), 6),
+            "robustness_sigma_low_c": round(float(robustness["sigma_low_c"]), 6),
+            "robustness_sigma_high_c": round(float(robustness["sigma_high_c"]), 6),
+            "robustness_min_prob": round(float(robustness["min_prob"]), 6),
+            "robustness_max_prob": round(float(robustness["max_prob"]), 6),
+            "robustness_min_edge": round(float(robustness["min_edge"]), 6),
+            "robustness_max_edge": round(float(robustness["max_edge"]), 6),
+            "robustness_pass": bool(robustness["pass"]),
             "liquidity": round(liquidity, 6),
             "yes_spread": None if yes_spread is None else round(yes_spread, 6),
             "no_bid": None if no_bid is None else round(no_bid, 6),
@@ -590,11 +732,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "no_mid": None if no_mid is None else round(no_mid, 6),
             "end_date": end_date_raw,
             "status": "quality-pass" if category else "watch-only",
-            "brief": (
-                "meets quality gates"
-                if category
-                else "reliable weather+odds, but below quality threshold"
-            ),
+            "brief": brief,
         }
         radar_rows.append(candidate_row)
         universe_rows.append(candidate_row)
@@ -623,6 +761,17 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             yes_spread=yes_spread,
             forecast_max_c=forecast_max_c,
             sigma_c=sigma_c,
+            bucket_lower=parsed.lower,
+            bucket_upper=parsed.upper,
+            side_price_source=side_price_source,
+            robustness_mu_shift_c=float(robustness["mu_shift_c"]),
+            robustness_sigma_low_c=float(robustness["sigma_low_c"]),
+            robustness_sigma_high_c=float(robustness["sigma_high_c"]),
+            robustness_min_prob=float(robustness["min_prob"]),
+            robustness_max_prob=float(robustness["max_prob"]),
+            robustness_min_edge=float(robustness["min_edge"]),
+            robustness_max_edge=float(robustness["max_edge"]),
+            robustness_pass=bool(robustness["pass"]),
             end_date=end_date_raw,
             liquidity=liquidity,
         )
@@ -1145,6 +1294,17 @@ def apply_paper_positions(
             "edge": round(s.edge, 6),
             "forecast_max_c": round(s.forecast_max_c, 4),
             "sigma_c": round(s.sigma_c, 4),
+            "bucket_lower": s.bucket_lower,
+            "bucket_upper": s.bucket_upper,
+            "side_price_source": s.side_price_source,
+            "robustness_mu_shift_c": round(s.robustness_mu_shift_c, 4),
+            "robustness_sigma_low_c": round(s.robustness_sigma_low_c, 4),
+            "robustness_sigma_high_c": round(s.robustness_sigma_high_c, 4),
+            "robustness_min_prob": round(s.robustness_min_prob, 6),
+            "robustness_max_prob": round(s.robustness_max_prob, 6),
+            "robustness_min_edge": round(s.robustness_min_edge, 6),
+            "robustness_max_edge": round(s.robustness_max_edge, 6),
+            "robustness_pass": bool(s.robustness_pass),
             "liquidity": round(s.liquidity, 4),
             "yes_ask": s.yes_ask,
             "yes_bid": s.yes_bid,
@@ -1194,6 +1354,8 @@ def summarize(
                 "edge": round(s.edge, 6),
                 "prob": round(s.side_prob, 6),
                 "price": round(s.side_price, 6),
+                "robust_min_edge": round(s.robustness_min_edge, 6),
+                "robust_pass": bool(s.robustness_pass),
                 "target_date": s.target_date,
                 "end_date": s.end_date,
                 "liquidity": round(s.liquidity, 2),
@@ -1335,6 +1497,30 @@ def main() -> None:
         default=None,
         help="Global minimum edge threshold required for entry",
     )
+    parser.add_argument(
+        "--robustness-mu-shift-c",
+        type=float,
+        default=None,
+        help="Forecast mean perturbation in C used by robustness gate",
+    )
+    parser.add_argument(
+        "--robustness-sigma-scale-low",
+        type=float,
+        default=None,
+        help="Lower sigma multiplier used by robustness gate",
+    )
+    parser.add_argument(
+        "--robustness-sigma-scale-high",
+        type=float,
+        default=None,
+        help="Upper sigma multiplier used by robustness gate",
+    )
+    parser.add_argument(
+        "--robustness-min-edge",
+        type=float,
+        default=None,
+        help="Require scenario worst-case edge to stay above this threshold",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -1364,6 +1550,14 @@ def main() -> None:
         config.max_bet_fraction = max(0.0, float(args.max_bet_fraction))
     if args.min_edge_for_entry is not None:
         config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
+    if args.robustness_mu_shift_c is not None:
+        config.robustness_mu_shift_c = max(0.0, float(args.robustness_mu_shift_c))
+    if args.robustness_sigma_scale_low is not None:
+        config.robustness_sigma_scale_low = max(0.01, float(args.robustness_sigma_scale_low))
+    if args.robustness_sigma_scale_high is not None:
+        config.robustness_sigma_scale_high = max(0.01, float(args.robustness_sigma_scale_high))
+    if args.robustness_min_edge is not None:
+        config.robustness_min_edge = float(args.robustness_min_edge)
 
     env_path = Path(args.env)
     state_path = Path(args.state)
@@ -1441,6 +1635,10 @@ def main() -> None:
         "kelly_fraction_tail": config.kelly_fraction_tail,
         "max_bet_fraction": config.max_bet_fraction,
         "min_edge_for_entry": config.min_edge_for_entry,
+        "robustness_mu_shift_c": config.robustness_mu_shift_c,
+        "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
+        "robustness_sigma_scale_high": config.robustness_sigma_scale_high,
+        "robustness_min_edge": config.robustness_min_edge,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
