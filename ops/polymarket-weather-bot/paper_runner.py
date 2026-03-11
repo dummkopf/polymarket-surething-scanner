@@ -238,6 +238,27 @@ def ensure_dirs(paths: List[Path]) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _get_json_with_retry(session: requests.Session, url: str, *, params: Dict[str, Any], timeout_sec: int, retries: int = 3, backoff_sec: float = 0.8) -> Any:
+    last_err: Optional[Exception] = None
+    for i in range(max(1, retries)):
+        try:
+            resp = session.get(url, params=params, timeout=timeout_sec)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                sleep_sec = backoff_sec * (2 ** i)
+                try:
+                    import time
+                    time.sleep(sleep_sec)
+                except Exception:
+                    pass
+    if last_err:
+        raise last_err
+    raise RuntimeError("request failed without explicit error")
+
+
 def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
     """Fetch weather markets natively from Gamma API.
 
@@ -262,13 +283,18 @@ def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
     session = requests.Session()
 
     while True:
-        resp = session.get(
-            "https://gamma-api.polymarket.com/series",
-            params={"closed": "false", "limit": series_limit, "offset": offset},
-            timeout=timeout_sec,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
+        try:
+            batch = _get_json_with_retry(
+                session,
+                "https://gamma-api.polymarket.com/series",
+                params={"closed": "false", "limit": series_limit, "offset": offset},
+                timeout_sec=timeout_sec,
+                retries=3,
+                backoff_sec=0.8,
+            )
+        except Exception:
+            # Upstream transient failure: keep loop alive and return what we have.
+            break
         if not isinstance(batch, list) or not batch:
             break
 
@@ -303,13 +329,14 @@ def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
 
     def fetch_event_rows(event_slug: str) -> List[Dict[str, Any]]:
         try:
-            event_resp = session.get(
+            rows = _get_json_with_retry(
+                session,
                 "https://gamma-api.polymarket.com/events",
                 params={"slug": event_slug, "limit": 1},
-                timeout=timeout_sec,
+                timeout_sec=timeout_sec,
+                retries=2,
+                backoff_sec=0.5,
             )
-            event_resp.raise_for_status()
-            rows = event_resp.json()
             if isinstance(rows, list):
                 return rows
         except Exception:
