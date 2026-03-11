@@ -106,6 +106,26 @@ class Config:
     robustness_sigma_scale_high: float = 1.15
     robustness_min_edge: float = 0.0
 
+    # Rotation: allow replacing weaker profitable positions with stronger candidates.
+    enable_edge_rotation: bool = True
+    rotation_min_edge_delta: float = 0.05
+    rotation_min_ev_per_usd_delta: float = 0.08
+    rotation_min_holding_minutes: int = 10
+    max_rotations_per_run: int = 1
+    rotation_require_profit: bool = True
+
+    # Compounding: derive next-run risk caps from current equity.
+    compound_enabled: bool = True
+    compound_trade_size_fraction: float = 0.01
+    compound_max_open_exposure_fraction: float = 0.12
+    compound_daily_stop_loss_fraction: float = 0.03
+    compound_trade_size_min_usd: float = 10.0
+    compound_trade_size_max_usd: float = 25.0
+    compound_max_open_exposure_min_usd: float = 120.0
+    compound_max_open_exposure_max_usd: float = 300.0
+    compound_daily_stop_loss_min_abs_usd: float = 30.0
+    compound_daily_stop_loss_max_abs_usd: float = 120.0
+
     request_timeout_sec: int = 20
 
 
@@ -922,6 +942,27 @@ def current_price_for_side(market: Dict[str, Any], side: str) -> Optional[float]
     return None
 
 
+def executable_exit_price_for_side(market: Dict[str, Any], side: str) -> Optional[float]:
+    """
+    Strict executable exit pricing (paper ~= live):
+    - close YES long at YES bid
+    - close NO long at NO bid (= 1 - YES ask when ask exists)
+    No midpoint fallback.
+    """
+    yes_bid_raw = parse_float(market.get("bestBid"))
+    yes_ask_raw = parse_float(market.get("bestAsk"))
+
+    if side == "YES":
+        return clamp01(yes_bid_raw) if yes_bid_raw is not None else None
+
+    if side == "NO":
+        if yes_ask_raw is None:
+            return None
+        return clamp01(1 - yes_ask_raw)
+
+    return None
+
+
 def current_edge_for_position(
     slug: str,
     side: str,
@@ -1034,6 +1075,41 @@ def kelly_full_fraction(prob: float, price: float) -> float:
     return (prob - price) / (1.0 - price)
 
 
+def edge_per_dollar(edge: float, price: float) -> float:
+    if price <= 0:
+        return 0.0
+    return float(edge) / float(price)
+
+
+def derive_effective_risk_limits(config: Config, bankroll_equity: float) -> Dict[str, float]:
+    trade_size = float(config.trade_size_usd)
+    max_open_exposure = float(config.max_open_exposure_usd)
+    daily_stop_loss = float(config.daily_stop_loss_usd)
+
+    if bool(config.compound_enabled):
+        eq = max(1.0, float(bankroll_equity))
+
+        trade_size = max(
+            float(config.compound_trade_size_min_usd),
+            min(float(config.compound_trade_size_max_usd), eq * float(config.compound_trade_size_fraction)),
+        )
+        max_open_exposure = max(
+            float(config.compound_max_open_exposure_min_usd),
+            min(float(config.compound_max_open_exposure_max_usd), eq * float(config.compound_max_open_exposure_fraction)),
+        )
+        stop_abs = max(
+            float(config.compound_daily_stop_loss_min_abs_usd),
+            min(float(config.compound_daily_stop_loss_max_abs_usd), eq * float(config.compound_daily_stop_loss_fraction)),
+        )
+        daily_stop_loss = -stop_abs
+
+    return {
+        "trade_size_usd": round(float(trade_size), 6),
+        "max_open_exposure_usd": round(float(max_open_exposure), 6),
+        "daily_stop_loss_usd": round(float(daily_stop_loss), 6),
+    }
+
+
 def calc_unrealized(open_positions: List[Dict[str, Any]], market_map: Dict[str, Dict[str, Any]]) -> float:
     total = 0.0
     for p in open_positions:
@@ -1045,7 +1121,7 @@ def calc_unrealized(open_positions: List[Dict[str, Any]], market_map: Dict[str, 
         m = market_map.get(slug)
         if not m:
             continue
-        px = current_price_for_side(m, side)
+        px = executable_exit_price_for_side(m, side)
         if px is None:
             continue
         total += shares * (px - entry)
@@ -1100,7 +1176,7 @@ def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict
         entry = float(p.get("entry_price", 0.0))
 
         m = market_map.get(slug)
-        px = current_price_for_side(m, side) if m else None
+        px = executable_exit_price_for_side(m, side) if m else None
         if px is None:
             p["mark_price"] = None
             p["unrealized_pnl_usd"] = None
@@ -1163,7 +1239,7 @@ def close_edge_decay_positions(
             continue
 
         m = market_map.get(slug)
-        px = current_price_for_side(m, side) if m else None
+        px = executable_exit_price_for_side(m, side) if m else None
         if px is None:
             still_open.append(p)
             continue
@@ -1273,10 +1349,6 @@ def apply_paper_positions(
     open_positions: List[Dict[str, Any]] = state.get("open_positions", [])
     closed_positions: List[Dict[str, Any]] = state.get("closed_positions", [])
 
-    exposure = calc_exposure(open_positions)
-    free_exposure = max(0.0, config.max_open_exposure_usd - exposure)
-    slots_left = int(free_exposure // config.trade_size_usd)
-
     day_cn = today_cn_str()
     realized_today = calc_realized_today(closed_positions, day_cn)
     realized_total = calc_realized_total(closed_positions)
@@ -1284,15 +1356,26 @@ def apply_paper_positions(
 
     # Equity reference for Kelly sizing in paper mode.
     bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + realized_total + unrealized)
+    effective_limits = derive_effective_risk_limits(config, bankroll_equity)
 
-    stop_triggered = (realized_today + unrealized) <= config.daily_stop_loss_usd
+    trade_size_usd = float(effective_limits["trade_size_usd"])
+    max_open_exposure_usd = float(effective_limits["max_open_exposure_usd"])
+    daily_stop_loss_usd = float(effective_limits["daily_stop_loss_usd"])
+
+    exposure = calc_exposure(open_positions)
+    free_exposure = max(0.0, max_open_exposure_usd - exposure)
+
+    stop_triggered = (realized_today + unrealized) <= daily_stop_loss_usd
 
     opened = 0
     skipped_existing = 0
     blocked_by_risk = 0
+    blocked_by_cluster = 0
     blocked_by_confirm = 0
     blocked_by_edge_gate = 0
     blocked_by_kelly = 0
+    rotated_closed = 0
+    rotation_opened = 0
 
     if stop_triggered:
         return {
@@ -1303,9 +1386,15 @@ def apply_paper_positions(
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
+            "rotated_closed": 0,
+            "rotation_opened": 0,
             "stop_triggered": True,
             "realized_today": realized_today,
             "unrealized": unrealized,
+            "bankroll_equity_usd": bankroll_equity,
+            "effective_trade_size_usd": trade_size_usd,
+            "effective_max_open_exposure_usd": max_open_exposure_usd,
+            "effective_daily_stop_loss_usd": daily_stop_loss_usd,
         }
 
     confirm_counts: Dict[str, int] = state.get("signal_confirm_counts", {})
@@ -1317,12 +1406,18 @@ def apply_paper_positions(
         else:
             blocked_by_confirm += 1
 
-    picks = select_signals_for_opening(confirmed_signals, config, slots_left)
+    # Try all ranked confirmed signals (not only top-N) so blocked picks can backfill.
+    ranked = sorted(
+        confirmed_signals,
+        key=lambda s: (signal_open_score(s, config), float(s.edge), float(s.side_prob)),
+        reverse=True,
+    )
+
+    signal_map: Dict[Tuple[str, str], Signal] = {(s.slug, s.side): s for s in signals}
 
     existing_keys = {(p.get("slug"), p.get("side")) for p in open_positions}
     city_counts: Dict[str, int] = {}
     cluster_exposure: Dict[str, float] = {}
-    blocked_by_cluster = 0
     for p in open_positions:
         c = str(p.get("city_slug") or "")
         if not c:
@@ -1331,29 +1426,9 @@ def apply_paper_positions(
         cluster_key_existing = event_cluster_key(c, str(p.get("target_date") or ""))
         cluster_exposure[cluster_key_existing] = cluster_exposure.get(cluster_key_existing, 0.0) + float(p.get("size_usd", 0.0))
 
-    for s in picks:
-        key = (s.slug, s.side)
-        if key in existing_keys:
-            skipped_existing += 1
-            continue
-
-        if city_counts.get(s.city_slug, 0) >= int(config.max_positions_per_city):
-            blocked_by_risk += 1
-            continue
-
+    def compute_open_ticket(s: Signal, available_exposure: float, cluster_remaining: float) -> Optional[Dict[str, float]]:
         if s.side_price <= 0:
-            blocked_by_risk += 1
-            continue
-
-        if float(s.edge) < float(config.min_edge_for_entry):
-            blocked_by_edge_gate += 1
-            continue
-
-        cluster_key = event_cluster_key(s.city_slug, s.target_date)
-        cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure.get(cluster_key, 0.0))
-        if cluster_remaining <= 0.25:
-            blocked_by_cluster += 1
-            continue
+            return None
 
         kelly_frac = (
             float(config.kelly_fraction_core)
@@ -1366,24 +1441,92 @@ def apply_paper_positions(
             max(0.0, full_kelly) * max(0.0, kelly_frac),
         )
         if used_kelly <= 0:
-            blocked_by_kelly += 1
-            continue
+            return None
 
         ttl_bucket, ttl_mult = ttl_bucket_and_multiplier(s.end_date)
 
         # Kelly-implied size, then apply TTL multiplier and hard exposure caps.
         kelly_size_usd = bankroll_equity * used_kelly
-        size_cap_by_policy = float(config.trade_size_usd) * float(ttl_mult)
+        size_cap_by_policy = float(trade_size_usd) * float(ttl_mult)
         if s.category == "tail":
             size_cap_by_policy *= float(config.tail_size_cap_fraction)
-        size_usd = min(kelly_size_usd * float(ttl_mult), size_cap_by_policy, free_exposure, cluster_remaining)
 
+        size_usd = min(
+            kelly_size_usd * float(ttl_mult),
+            size_cap_by_policy,
+            float(available_exposure),
+            float(cluster_remaining),
+        )
         if size_usd <= 0.25:
+            return None
+
+        return {
+            "full_kelly": float(full_kelly),
+            "used_kelly": float(used_kelly),
+            "ttl_mult": float(ttl_mult),
+            "ttl_bucket": ttl_bucket,
+            "kelly_size_usd": float(kelly_size_usd),
+            "size_cap_by_policy": float(size_cap_by_policy),
+            "size_usd": float(size_usd),
+        }
+
+    def can_open_with_state(
+        s: Signal,
+        available_exposure: float,
+        city_counts_ref: Dict[str, int],
+        cluster_exposure_ref: Dict[str, float],
+        existing_keys_ref: set,
+    ) -> Optional[str]:
+        key = (s.slug, s.side)
+        if key in existing_keys_ref:
+            return "already_open"
+
+        if city_counts_ref.get(s.city_slug, 0) >= int(config.max_positions_per_city):
+            return "city_cap"
+
+        if s.side_price <= 0:
+            return "bad_price"
+
+        if float(s.edge) < float(config.min_edge_for_entry):
+            return "min_edge"
+
+        cluster_key = event_cluster_key(s.city_slug, s.target_date)
+        cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure_ref.get(cluster_key, 0.0))
+        if cluster_remaining <= 0.25:
+            return "cluster_cap"
+
+        ticket = compute_open_ticket(s, available_exposure, cluster_remaining)
+        if ticket is None:
+            return "kelly"
+
+        return None
+
+    def register_block(reason: str) -> None:
+        nonlocal blocked_by_risk, blocked_by_cluster, blocked_by_edge_gate, blocked_by_kelly
+        if reason == "cluster_cap":
+            blocked_by_cluster += 1
+        elif reason == "min_edge":
+            blocked_by_edge_gate += 1
+        elif reason == "kelly":
             blocked_by_kelly += 1
-            continue
+        elif reason in {"city_cap", "bad_price"}:
+            blocked_by_risk += 1
 
+    def open_signal(s: Signal) -> Tuple[bool, str]:
+        nonlocal free_exposure, opened
+
+        reason = can_open_with_state(s, free_exposure, city_counts, cluster_exposure, existing_keys)
+        if reason is not None:
+            return False, reason
+
+        cluster_key = event_cluster_key(s.city_slug, s.target_date)
+        cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure.get(cluster_key, 0.0))
+        ticket = compute_open_ticket(s, free_exposure, cluster_remaining)
+        if ticket is None:
+            return False, "kelly"
+
+        size_usd = float(ticket["size_usd"])
         shares = size_usd / s.side_price
-
         selection_score = signal_open_score(s, config)
 
         pos = {
@@ -1398,13 +1541,13 @@ def apply_paper_positions(
             "side": s.side,
             "category": s.category,
             "size_usd": round(size_usd, 6),
-            "ttl_bucket": ttl_bucket,
-            "size_multiplier": round(ttl_mult, 4),
+            "ttl_bucket": ticket["ttl_bucket"],
+            "size_multiplier": round(float(ticket["ttl_mult"]), 4),
             "cluster_remaining_usd_before_entry": round(cluster_remaining, 6),
-            "size_cap_by_policy_usd": round(size_cap_by_policy, 6),
-            "kelly_full_fraction": round(full_kelly, 6),
-            "kelly_fraction_used": round(used_kelly, 6),
-            "kelly_size_usd_pre_ttl": round(kelly_size_usd, 6),
+            "size_cap_by_policy_usd": round(float(ticket["size_cap_by_policy"]), 6),
+            "kelly_full_fraction": round(float(ticket["full_kelly"]), 6),
+            "kelly_fraction_used": round(float(ticket["used_kelly"]), 6),
+            "kelly_size_usd_pre_ttl": round(float(ticket["kelly_size_usd"]), 6),
             "selection_score": round(selection_score, 8),
             "bankroll_equity_usd_at_entry": round(bankroll_equity, 6),
             "entry_price": round(s.side_price, 6),
@@ -1430,14 +1573,195 @@ def apply_paper_positions(
             "yes_spread": s.yes_spread,
             "no_price": s.no_price,
         }
+
         open_positions.append(pos)
-        existing_keys.add(key)
+        existing_keys.add((s.slug, s.side))
         city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
         cluster_exposure[cluster_key] = cluster_exposure.get(cluster_key, 0.0) + size_usd
         free_exposure = max(0.0, free_exposure - size_usd)
         opened += 1
+        return True, "opened"
+
+    def current_edge_and_prices_for_position(p: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        slug = str(p.get("slug") or "")
+        side = str(p.get("side") or "")
+        m = market_map.get(slug)
+        if not m:
+            return None, None, None
+
+        yes_bid, yes_ask, _, _, no_ask, _ = market_prices(m)
+        side_ask = yes_ask if side == "YES" else no_ask
+        mark_price = current_price_for_side(m, side)
+
+        edge_now: Optional[float] = None
+        sig = signal_map.get((slug, side))
+        if sig is not None:
+            edge_now = float(sig.edge)
+        else:
+            edge_now = current_edge_for_position(
+                slug=slug,
+                side=side,
+                market=m,
+                config=config,
+                forecast_cache={},
+                now=datetime.now(UTC),
+            )
+
+        return edge_now, side_ask, mark_price
+
+    def close_position_for_rotation(p: Dict[str, Any], target_signal: Signal, edge_now: float, mark_price: float) -> None:
+        nonlocal free_exposure, rotated_closed
+
+        shares = float(p.get("shares", 0.0))
+        entry = float(p.get("entry_price", 0.0))
+        pnl = shares * (mark_price - entry)
+
+        p2 = dict(p)
+        p2["closed_at"] = iso_now()
+        p2["settle_price"] = round(mark_price, 6)
+        p2["realized_pnl_usd"] = round(pnl, 6)
+        p2["close_reason"] = "rotation_upgrade"
+        p2["close_edge"] = round(float(edge_now), 6)
+        p2["replace_with_slug"] = target_signal.slug
+        p2["replace_with_side"] = target_signal.side
+
+        closed_positions.append(p2)
+
+        pid = p.get("position_id")
+        open_positions[:] = [x for x in open_positions if x.get("position_id") != pid]
+
+        old_key = (p.get("slug"), p.get("side"))
+        if old_key in existing_keys:
+            existing_keys.remove(old_key)
+
+        c = str(p.get("city_slug") or "")
+        if c:
+            city_counts[c] = max(0, city_counts.get(c, 0) - 1)
+            ck = event_cluster_key(c, str(p.get("target_date") or ""))
+            cluster_exposure[ck] = max(0.0, cluster_exposure.get(ck, 0.0) - float(p.get("size_usd", 0.0)))
+
+        free_exposure = max(0.0, free_exposure + float(p.get("size_usd", 0.0)))
+        rotated_closed += 1
+
+    # First pass: open what we can directly.
+    structure_blocked_candidates: List[Signal] = []
+    for s in ranked:
+        if free_exposure <= 0.25:
+            break
+
+        key = (s.slug, s.side)
+        if key in existing_keys:
+            skipped_existing += 1
+            continue
+
+        ok, reason = open_signal(s)
+        if ok:
+            continue
+
+        register_block(reason)
+        if reason in {"city_cap", "cluster_cap"}:
+            structure_blocked_candidates.append(s)
+
+    # Rotation pass: upgrade lower-edge profitable positions.
+    rotations_left = max(0, int(config.max_rotations_per_run))
+    if bool(config.enable_edge_rotation) and rotations_left > 0:
+        seen_rotation_keys = set()
+        for s in structure_blocked_candidates:
+            if rotations_left <= 0:
+                break
+
+            key = (s.slug, s.side)
+            if key in seen_rotation_keys:
+                continue
+            seen_rotation_keys.add(key)
+
+            if key in existing_keys:
+                continue
+
+            # If direct-open now works (because earlier operations changed caps), just open.
+            direct_reason = can_open_with_state(s, free_exposure, city_counts, cluster_exposure, existing_keys)
+            if direct_reason is None:
+                ok, _ = open_signal(s)
+                if ok:
+                    continue
+
+            candidate_cluster = event_cluster_key(s.city_slug, s.target_date)
+            replacement_pool = []
+
+            for p in list(open_positions):
+                pos_city = str(p.get("city_slug") or "")
+                pos_cluster = event_cluster_key(pos_city, str(p.get("target_date") or ""))
+
+                if not (pos_city == s.city_slug or pos_cluster == candidate_cluster):
+                    continue
+
+                unreal = float(p.get("unrealized_pnl_usd") or 0.0)
+                if bool(config.rotation_require_profit) and unreal <= 0:
+                    continue
+
+                opened_at = parse_iso_to_utc(str(p.get("opened_at") or ""))
+                if opened_at is not None:
+                    held_minutes = max(0.0, (datetime.now(UTC) - opened_at).total_seconds() / 60.0)
+                    if held_minutes < float(config.rotation_min_holding_minutes):
+                        continue
+
+                edge_now, side_ask, mark_price = current_edge_and_prices_for_position(p)
+                if edge_now is None or side_ask is None or mark_price is None:
+                    continue
+
+                edge_delta = float(s.edge) - float(edge_now)
+                ev_delta = edge_per_dollar(float(s.edge), float(s.side_price)) - edge_per_dollar(float(edge_now), float(side_ask))
+
+                if edge_delta < float(config.rotation_min_edge_delta):
+                    continue
+                if ev_delta < float(config.rotation_min_ev_per_usd_delta):
+                    continue
+
+                # Check viability after removing this one position.
+                tmp_free = max(0.0, free_exposure + float(p.get("size_usd", 0.0)))
+                tmp_city_counts = dict(city_counts)
+                tmp_cluster_exposure = dict(cluster_exposure)
+                tmp_existing_keys = set(existing_keys)
+
+                old_key = (p.get("slug"), p.get("side"))
+                if old_key in tmp_existing_keys:
+                    tmp_existing_keys.remove(old_key)
+
+                if pos_city:
+                    tmp_city_counts[pos_city] = max(0, tmp_city_counts.get(pos_city, 0) - 1)
+                    tmp_cluster_exposure[pos_cluster] = max(
+                        0.0,
+                        tmp_cluster_exposure.get(pos_cluster, 0.0) - float(p.get("size_usd", 0.0)),
+                    )
+
+                can_reason = can_open_with_state(s, tmp_free, tmp_city_counts, tmp_cluster_exposure, tmp_existing_keys)
+                if can_reason is not None:
+                    continue
+
+                replacement_pool.append((ev_delta, edge_delta, unreal, p, edge_now, mark_price))
+
+            if not replacement_pool:
+                continue
+
+            replacement_pool.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+            _, _, _, target_pos, target_edge, target_mark = replacement_pool[0]
+
+            close_position_for_rotation(target_pos, s, float(target_edge), float(target_mark))
+
+            ok, reason = open_signal(s)
+            if ok:
+                rotation_opened += 1
+                rotations_left -= 1
+            else:
+                # Should be rare due viability simulation; still keep close result deterministic.
+                register_block(reason)
+                rotations_left -= 1
 
     state["open_positions"] = open_positions
+    state["closed_positions"] = closed_positions
+
+    realized_today_final = calc_realized_today(closed_positions, day_cn)
+    unrealized_final = calc_unrealized(open_positions, market_map)
 
     return {
         "opened": opened,
@@ -1447,9 +1771,15 @@ def apply_paper_positions(
         "blocked_by_confirm": blocked_by_confirm,
         "blocked_by_edge_gate": blocked_by_edge_gate,
         "blocked_by_kelly": blocked_by_kelly,
+        "rotated_closed": rotated_closed,
+        "rotation_opened": rotation_opened,
         "stop_triggered": False,
-        "realized_today": realized_today,
-        "unrealized": unrealized,
+        "realized_today": realized_today_final,
+        "unrealized": unrealized_final,
+        "bankroll_equity_usd": round(bankroll_equity, 6),
+        "effective_trade_size_usd": trade_size_usd,
+        "effective_max_open_exposure_usd": max_open_exposure_usd,
+        "effective_daily_stop_loss_usd": daily_stop_loss_usd,
     }
 
 
@@ -1490,6 +1820,8 @@ def summarize(
             "closed_new_expiry": int(closed_new_expiry),
             "closed_new_edge": int(closed_new_edge),
             "opened_new": apply_result.get("opened", 0),
+            "rotated_closed": apply_result.get("rotated_closed", 0),
+            "rotation_opened": apply_result.get("rotation_opened", 0),
             "blocked_by_confirm": apply_result.get("blocked_by_confirm", 0),
             "blocked_by_edge_gate": apply_result.get("blocked_by_edge_gate", 0),
             "blocked_by_kelly": apply_result.get("blocked_by_kelly", 0),
@@ -1498,6 +1830,10 @@ def summarize(
             "open_exposure_usd": round(calc_exposure(open_positions), 6),
             "realized_today_usd": apply_result.get("realized_today", 0.0),
             "unrealized_usd": apply_result.get("unrealized", 0.0),
+            "bankroll_equity_usd": apply_result.get("bankroll_equity_usd", 0.0),
+            "effective_trade_size_usd": apply_result.get("effective_trade_size_usd"),
+            "effective_max_open_exposure_usd": apply_result.get("effective_max_open_exposure_usd"),
+            "effective_daily_stop_loss_usd": apply_result.get("effective_daily_stop_loss_usd"),
             "stop_triggered": bool(apply_result.get("stop_triggered", False)),
         },
     }
@@ -1656,6 +1992,105 @@ def main() -> None:
         default=None,
         help="Require scenario worst-case edge to stay above this threshold",
     )
+    parser.add_argument(
+        "--enable-edge-rotation",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable replacing weaker profitable open positions with stronger candidates",
+    )
+    parser.add_argument(
+        "--rotation-min-edge-delta",
+        type=float,
+        default=None,
+        help="Minimum edge improvement required to rotate into a new signal",
+    )
+    parser.add_argument(
+        "--rotation-min-ev-per-usd-delta",
+        type=float,
+        default=None,
+        help="Minimum edge-per-dollar improvement required for rotation",
+    )
+    parser.add_argument(
+        "--rotation-min-holding-minutes",
+        type=int,
+        default=None,
+        help="Minimum holding minutes before a position is eligible for rotation",
+    )
+    parser.add_argument(
+        "--max-rotations-per-run",
+        type=int,
+        default=None,
+        help="Maximum number of rotation upgrades per run",
+    )
+    parser.add_argument(
+        "--rotation-require-profit",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Require currently-positive unrealized PnL before rotating out a position",
+    )
+    parser.add_argument(
+        "--compound-enabled",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable equity-based compounding for risk limits",
+    )
+    parser.add_argument(
+        "--compound-trade-size-fraction",
+        type=float,
+        default=None,
+        help="trade_size_usd = equity * fraction (bounded by compound min/max)",
+    )
+    parser.add_argument(
+        "--compound-max-open-exposure-fraction",
+        type=float,
+        default=None,
+        help="max_open_exposure_usd = equity * fraction (bounded by compound min/max)",
+    )
+    parser.add_argument(
+        "--compound-daily-stop-loss-fraction",
+        type=float,
+        default=None,
+        help="daily stop loss abs = equity * fraction (bounded by compound min/max)",
+    )
+    parser.add_argument(
+        "--compound-trade-size-min-usd",
+        type=float,
+        default=None,
+        help="Minimum trade size when compounding is enabled",
+    )
+    parser.add_argument(
+        "--compound-trade-size-max-usd",
+        type=float,
+        default=None,
+        help="Maximum trade size when compounding is enabled",
+    )
+    parser.add_argument(
+        "--compound-max-open-exposure-min-usd",
+        type=float,
+        default=None,
+        help="Minimum max-open-exposure when compounding is enabled",
+    )
+    parser.add_argument(
+        "--compound-max-open-exposure-max-usd",
+        type=float,
+        default=None,
+        help="Maximum max-open-exposure when compounding is enabled",
+    )
+    parser.add_argument(
+        "--compound-daily-stop-loss-min-abs-usd",
+        type=float,
+        default=None,
+        help="Minimum daily stop-loss absolute USD when compounding is enabled",
+    )
+    parser.add_argument(
+        "--compound-daily-stop-loss-max-abs-usd",
+        type=float,
+        default=None,
+        help="Maximum daily stop-loss absolute USD when compounding is enabled",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -1698,6 +2133,40 @@ def main() -> None:
     if args.robustness_min_edge is not None:
         config.robustness_min_edge = float(args.robustness_min_edge)
 
+    if args.enable_edge_rotation is not None:
+        config.enable_edge_rotation = bool(int(args.enable_edge_rotation))
+    if args.rotation_min_edge_delta is not None:
+        config.rotation_min_edge_delta = max(0.0, float(args.rotation_min_edge_delta))
+    if args.rotation_min_ev_per_usd_delta is not None:
+        config.rotation_min_ev_per_usd_delta = max(0.0, float(args.rotation_min_ev_per_usd_delta))
+    if args.rotation_min_holding_minutes is not None:
+        config.rotation_min_holding_minutes = max(0, int(args.rotation_min_holding_minutes))
+    if args.max_rotations_per_run is not None:
+        config.max_rotations_per_run = max(0, int(args.max_rotations_per_run))
+    if args.rotation_require_profit is not None:
+        config.rotation_require_profit = bool(int(args.rotation_require_profit))
+
+    if args.compound_enabled is not None:
+        config.compound_enabled = bool(int(args.compound_enabled))
+    if args.compound_trade_size_fraction is not None:
+        config.compound_trade_size_fraction = max(0.0, float(args.compound_trade_size_fraction))
+    if args.compound_max_open_exposure_fraction is not None:
+        config.compound_max_open_exposure_fraction = max(0.0, float(args.compound_max_open_exposure_fraction))
+    if args.compound_daily_stop_loss_fraction is not None:
+        config.compound_daily_stop_loss_fraction = max(0.0, float(args.compound_daily_stop_loss_fraction))
+    if args.compound_trade_size_min_usd is not None:
+        config.compound_trade_size_min_usd = max(0.25, float(args.compound_trade_size_min_usd))
+    if args.compound_trade_size_max_usd is not None:
+        config.compound_trade_size_max_usd = max(config.compound_trade_size_min_usd, float(args.compound_trade_size_max_usd))
+    if args.compound_max_open_exposure_min_usd is not None:
+        config.compound_max_open_exposure_min_usd = max(0.25, float(args.compound_max_open_exposure_min_usd))
+    if args.compound_max_open_exposure_max_usd is not None:
+        config.compound_max_open_exposure_max_usd = max(config.compound_max_open_exposure_min_usd, float(args.compound_max_open_exposure_max_usd))
+    if args.compound_daily_stop_loss_min_abs_usd is not None:
+        config.compound_daily_stop_loss_min_abs_usd = max(0.25, float(args.compound_daily_stop_loss_min_abs_usd))
+    if args.compound_daily_stop_loss_max_abs_usd is not None:
+        config.compound_daily_stop_loss_max_abs_usd = max(config.compound_daily_stop_loss_min_abs_usd, float(args.compound_daily_stop_loss_max_abs_usd))
+
     env_path = Path(args.env)
     state_path = Path(args.state)
     snapshot_path = Path(args.snapshot)
@@ -1717,6 +2186,12 @@ def main() -> None:
         closed_new_edge = close_edge_decay_positions(state, signals, market_map, config)
         apply_result = apply_paper_positions(state, signals, market_map, config)
     else:
+        realized_today = calc_realized_today(state.get("closed_positions", []), today_cn_str())
+        unrealized = calc_unrealized(state.get("open_positions", []), market_map)
+        realized_total = calc_realized_total(state.get("closed_positions", []))
+        bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + realized_total + unrealized)
+        effective_limits = derive_effective_risk_limits(config, bankroll_equity)
+
         apply_result = {
             "opened": 0,
             "skipped_existing": 0,
@@ -1724,9 +2199,15 @@ def main() -> None:
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
+            "rotated_closed": 0,
+            "rotation_opened": 0,
             "stop_triggered": False,
-            "realized_today": calc_realized_today(state.get("closed_positions", []), today_cn_str()),
-            "unrealized": calc_unrealized(state.get("open_positions", []), market_map),
+            "realized_today": realized_today,
+            "unrealized": unrealized,
+            "bankroll_equity_usd": round(bankroll_equity, 6),
+            "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
+            "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
+            "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
         }
 
     update_open_position_marks(state, market_map)
@@ -1781,6 +2262,22 @@ def main() -> None:
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
         "robustness_sigma_scale_high": config.robustness_sigma_scale_high,
         "robustness_min_edge": config.robustness_min_edge,
+        "enable_edge_rotation": config.enable_edge_rotation,
+        "rotation_min_edge_delta": config.rotation_min_edge_delta,
+        "rotation_min_ev_per_usd_delta": config.rotation_min_ev_per_usd_delta,
+        "rotation_min_holding_minutes": config.rotation_min_holding_minutes,
+        "max_rotations_per_run": config.max_rotations_per_run,
+        "rotation_require_profit": config.rotation_require_profit,
+        "compound_enabled": config.compound_enabled,
+        "compound_trade_size_fraction": config.compound_trade_size_fraction,
+        "compound_max_open_exposure_fraction": config.compound_max_open_exposure_fraction,
+        "compound_daily_stop_loss_fraction": config.compound_daily_stop_loss_fraction,
+        "compound_trade_size_min_usd": config.compound_trade_size_min_usd,
+        "compound_trade_size_max_usd": config.compound_trade_size_max_usd,
+        "compound_max_open_exposure_min_usd": config.compound_max_open_exposure_min_usd,
+        "compound_max_open_exposure_max_usd": config.compound_max_open_exposure_max_usd,
+        "compound_daily_stop_loss_min_abs_usd": config.compound_daily_stop_loss_min_abs_usd,
+        "compound_daily_stop_loss_max_abs_usd": config.compound_daily_stop_loss_max_abs_usd,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
