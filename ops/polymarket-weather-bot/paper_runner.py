@@ -6,6 +6,7 @@ import json
 import math
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -105,6 +106,9 @@ class Config:
     min_edge_for_entry: float = 0.02
     # Ignore tiny entries below this USD notional.
     min_open_size_usd: float = 10.0
+    # Max share of currently executable entry depth to take per order.
+    # 0.20 means consume at most 20% of depth visible at target entry price.
+    max_entry_participation: float = 0.20
 
     # Model robustness gate: require edge to remain positive under
     # small forecast mean shifts and sigma perturbations.
@@ -245,14 +249,20 @@ def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
 
     This avoids HTML scraping blind spots and avoids scanning the entire open
     market universe just to find weather contracts.
+
+    Performance note:
+    event detail fetches are done with bounded concurrency to reduce per-tick
+    wall time while avoiding API bursts.
     """
     series_limit = 300
     offset = 0
     weather_series: List[Dict[str, Any]] = []
     seen_series = set()
 
+    session = requests.Session()
+
     while True:
-        resp = requests.get(
+        resp = session.get(
             "https://gamma-api.polymarket.com/series",
             params={"closed": "false", "limit": series_limit, "offset": offset},
             timeout=timeout_sec,
@@ -277,8 +287,8 @@ def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
         if offset > 5000:
             break
 
-    markets: List[Dict[str, Any]] = []
-    seen_market_slugs = set()
+    event_slugs: List[str] = []
+    seen_event_slugs = set()
     for series in weather_series:
         for event_stub in (series.get("events") or []):
             if not isinstance(event_stub, dict):
@@ -286,33 +296,53 @@ def fetch_weather_markets(timeout_sec: int) -> List[Dict[str, Any]]:
             if not event_stub.get("active") or event_stub.get("closed"):
                 continue
             event_slug = str(event_stub.get("slug") or "")
-            if not event_slug:
+            if not event_slug or event_slug in seen_event_slugs:
                 continue
+            seen_event_slugs.add(event_slug)
+            event_slugs.append(event_slug)
 
+    def fetch_event_rows(event_slug: str) -> List[Dict[str, Any]]:
+        try:
+            event_resp = session.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": event_slug, "limit": 1},
+                timeout=timeout_sec,
+            )
+            event_resp.raise_for_status()
+            rows = event_resp.json()
+            if isinstance(rows, list):
+                return rows
+        except Exception:
+            return []
+        return []
+
+    max_workers = max(4, min(16, len(event_slugs) or 1))
+    event_rows_all: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(fetch_event_rows, s) for s in event_slugs]
+        for fut in as_completed(futs):
             try:
-                event_resp = requests.get(
-                    "https://gamma-api.polymarket.com/events",
-                    params={"slug": event_slug, "limit": 1},
-                    timeout=timeout_sec,
-                )
-                event_resp.raise_for_status()
-                event_rows = event_resp.json()
+                rows = fut.result()
             except Exception:
-                continue
+                rows = []
+            if rows:
+                event_rows_all.extend(rows)
 
-            if not isinstance(event_rows, list) or not event_rows:
+    markets: List[Dict[str, Any]] = []
+    seen_market_slugs = set()
+    for event in event_rows_all:
+        if not isinstance(event, dict):
+            continue
+        for market in (event.get("markets") or []):
+            if not isinstance(market, dict):
                 continue
-            event = event_rows[0]
-            for market in (event.get("markets") or []):
-                if not isinstance(market, dict):
-                    continue
-                market_slug = str(market.get("slug") or "")
-                if not market_slug.startswith("highest-temperature-in-"):
-                    continue
-                if market_slug in seen_market_slugs:
-                    continue
-                seen_market_slugs.add(market_slug)
-                markets.append(market)
+            market_slug = str(market.get("slug") or "")
+            if not market_slug.startswith("highest-temperature-in-"):
+                continue
+            if market_slug in seen_market_slugs:
+                continue
+            seen_market_slugs.add(market_slug)
+            markets.append(market)
 
     markets.sort(key=lambda m: str(m.get("slug") or ""))
     return markets
@@ -1873,10 +1903,16 @@ def apply_paper_positions(
 
         depth_cap_shares = float(depth.get("shares", 0.0))
         depth_cap_usd = float(depth.get("usd", 0.0))
-        size_usd = min(size_usd, depth_cap_usd)
+        max_entry_participation = min(1.0, max(0.01, float(config.max_entry_participation)))
+        depth_participation_cap_usd = depth_cap_usd * max_entry_participation
+        size_usd = min(size_usd, depth_participation_cap_usd)
 
         if size_usd <= float(min_open_size_usd):
             return None
+
+        entry_participation_est = 0.0
+        if depth_cap_usd > 0:
+            entry_participation_est = size_usd / depth_cap_usd
 
         return {
             "full_kelly": float(full_kelly),
@@ -1887,6 +1923,9 @@ def apply_paper_positions(
             "size_cap_by_policy": float(size_cap_by_policy),
             "depth_cap_shares": float(depth_cap_shares),
             "depth_cap_usd": float(depth_cap_usd),
+            "depth_participation_cap_usd": float(depth_participation_cap_usd),
+            "max_entry_participation": float(max_entry_participation),
+            "entry_participation_est": float(entry_participation_est),
             "size_usd": float(size_usd),
         }
 
@@ -1926,7 +1965,9 @@ def apply_paper_positions(
         )
         if depth is None:
             return "depth_unavailable"
-        if float(depth.get("usd", 0.0)) <= float(min_open_size_usd):
+        max_entry_participation = min(1.0, max(0.01, float(config.max_entry_participation)))
+        depth_participation_cap_usd = float(depth.get("usd", 0.0)) * max_entry_participation
+        if depth_participation_cap_usd <= float(min_open_size_usd):
             return "depth_cap"
 
         cluster_key = event_cluster_key(s.city_slug, s.target_date)
@@ -2015,6 +2056,9 @@ def apply_paper_positions(
             "size_cap_by_policy_usd": round(float(ticket["size_cap_by_policy"]), 6),
             "depth_cap_shares_at_entry": round(float(ticket.get("depth_cap_shares", 0.0)), 6),
             "depth_cap_usd_at_entry": round(float(ticket.get("depth_cap_usd", 0.0)), 6),
+            "depth_participation_cap_usd_at_entry": round(float(ticket.get("depth_participation_cap_usd", 0.0)), 6),
+            "max_entry_participation": round(float(ticket.get("max_entry_participation", 1.0)), 6),
+            "entry_participation_est": round(float(ticket.get("entry_participation_est", 0.0)), 6),
             "kelly_full_fraction": round(float(ticket["full_kelly"]), 6),
             "kelly_fraction_used": round(float(ticket["used_kelly"]), 6),
             "kelly_size_usd_pre_ttl": round(float(ticket["kelly_size_usd"]), 6),
@@ -2537,6 +2581,12 @@ def main() -> None:
         help="Minimum allowed open size in USD; smaller tickets are skipped",
     )
     parser.add_argument(
+        "--max-entry-participation",
+        type=float,
+        default=None,
+        help="Max share of executable entry depth to consume per order (0..1)",
+    )
+    parser.add_argument(
         "--robustness-mu-shift-c",
         type=float,
         default=None,
@@ -2726,6 +2776,8 @@ def main() -> None:
         config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
     if args.min_open_size_usd is not None:
         config.min_open_size_usd = max(0.25, float(args.min_open_size_usd))
+    if args.max_entry_participation is not None:
+        config.max_entry_participation = min(1.0, max(0.01, float(args.max_entry_participation)))
     if args.robustness_mu_shift_c is not None:
         config.robustness_mu_shift_c = max(0.0, float(args.robustness_mu_shift_c))
     if args.robustness_sigma_scale_low is not None:
@@ -2902,6 +2954,7 @@ def main() -> None:
         "tail_size_cap_fraction": config.tail_size_cap_fraction,
         "min_edge_for_entry": config.min_edge_for_entry,
         "min_open_size_usd": config.min_open_size_usd,
+        "max_entry_participation": config.max_entry_participation,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
         "robustness_sigma_scale_high": config.robustness_sigma_scale_high,
