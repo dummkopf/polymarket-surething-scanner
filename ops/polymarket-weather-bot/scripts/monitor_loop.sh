@@ -52,7 +52,10 @@ mkdir -p "$STATE_DIR"
 echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] monitor_loop start (interval=${INTERVAL_SEC}s, run_timeout=${RUN_TIMEOUT_SEC}s)" >> "$LOG_FILE"
 
 while true; do
-  echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] tick" >> "$LOG_FILE"
+  tick_started_epoch="$(date +%s)"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] tick start" >> "$LOG_FILE"
+
+  set +e
   timeout "${RUN_TIMEOUT_SEC}s" "$PYTHON_BIN" "$ROOT_DIR/paper_runner.py" --apply \
     --min-hours-to-expiry "$MIN_HOURS_TO_EXPIRY" \
     --max-positions-per-city "$MAX_POSITIONS_PER_CITY" \
@@ -92,7 +95,21 @@ while true; do
     --compound-max-open-exposure-max-usd "$COMPOUND_MAX_OPEN_EXPOSURE_MAX_USD" \
     --compound-daily-stop-loss-min-abs-usd "$COMPOUND_DAILY_STOP_LOSS_MIN_ABS_USD" \
     --compound-daily-stop-loss-max-abs-usd "$COMPOUND_DAILY_STOP_LOSS_MAX_ABS_USD" \
-    >> "$LOG_FILE" 2>&1 || true
+    >> "$LOG_FILE" 2>&1
+  rc=$?
+  set -e
 
-  sleep "$INTERVAL_SEC"
+  tick_finished_epoch="$(date +%s)"
+  tick_elapsed=$((tick_finished_epoch - tick_started_epoch))
+
+  if [ "$rc" -eq 124 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] tick end rc=124 timeout after ${tick_elapsed}s" >> "$LOG_FILE"
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] tick end rc=${rc} elapsed=${tick_elapsed}s" >> "$LOG_FILE"
+  fi
+
+  sleep_left=$((INTERVAL_SEC - tick_elapsed))
+  if [ "$sleep_left" -gt 0 ]; then
+    sleep "$sleep_left"
+  fi
 done
