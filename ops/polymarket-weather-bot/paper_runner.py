@@ -103,6 +103,8 @@ class Config:
     max_bet_fraction: float = 0.01
     tail_size_cap_fraction: float = 0.5
     min_edge_for_entry: float = 0.02
+    # Ignore tiny entries below this USD notional.
+    min_open_size_usd: float = 1.0
 
     # Model robustness gate: require edge to remain positive under
     # small forecast mean shifts and sigma perturbations.
@@ -1723,6 +1725,7 @@ def apply_paper_positions(
 
     exposure = calc_exposure(open_positions)
     free_exposure = max(0.0, max_open_exposure_usd - exposure)
+    min_open_size_usd = max(0.25, float(config.min_open_size_usd))
 
     daily_opened_notional_usd = calc_daily_opened_notional(open_positions, closed_positions, day_cn)
     daily_new_open_notional_cap_cfg = float(config.daily_new_open_notional_cap_usd)
@@ -1871,7 +1874,7 @@ def apply_paper_positions(
         depth_cap_usd = float(depth.get("usd", 0.0))
         size_usd = min(size_usd, depth_cap_usd)
 
-        if size_usd <= 0.25:
+        if size_usd <= float(min_open_size_usd):
             return None
 
         return {
@@ -1922,15 +1925,15 @@ def apply_paper_positions(
         )
         if depth is None:
             return "depth_unavailable"
-        if float(depth.get("usd", 0.0)) <= 0.25:
+        if float(depth.get("usd", 0.0)) <= float(min_open_size_usd):
             return "depth_cap"
 
         cluster_key = event_cluster_key(s.city_slug, s.target_date)
         cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure_ref.get(cluster_key, 0.0))
-        if cluster_remaining <= 0.25:
+        if cluster_remaining <= float(min_open_size_usd):
             return "cluster_cap"
 
-        if daily_open_cap_enabled and float(available_daily_open_notional) <= 0.25:
+        if daily_open_cap_enabled and float(available_daily_open_notional) <= float(min_open_size_usd):
             return "daily_open_cap"
 
         ticket = compute_open_ticket(
@@ -2145,9 +2148,9 @@ def apply_paper_positions(
     # First pass: open what we can directly.
     structure_blocked_candidates: List[Signal] = []
     for s in ranked:
-        if free_exposure <= 0.25:
+        if free_exposure <= float(min_open_size_usd):
             break
-        if daily_open_cap_enabled and daily_new_open_notional_left_usd <= 0.25:
+        if daily_open_cap_enabled and daily_new_open_notional_left_usd <= float(min_open_size_usd):
             break
 
         key = (s.slug, s.side)
@@ -2527,6 +2530,12 @@ def main() -> None:
         help="Global minimum edge threshold required for entry",
     )
     parser.add_argument(
+        "--min-open-size-usd",
+        type=float,
+        default=None,
+        help="Minimum allowed open size in USD; smaller tickets are skipped",
+    )
+    parser.add_argument(
         "--robustness-mu-shift-c",
         type=float,
         default=None,
@@ -2714,6 +2723,8 @@ def main() -> None:
         config.tail_size_cap_fraction = max(0.0, float(args.tail_size_cap_fraction))
     if args.min_edge_for_entry is not None:
         config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
+    if args.min_open_size_usd is not None:
+        config.min_open_size_usd = max(0.25, float(args.min_open_size_usd))
     if args.robustness_mu_shift_c is not None:
         config.robustness_mu_shift_c = max(0.0, float(args.robustness_mu_shift_c))
     if args.robustness_sigma_scale_low is not None:
@@ -2889,6 +2900,7 @@ def main() -> None:
         "max_bet_fraction": config.max_bet_fraction,
         "tail_size_cap_fraction": config.tail_size_cap_fraction,
         "min_edge_for_entry": config.min_edge_for_entry,
+        "min_open_size_usd": config.min_open_size_usd,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
         "robustness_sigma_scale_high": config.robustness_sigma_scale_high,

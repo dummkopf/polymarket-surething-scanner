@@ -9,20 +9,21 @@ LOG_FILE="$STATE_DIR/monitor.log"
 INTERVAL_SEC="${INTERVAL_SEC:-300}"
 MIN_HOURS_TO_EXPIRY="${MIN_HOURS_TO_EXPIRY:-0}"
 MAX_POSITIONS_PER_CITY="${MAX_POSITIONS_PER_CITY:-2}"
-MAX_EVENT_CLUSTER_EXPOSURE_USD="${MAX_EVENT_CLUSTER_EXPOSURE_USD:-10}"
+MAX_EVENT_CLUSTER_EXPOSURE_USD="${MAX_EVENT_CLUSTER_EXPOSURE_USD:-100}"
 EXIT_EDGE_FLOOR="${EXIT_EDGE_FLOOR:-0.01}"
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT="${MIN_HOLDING_MINUTES_FOR_EDGE_EXIT:-10}"
 CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
-TRADE_SIZE_USD="${TRADE_SIZE_USD:-10}"
-MAX_OPEN_EXPOSURE_USD="${MAX_OPEN_EXPOSURE_USD:-120}"
+TRADE_SIZE_USD="${TRADE_SIZE_USD:-100}"
+MAX_OPEN_EXPOSURE_USD="${MAX_OPEN_EXPOSURE_USD:-200}"
 DAILY_STOP_LOSS_USD="${DAILY_STOP_LOSS_USD:--50}"
 DAILY_NEW_OPEN_NOTIONAL_CAP_USD="${DAILY_NEW_OPEN_NOTIONAL_CAP_USD:-0}"
 PAPER_BANKROLL_USD="${PAPER_BANKROLL_USD:-1000}"
 KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
 KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.08}"
-MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.01}"
+MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.10}"
 TAIL_SIZE_CAP_FRACTION="${TAIL_SIZE_CAP_FRACTION:-0.5}"
 MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.02}"
+MIN_OPEN_SIZE_USD="${MIN_OPEN_SIZE_USD:-1}"
 ROBUSTNESS_MU_SHIFT_C="${ROBUSTNESS_MU_SHIFT_C:-0.7}"
 ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
 ROBUSTNESS_SIGMA_SCALE_HIGH="${ROBUSTNESS_SIGMA_SCALE_HIGH:-1.15}"
@@ -34,12 +35,12 @@ ROTATION_MIN_HOLDING_MINUTES="${ROTATION_MIN_HOLDING_MINUTES:-10}"
 MAX_ROTATIONS_PER_RUN="${MAX_ROTATIONS_PER_RUN:-1}"
 ROTATION_REQUIRE_PROFIT="${ROTATION_REQUIRE_PROFIT:-1}"
 COMPOUND_ENABLED="${COMPOUND_ENABLED:-1}"
-COMPOUND_TRADE_SIZE_FRACTION="${COMPOUND_TRADE_SIZE_FRACTION:-0.01}"
-COMPOUND_MAX_OPEN_EXPOSURE_FRACTION="${COMPOUND_MAX_OPEN_EXPOSURE_FRACTION:-0.12}"
+COMPOUND_TRADE_SIZE_FRACTION="${COMPOUND_TRADE_SIZE_FRACTION:-0.10}"
+COMPOUND_MAX_OPEN_EXPOSURE_FRACTION="${COMPOUND_MAX_OPEN_EXPOSURE_FRACTION:-0.20}"
 COMPOUND_DAILY_STOP_LOSS_FRACTION="${COMPOUND_DAILY_STOP_LOSS_FRACTION:-0.03}"
 COMPOUND_TRADE_SIZE_MIN_USD="${COMPOUND_TRADE_SIZE_MIN_USD:-10}"
-COMPOUND_TRADE_SIZE_MAX_USD="${COMPOUND_TRADE_SIZE_MAX_USD:-25}"
-COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD="${COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD:-120}"
+COMPOUND_TRADE_SIZE_MAX_USD="${COMPOUND_TRADE_SIZE_MAX_USD:-100}"
+COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD="${COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD:-200}"
 COMPOUND_MAX_OPEN_EXPOSURE_MAX_USD="${COMPOUND_MAX_OPEN_EXPOSURE_MAX_USD:-300}"
 COMPOUND_DAILY_STOP_LOSS_MIN_ABS_USD="${COMPOUND_DAILY_STOP_LOSS_MIN_ABS_USD:-50}"
 COMPOUND_DAILY_STOP_LOSS_MAX_ABS_USD="${COMPOUND_DAILY_STOP_LOSS_MAX_ABS_USD:-50}"
@@ -106,6 +107,7 @@ cmd_start() {
         --max-bet-fraction '$MAX_BET_FRACTION' \
         --tail-size-cap-fraction '$TAIL_SIZE_CAP_FRACTION' \
         --min-edge-for-entry '$MIN_EDGE_FOR_ENTRY' \
+        --min-open-size-usd '$MIN_OPEN_SIZE_USD' \
         --robustness-mu-shift-c '$ROBUSTNESS_MU_SHIFT_C' \
         --robustness-sigma-scale-low '$ROBUSTNESS_SIGMA_SCALE_LOW' \
         --robustness-sigma-scale-high '$ROBUSTNESS_SIGMA_SCALE_HIGH' \
@@ -163,7 +165,7 @@ cmd_status() {
     fi
   else
     if is_running; then
-      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
+      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, min_open_size_usd=${MIN_OPEN_SIZE_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
     else
       echo "monitor: stopped"
     fi
@@ -203,6 +205,7 @@ cmd_run_once() {
     --max-bet-fraction "$MAX_BET_FRACTION" \
     --tail-size-cap-fraction "$TAIL_SIZE_CAP_FRACTION" \
     --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY" \
+    --min-open-size-usd "$MIN_OPEN_SIZE_USD" \
     --robustness-mu-shift-c "$ROBUSTNESS_MU_SHIFT_C" \
     --robustness-sigma-scale-low "$ROBUSTNESS_SIGMA_SCALE_LOW" \
     --robustness-sigma-scale-high "$ROBUSTNESS_SIGMA_SCALE_HIGH" \
@@ -268,20 +271,21 @@ Env overrides:
   INTERVAL_SEC=<seconds>                           # default 300
   MIN_HOURS_TO_EXPIRY=<hours>                      # default 0 (paper can still open near expiry)
   MAX_POSITIONS_PER_CITY=<int>                     # default 2
-  MAX_EVENT_CLUSTER_EXPOSURE_USD=<float>           # default 10
+  MAX_EVENT_CLUSTER_EXPOSURE_USD=<float>           # default 100
   EXIT_EDGE_FLOOR=<float>                          # default 0.01
   MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=<int>          # default 10
   CONFIRM_TICKS=<int>                              # default 2
-  TRADE_SIZE_USD=<float>                           # default 10
-  MAX_OPEN_EXPOSURE_USD=<float>                    # default 120
+  TRADE_SIZE_USD=<float>                           # default 100
+  MAX_OPEN_EXPOSURE_USD=<float>                    # default 200
   DAILY_STOP_LOSS_USD=<float>                      # default -50
   DAILY_NEW_OPEN_NOTIONAL_CAP_USD=<float>          # default 0 (<=0 disables daily turnover cap; live-exposure mode)
   PAPER_BANKROLL_USD=<float>                       # default 1000
   KELLY_FRACTION_CORE=<float>                      # default 0.20
   KELLY_FRACTION_TAIL=<float>                      # default 0.08
-  MAX_BET_FRACTION=<float>                         # default 0.01
+  MAX_BET_FRACTION=<float>                         # default 0.10
   TAIL_SIZE_CAP_FRACTION=<float>                   # default 0.5
   MIN_EDGE_FOR_ENTRY=<float>                       # default 0.02
+  MIN_OPEN_SIZE_USD=<float>                        # default 1
   ROBUSTNESS_MU_SHIFT_C=<float>                    # default 0.7
   ROBUSTNESS_SIGMA_SCALE_LOW=<float>               # default 0.85
   ROBUSTNESS_SIGMA_SCALE_HIGH=<float>              # default 1.15
@@ -293,12 +297,12 @@ Env overrides:
   MAX_ROTATIONS_PER_RUN=<int>                      # default 1
   ROTATION_REQUIRE_PROFIT=<0|1>                    # default 1
   COMPOUND_ENABLED=<0|1>                           # default 1
-  COMPOUND_TRADE_SIZE_FRACTION=<float>             # default 0.01
-  COMPOUND_MAX_OPEN_EXPOSURE_FRACTION=<float>      # default 0.12
+  COMPOUND_TRADE_SIZE_FRACTION=<float>             # default 0.10
+  COMPOUND_MAX_OPEN_EXPOSURE_FRACTION=<float>      # default 0.20
   COMPOUND_DAILY_STOP_LOSS_FRACTION=<float>        # default 0.03
   COMPOUND_TRADE_SIZE_MIN_USD=<float>              # default 10
-  COMPOUND_TRADE_SIZE_MAX_USD=<float>              # default 25
-  COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD=<float>       # default 120
+  COMPOUND_TRADE_SIZE_MAX_USD=<float>              # default 100
+  COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD=<float>       # default 200
   COMPOUND_MAX_OPEN_EXPOSURE_MAX_USD=<float>       # default 300
   COMPOUND_DAILY_STOP_LOSS_MIN_ABS_USD=<float>     # default 50
   COMPOUND_DAILY_STOP_LOSS_MAX_ABS_USD=<float>     # default 50
