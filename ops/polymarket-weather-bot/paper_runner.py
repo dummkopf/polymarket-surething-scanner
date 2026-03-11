@@ -67,6 +67,8 @@ class Config:
     trade_size_usd: float = 10.0
     max_open_exposure_usd: float = 120.0
     daily_stop_loss_usd: float = -30.0
+    # Daily budget for newly-opened notional (open-side turnover cap).
+    daily_new_open_notional_cap_usd: float = 250.0
 
     # Legacy slot-mix knobs kept for compatibility only.
     # Capital allocation is no longer driven by fixed core/tail quotas.
@@ -1192,6 +1194,25 @@ def calc_exposure(open_positions: List[Dict[str, Any]]) -> float:
     return round(sum(float(p.get("size_usd", 0.0)) for p in open_positions), 6)
 
 
+def calc_daily_opened_notional(
+    open_positions: List[Dict[str, Any]],
+    closed_positions: List[Dict[str, Any]],
+    day_cn: str,
+) -> float:
+    """Sum size_usd for positions opened in `day_cn`, regardless of later close."""
+    total = 0.0
+    for p in list(open_positions) + list(closed_positions):
+        if exclude_from_model_cohort(p):
+            continue
+        opened_at = p.get("opened_at")
+        if not opened_at:
+            continue
+        if today_cn_str(opened_at) != day_cn:
+            continue
+        total += float(p.get("size_usd", 0.0))
+    return round(total, 6)
+
+
 def exclude_from_model_cohort(p: Dict[str, Any]) -> bool:
     return bool(p.get("exclude_from_model_cohort")) or str(p.get("close_reason") or "") == "manual_close_legacy_reset"
 
@@ -1702,12 +1723,17 @@ def apply_paper_positions(
     exposure = calc_exposure(open_positions)
     free_exposure = max(0.0, max_open_exposure_usd - exposure)
 
+    daily_opened_notional_usd = calc_daily_opened_notional(open_positions, closed_positions, day_cn)
+    daily_new_open_notional_cap_usd = max(0.25, float(config.daily_new_open_notional_cap_usd))
+    daily_new_open_notional_left_usd = max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
+
     stop_triggered = (net_realized_today + net_unrealized) <= daily_stop_loss_usd
 
     opened = 0
     skipped_existing = 0
     blocked_by_risk = 0
     blocked_by_cluster = 0
+    blocked_by_daily_open_cap = 0
     blocked_by_confirm = 0
     blocked_by_edge_gate = 0
     blocked_by_kelly = 0
@@ -1722,6 +1748,7 @@ def apply_paper_positions(
             "skipped_existing": 0,
             "blocked_by_risk": len(signals),
             "blocked_by_cluster": 0,
+            "blocked_by_daily_open_cap": 0,
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
@@ -1739,6 +1766,9 @@ def apply_paper_positions(
             "effective_trade_size_usd": trade_size_usd,
             "effective_max_open_exposure_usd": max_open_exposure_usd,
             "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+            "daily_opened_notional_usd": daily_opened_notional_usd,
+            "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
+            "daily_new_open_notional_left_usd": daily_new_open_notional_left_usd,
             **pending_stats,
         }
 
@@ -1781,6 +1811,7 @@ def apply_paper_positions(
         s: Signal,
         available_exposure: float,
         cluster_remaining: float,
+        available_daily_open_notional: float,
         market: Dict[str, Any],
     ) -> Optional[Dict[str, float]]:
         if s.side_price <= 0:
@@ -1812,6 +1843,7 @@ def apply_paper_positions(
             size_cap_by_policy,
             float(available_exposure),
             float(cluster_remaining),
+            float(available_daily_open_notional),
         )
 
         depth = depth_cap_for_entry(
@@ -1847,6 +1879,7 @@ def apply_paper_positions(
     def can_open_with_state(
         s: Signal,
         available_exposure: float,
+        available_daily_open_notional: float,
         city_counts_ref: Dict[str, int],
         cluster_exposure_ref: Dict[str, float],
         existing_keys_ref: set,
@@ -1887,16 +1920,27 @@ def apply_paper_positions(
         if cluster_remaining <= 0.25:
             return "cluster_cap"
 
-        ticket = compute_open_ticket(s, available_exposure, cluster_remaining, market)
+        if float(available_daily_open_notional) <= 0.25:
+            return "daily_open_cap"
+
+        ticket = compute_open_ticket(
+            s,
+            available_exposure,
+            cluster_remaining,
+            available_daily_open_notional,
+            market,
+        )
         if ticket is None:
             return "kelly"
 
         return None
 
     def register_block(reason: str) -> None:
-        nonlocal blocked_by_risk, blocked_by_cluster, blocked_by_edge_gate, blocked_by_kelly, blocked_by_depth
+        nonlocal blocked_by_risk, blocked_by_cluster, blocked_by_daily_open_cap, blocked_by_edge_gate, blocked_by_kelly, blocked_by_depth
         if reason == "cluster_cap":
             blocked_by_cluster += 1
+        elif reason == "daily_open_cap":
+            blocked_by_daily_open_cap += 1
         elif reason == "min_edge":
             blocked_by_edge_gate += 1
         elif reason == "kelly":
@@ -1907,9 +1951,16 @@ def apply_paper_positions(
             blocked_by_risk += 1
 
     def open_signal(s: Signal) -> Tuple[bool, str]:
-        nonlocal free_exposure, opened
+        nonlocal free_exposure, daily_new_open_notional_left_usd, opened
 
-        reason = can_open_with_state(s, free_exposure, city_counts, cluster_exposure, existing_keys)
+        reason = can_open_with_state(
+            s,
+            free_exposure,
+            daily_new_open_notional_left_usd,
+            city_counts,
+            cluster_exposure,
+            existing_keys,
+        )
         if reason is not None:
             return False, reason
 
@@ -1918,7 +1969,13 @@ def apply_paper_positions(
         market = market_map.get(s.slug)
         if not market:
             return False, "depth_unavailable"
-        ticket = compute_open_ticket(s, free_exposure, cluster_remaining, market)
+        ticket = compute_open_ticket(
+            s,
+            free_exposure,
+            cluster_remaining,
+            daily_new_open_notional_left_usd,
+            market,
+        )
         if ticket is None:
             return False, "kelly"
 
@@ -1981,6 +2038,7 @@ def apply_paper_positions(
         city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
         cluster_exposure[cluster_key] = cluster_exposure.get(cluster_key, 0.0) + size_usd
         free_exposure = max(0.0, free_exposure - size_usd)
+        daily_new_open_notional_left_usd = max(0.0, daily_new_open_notional_left_usd - size_usd)
         opened += 1
         return True, "opened"
 
@@ -2076,7 +2134,7 @@ def apply_paper_positions(
     # First pass: open what we can directly.
     structure_blocked_candidates: List[Signal] = []
     for s in ranked:
-        if free_exposure <= 0.25:
+        if free_exposure <= 0.25 or daily_new_open_notional_left_usd <= 0.25:
             break
 
         key = (s.slug, s.side)
@@ -2109,7 +2167,14 @@ def apply_paper_positions(
                 continue
 
             # If direct-open now works (because earlier operations changed caps), just open.
-            direct_reason = can_open_with_state(s, free_exposure, city_counts, cluster_exposure, existing_keys)
+            direct_reason = can_open_with_state(
+                s,
+                free_exposure,
+                daily_new_open_notional_left_usd,
+                city_counts,
+                cluster_exposure,
+                existing_keys,
+            )
             if direct_reason is None:
                 ok, _ = open_signal(s)
                 if ok:
@@ -2169,7 +2234,14 @@ def apply_paper_positions(
                         tmp_cluster_exposure.get(pos_cluster, 0.0) - float(p.get("size_usd", 0.0)),
                     )
 
-                can_reason = can_open_with_state(s, tmp_free, tmp_city_counts, tmp_cluster_exposure, tmp_existing_keys)
+                can_reason = can_open_with_state(
+                    s,
+                    tmp_free,
+                    daily_new_open_notional_left_usd,
+                    tmp_city_counts,
+                    tmp_cluster_exposure,
+                    tmp_existing_keys,
+                )
                 if can_reason is not None:
                     continue
 
@@ -2208,6 +2280,7 @@ def apply_paper_positions(
         "skipped_existing": skipped_existing,
         "blocked_by_risk": blocked_by_risk,
         "blocked_by_cluster": blocked_by_cluster,
+        "blocked_by_daily_open_cap": blocked_by_daily_open_cap,
         "blocked_by_confirm": blocked_by_confirm,
         "blocked_by_edge_gate": blocked_by_edge_gate,
         "blocked_by_kelly": blocked_by_kelly,
@@ -2225,6 +2298,9 @@ def apply_paper_positions(
         "effective_trade_size_usd": trade_size_usd,
         "effective_max_open_exposure_usd": max_open_exposure_usd,
         "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+        "daily_opened_notional_usd": calc_daily_opened_notional(open_positions, closed_positions, day_cn),
+        "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
+        "daily_new_open_notional_left_usd": daily_new_open_notional_left_usd,
         **pending_stats,
     }
 
@@ -2270,6 +2346,7 @@ def summarize(
             "rotated_closed": apply_result.get("rotated_closed", 0),
             "rotation_opened": apply_result.get("rotation_opened", 0),
             "blocked_by_confirm": apply_result.get("blocked_by_confirm", 0),
+            "blocked_by_daily_open_cap": apply_result.get("blocked_by_daily_open_cap", 0),
             "blocked_by_edge_gate": apply_result.get("blocked_by_edge_gate", 0),
             "blocked_by_kelly": apply_result.get("blocked_by_kelly", 0),
             "blocked_by_depth": apply_result.get("blocked_by_depth", 0),
@@ -2289,6 +2366,9 @@ def summarize(
             "effective_trade_size_usd": apply_result.get("effective_trade_size_usd"),
             "effective_max_open_exposure_usd": apply_result.get("effective_max_open_exposure_usd"),
             "effective_daily_stop_loss_usd": apply_result.get("effective_daily_stop_loss_usd"),
+            "daily_opened_notional_usd": apply_result.get("daily_opened_notional_usd", 0.0),
+            "daily_new_open_notional_cap_usd": apply_result.get("daily_new_open_notional_cap_usd"),
+            "daily_new_open_notional_left_usd": apply_result.get("daily_new_open_notional_left_usd"),
             "stop_triggered": bool(apply_result.get("stop_triggered", False)),
         },
     }
@@ -2350,6 +2430,12 @@ def main() -> None:
         type=float,
         default=None,
         help="Daily stop loss threshold in USD, usually negative (default: Config.daily_stop_loss_usd)",
+    )
+    parser.add_argument(
+        "--daily-new-open-notional-cap-usd",
+        type=float,
+        default=None,
+        help="Daily cap for newly-opened notional (sum of size_usd opened today)",
     )
     parser.add_argument(
         "--min-hours-to-expiry",
@@ -2585,6 +2671,8 @@ def main() -> None:
         config.max_open_exposure_usd = max(0.25, float(args.max_open_exposure_usd))
     if args.daily_stop_loss_usd is not None:
         config.daily_stop_loss_usd = float(args.daily_stop_loss_usd)
+    if args.daily_new_open_notional_cap_usd is not None:
+        config.daily_new_open_notional_cap_usd = max(0.25, float(args.daily_new_open_notional_cap_usd))
     if args.min_hours_to_expiry is not None:
         config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
     if args.max_positions_per_city is not None:
@@ -2692,11 +2780,19 @@ def main() -> None:
         bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + net_realized_total + net_unrealized)
         effective_limits = derive_effective_risk_limits(config, bankroll_equity)
         pending_stats = pending_exit_stats(state.get("open_positions", []))
+        daily_opened_notional_usd = calc_daily_opened_notional(
+            state.get("open_positions", []),
+            state.get("closed_positions", []),
+            day_cn,
+        )
+        daily_new_open_notional_cap_usd = max(0.25, float(config.daily_new_open_notional_cap_usd))
 
         apply_result = {
             "opened": 0,
             "skipped_existing": 0,
             "blocked_by_risk": 0,
+            "blocked_by_cluster": 0,
+            "blocked_by_daily_open_cap": 0,
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
@@ -2714,6 +2810,9 @@ def main() -> None:
             "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
             "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
             "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
+            "daily_opened_notional_usd": daily_opened_notional_usd,
+            "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
+            "daily_new_open_notional_left_usd": max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd),
             **pending_stats,
         }
 
@@ -2753,6 +2852,7 @@ def main() -> None:
         "trade_size_usd": config.trade_size_usd,
         "max_open_exposure_usd": config.max_open_exposure_usd,
         "daily_stop_loss_usd": config.daily_stop_loss_usd,
+        "daily_new_open_notional_cap_usd": config.daily_new_open_notional_cap_usd,
         "min_hours_to_expiry": config.min_hours_to_expiry,
         "max_positions_per_city": config.max_positions_per_city,
         "max_event_cluster_exposure_usd": config.max_event_cluster_exposure_usd,
