@@ -1655,11 +1655,13 @@ def ttl_bucket_and_multiplier(end_date_raw: str) -> Tuple[str, float]:
 
 
 def signal_open_score(s: Signal, config: Config) -> float:
-    """Compatibility helper; opening order now uses raw edge priority.
+    """Risk-adjusted score used for capital allocation.
 
-    Kept for reporting/diagnostics fields (`selection_score`) to avoid schema
-    churn, but opening ranking is controlled in `select_signals_for_opening`
-    and `apply_paper_positions`.
+    Ranking priority is risk-first (not raw edge-first):
+    - Kelly edge (`full_kelly`)
+    - category risk appetite (`kelly_fraction_core/tail`)
+    - robustness retention (`robustness_min_edge / edge`)
+    - time-to-expiry multiplier
     """
     if float(s.side_price) <= 0:
         return 0.0
@@ -1686,9 +1688,9 @@ def select_signals_for_opening(signals: List[Signal], config: Config, slots_tota
     ranked = sorted(
         signals,
         key=lambda s: (
-            float(s.edge),
+            signal_open_score(s, config),
             signal_net_edge(float(s.side_price), float(s.edge), config),
-            float(s.robustness_min_edge),
+            float(s.edge),
             float(s.side_prob),
         ),
         reverse=True,
@@ -1796,9 +1798,9 @@ def apply_paper_positions(
     ranked = sorted(
         confirmed_signals,
         key=lambda s: (
-            float(s.edge),
+            signal_open_score(s, config),
             signal_net_edge(float(s.side_price), float(s.edge), config),
-            float(s.robustness_min_edge),
+            float(s.edge),
             float(s.side_prob),
         ),
         reverse=True,
