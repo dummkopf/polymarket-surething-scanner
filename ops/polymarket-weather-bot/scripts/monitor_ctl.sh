@@ -13,8 +13,6 @@ MAX_EVENT_CLUSTER_EXPOSURE_USD="${MAX_EVENT_CLUSTER_EXPOSURE_USD:-100}"
 EXIT_EDGE_FLOOR="${EXIT_EDGE_FLOOR:-0.01}"
 MIN_HOLDING_MINUTES_FOR_EDGE_EXIT="${MIN_HOLDING_MINUTES_FOR_EDGE_EXIT:-10}"
 CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
-CONFIRM_TICKS_CORE="${CONFIRM_TICKS_CORE:-1}"
-CONFIRM_TICKS_TAIL="${CONFIRM_TICKS_TAIL:-2}"
 TRADE_SIZE_USD="${TRADE_SIZE_USD:-100}"
 MAX_OPEN_EXPOSURE_USD="${MAX_OPEN_EXPOSURE_USD:-250}"
 DAILY_STOP_LOSS_USD="${DAILY_STOP_LOSS_USD:--50}"
@@ -99,8 +97,6 @@ cmd_start() {
         --exit-edge-floor '$EXIT_EDGE_FLOOR' \
         --min-holding-minutes-for-edge-exit '$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT' \
         --confirm-ticks '$CONFIRM_TICKS' \
-        --confirm-ticks-core '$CONFIRM_TICKS_CORE' \
-        --confirm-ticks-tail '$CONFIRM_TICKS_TAIL' \
         --trade-size-usd '$TRADE_SIZE_USD' \
         --max-open-exposure-usd '$MAX_OPEN_EXPOSURE_USD' \
         --daily-stop-loss-usd '$DAILY_STOP_LOSS_USD' \
@@ -169,7 +165,7 @@ cmd_status() {
     fi
   else
     if is_running; then
-      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, min_open_size_usd=${MIN_OPEN_SIZE_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, confirm_ticks_core=${CONFIRM_TICKS_CORE}, confirm_ticks_tail=${CONFIRM_TICKS_TAIL}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
+      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, min_open_size_usd=${MIN_OPEN_SIZE_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
     else
       echo "monitor: stopped"
     fi
@@ -199,8 +195,6 @@ cmd_run_once() {
     --exit-edge-floor "$EXIT_EDGE_FLOOR" \
     --min-holding-minutes-for-edge-exit "$MIN_HOLDING_MINUTES_FOR_EDGE_EXIT" \
     --confirm-ticks "$CONFIRM_TICKS" \
-    --confirm-ticks-core "$CONFIRM_TICKS_CORE" \
-    --confirm-ticks-tail "$CONFIRM_TICKS_TAIL" \
     --trade-size-usd "$TRADE_SIZE_USD" \
     --max-open-exposure-usd "$MAX_OPEN_EXPOSURE_USD" \
     --daily-stop-loss-usd "$DAILY_STOP_LOSS_USD" \
@@ -280,9 +274,7 @@ Env overrides:
   MAX_EVENT_CLUSTER_EXPOSURE_USD=<float>           # default 100
   EXIT_EDGE_FLOOR=<float>                          # default 0.01
   MIN_HOLDING_MINUTES_FOR_EDGE_EXIT=<int>          # default 10
-  CONFIRM_TICKS=<int>                              # default 2 (fallback for both)
-  CONFIRM_TICKS_CORE=<int>                         # default 1
-  CONFIRM_TICKS_TAIL=<int>                         # default 2
+  CONFIRM_TICKS=<int>                              # default 2
   TRADE_SIZE_USD=<float>                           # default 100
   MAX_OPEN_EXPOSURE_USD=<float>                    # default 250
   DAILY_STOP_LOSS_USD=<float>                      # default -50

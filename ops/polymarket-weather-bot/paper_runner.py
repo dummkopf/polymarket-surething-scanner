@@ -95,9 +95,6 @@ class Config:
 
     # Signal confirmation + sizing by time-to-expiry
     confirm_ticks: int = 2
-    # Optional per-category confirmation thresholds.
-    confirm_ticks_core: int = 1
-    confirm_ticks_tail: int = 2
 
     # Fractional Kelly controls
     paper_bankroll_usd: float = 1000.0
@@ -1790,14 +1787,9 @@ def apply_paper_positions(
 
     confirm_counts: Dict[str, int] = state.get("signal_confirm_counts", {})
     confirmed_signals: List[Signal] = []
-    confirm_ticks_default = max(1, int(config.confirm_ticks))
-    confirm_ticks_core = max(1, int(getattr(config, "confirm_ticks_core", confirm_ticks_default)))
-    confirm_ticks_tail = max(1, int(getattr(config, "confirm_ticks_tail", confirm_ticks_default)))
-
     for s in signals:
         k = f"{s.slug}|{s.side}"
-        required_ticks = confirm_ticks_core if s.category == "core" else confirm_ticks_tail
-        if int(confirm_counts.get(k, 0)) >= int(required_ticks):
+        if int(confirm_counts.get(k, 0)) >= int(config.confirm_ticks):
             confirmed_signals.append(s)
         else:
             blocked_by_confirm += 1
@@ -2500,19 +2492,7 @@ def main() -> None:
         "--confirm-ticks",
         type=int,
         default=None,
-        help="Fallback confirmation ticks for both categories",
-    )
-    parser.add_argument(
-        "--confirm-ticks-core",
-        type=int,
-        default=None,
-        help="Core signal confirmation ticks (default: Config.confirm_ticks_core)",
-    )
-    parser.add_argument(
-        "--confirm-ticks-tail",
-        type=int,
-        default=None,
-        help="Tail signal confirmation ticks (default: Config.confirm_ticks_tail)",
+        help="Require signal persistence for N cycles before entry",
     )
     parser.add_argument(
         "--paper-bankroll-usd",
@@ -2731,15 +2711,7 @@ def main() -> None:
     if args.min_holding_minutes_for_edge_exit is not None:
         config.min_holding_minutes_for_edge_exit = max(0, int(args.min_holding_minutes_for_edge_exit))
     if args.confirm_ticks is not None:
-        v = max(1, int(args.confirm_ticks))
-        config.confirm_ticks = v
-        # Backward compatibility: a single confirm-ticks sets both categories.
-        config.confirm_ticks_core = v
-        config.confirm_ticks_tail = v
-    if args.confirm_ticks_core is not None:
-        config.confirm_ticks_core = max(1, int(args.confirm_ticks_core))
-    if args.confirm_ticks_tail is not None:
-        config.confirm_ticks_tail = max(1, int(args.confirm_ticks_tail))
+        config.confirm_ticks = max(1, int(args.confirm_ticks))
     if args.paper_bankroll_usd is not None:
         config.paper_bankroll_usd = max(1.0, float(args.paper_bankroll_usd))
     if args.kelly_fraction_core is not None:
@@ -2923,8 +2895,6 @@ def main() -> None:
         "exit_edge_floor": config.exit_edge_floor,
         "min_holding_minutes_for_edge_exit": config.min_holding_minutes_for_edge_exit,
         "confirm_ticks": config.confirm_ticks,
-        "confirm_ticks_core": config.confirm_ticks_core,
-        "confirm_ticks_tail": config.confirm_ticks_tail,
         "paper_bankroll_usd": config.paper_bankroll_usd,
         "kelly_fraction_core": config.kelly_fraction_core,
         "kelly_fraction_tail": config.kelly_fraction_tail,
