@@ -47,6 +47,7 @@
       <div class="card"><div class="k">Latest Signals</div><div id="signals" class="v">-</div></div>
       <div class="card"><div class="k">Starting Fund</div><div id="startingFund" class="v">$1000</div></div>
       <div class="card"><div class="k">Pending Settle</div><div id="pendingSettle" class="v">-</div></div>
+      <div class="card"><div class="k">Fresh Settled</div><div id="settledFresh" class="v">-</div></div>
       <div class="card"><div class="k">Last Runner Tick</div><div id="lastRun" class="v" style="font-size:13px">-</div></div>
     </div>
 
@@ -88,6 +89,13 @@
         <thead><tr><th>City</th><th>Market Link</th><th>Status</th><th>Brief</th></tr></thead>
         <tbody id="universeBody"></tbody>
       </table>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <h3 style="margin-top:0">资金变动曲线（Realized Equity）</h3>
+      <div class="muted" style="margin-bottom:8px;">基于已平仓盈亏累计；用于观察资金曲线斜率与回撤。</div>
+      <svg id="equityChart" viewBox="0 0 1000 220" width="100%" height="220" style="background:#0f1730;border-radius:10px;border:1px solid rgba(255,255,255,.08)"></svg>
+      <div id="equityMeta" class="muted" style="margin-top:8px;">-</div>
     </div>
   </div>
 
@@ -147,6 +155,53 @@ const shanghaiDay=(t)=>{
   return new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit' }).format(d);
 };
 
+function renderEquityChart(closedAll, freshMs){
+  const svg=document.getElementById('equityChart');
+  const meta=document.getElementById('equityMeta');
+  if(!svg || !meta) return;
+
+  const startFund=1000;
+  const pts=[{ts:freshMs, eq:startFund}];
+  const closedFresh=(closedAll||[])
+    .filter(p=>{
+      const t=new Date(p.closed_at||0).getTime();
+      return Number.isFinite(t) && t>=freshMs;
+    })
+    .sort((a,b)=>new Date(a.closed_at).getTime()-new Date(b.closed_at).getTime());
+
+  let eq=startFund;
+  for(const p of closedFresh){
+    eq += (+p.realized_pnl_usd||0);
+    pts.push({ts:new Date(p.closed_at).getTime(), eq});
+  }
+  const now=Date.now();
+  pts.push({ts:now, eq});
+
+  const w=1000,h=220,pad=24;
+  const minEq=Math.min(...pts.map(p=>p.eq));
+  const maxEq=Math.max(...pts.map(p=>p.eq));
+  const spanEq=Math.max(1e-6,maxEq-minEq);
+  const minTs=Math.min(...pts.map(p=>p.ts));
+  const maxTs=Math.max(...pts.map(p=>p.ts));
+  const spanTs=Math.max(1,maxTs-minTs);
+
+  const x=t=>pad + ((t-minTs)/spanTs)*(w-pad*2);
+  const y=v=>h-pad - ((v-minEq)/spanEq)*(h-pad*2);
+
+  const poly=pts.map(p=>`${x(p.ts).toFixed(2)},${y(p.eq).toFixed(2)}`).join(' ');
+  const last=pts[pts.length-1];
+  const color=last.eq>=startFund?'#1ec98f':'#ff6b6b';
+
+  svg.innerHTML=`
+    <line x1="${pad}" y1="${y(startFund)}" x2="${w-pad}" y2="${y(startFund)}" stroke="rgba(255,255,255,.2)" stroke-dasharray="4 4" />
+    <polyline fill="none" stroke="${color}" stroke-width="3" points="${poly}" />
+    <circle cx="${x(last.ts)}" cy="${y(last.eq)}" r="4" fill="${color}" />
+  `;
+
+  const pnl=last.eq-startFund;
+  meta.textContent=`样本: ${closedFresh.length} settled | 起始: $${startFund.toFixed(2)} | 当前: $${last.eq.toFixed(2)} | 变动: ${pnl>=0?'+':''}$${pnl.toFixed(2)}`;
+}
+
 function getFreshTs(){
   const x=localStorage.getItem('pm_fresh_ts');
   if(x) return x;
@@ -193,6 +248,7 @@ async function refreshAll(){
       .filter(p=>shanghaiDay(p.closed_at)===todayKey)
       .reduce((a,p)=>a+(+p.realized_pnl_usd||0),0);
     const pendingSettle=open.filter(p=>new Date(p.end_date||0).getTime()<=Date.now()).length;
+    const settledFresh=closedFresh.length;
 
     document.getElementById('openPositions').textContent=open.length;
     document.getElementById('openExposure').textContent='$'+fmt(exposure,2);
@@ -212,7 +268,11 @@ async function refreshAll(){
     const ps=document.getElementById('pendingSettle');
     ps.textContent=String(pendingSettle);
     ps.className='v '+(pendingSettle>0?'warn':'ok');
+    const sf=document.getElementById('settledFresh');
+    sf.textContent=String(settledFresh);
+    sf.className='v '+(settledFresh>0?'ok':'warn');
     document.getElementById('lastRun').textContent=fmtTime(state.last_run);
+    renderEquityChart(closedAll, freshMs);
 
     const pb=document.getElementById('positionsBody'); pb.innerHTML='';
     if(!open.length) pb.innerHTML='<tr><td colspan="10" class="muted">暂无 fresh 持仓</td></tr>';
