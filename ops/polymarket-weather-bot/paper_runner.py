@@ -68,7 +68,8 @@ class Config:
     max_open_exposure_usd: float = 120.0
     daily_stop_loss_usd: float = -30.0
     # Daily budget for newly-opened notional (open-side turnover cap).
-    daily_new_open_notional_cap_usd: float = 250.0
+    # <=0 means disabled (live-exposure-only mode).
+    daily_new_open_notional_cap_usd: float = 0.0
 
     # Legacy slot-mix knobs kept for compatibility only.
     # Capital allocation is no longer driven by fixed core/tail quotas.
@@ -1724,8 +1725,14 @@ def apply_paper_positions(
     free_exposure = max(0.0, max_open_exposure_usd - exposure)
 
     daily_opened_notional_usd = calc_daily_opened_notional(open_positions, closed_positions, day_cn)
-    daily_new_open_notional_cap_usd = max(0.25, float(config.daily_new_open_notional_cap_usd))
-    daily_new_open_notional_left_usd = max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
+    daily_new_open_notional_cap_cfg = float(config.daily_new_open_notional_cap_usd)
+    daily_open_cap_enabled = daily_new_open_notional_cap_cfg > 0.0
+    daily_new_open_notional_cap_usd = max(0.0, daily_new_open_notional_cap_cfg)
+    daily_new_open_notional_left_usd = (
+        max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
+        if daily_open_cap_enabled
+        else float("inf")
+    )
 
     stop_triggered = (net_realized_today + net_unrealized) <= daily_stop_loss_usd
 
@@ -1766,9 +1773,12 @@ def apply_paper_positions(
             "effective_trade_size_usd": trade_size_usd,
             "effective_max_open_exposure_usd": max_open_exposure_usd,
             "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+            "new_open_cap_mode": "daily_turnover" if daily_open_cap_enabled else "live_exposure",
             "daily_opened_notional_usd": daily_opened_notional_usd,
             "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
-            "daily_new_open_notional_left_usd": daily_new_open_notional_left_usd,
+            "daily_new_open_notional_left_usd": (
+                daily_new_open_notional_left_usd if daily_open_cap_enabled else None
+            ),
             **pending_stats,
         }
 
@@ -1920,7 +1930,7 @@ def apply_paper_positions(
         if cluster_remaining <= 0.25:
             return "cluster_cap"
 
-        if float(available_daily_open_notional) <= 0.25:
+        if daily_open_cap_enabled and float(available_daily_open_notional) <= 0.25:
             return "daily_open_cap"
 
         ticket = compute_open_ticket(
@@ -2038,7 +2048,8 @@ def apply_paper_positions(
         city_counts[s.city_slug] = city_counts.get(s.city_slug, 0) + 1
         cluster_exposure[cluster_key] = cluster_exposure.get(cluster_key, 0.0) + size_usd
         free_exposure = max(0.0, free_exposure - size_usd)
-        daily_new_open_notional_left_usd = max(0.0, daily_new_open_notional_left_usd - size_usd)
+        if daily_open_cap_enabled:
+            daily_new_open_notional_left_usd = max(0.0, daily_new_open_notional_left_usd - size_usd)
         opened += 1
         return True, "opened"
 
@@ -2134,7 +2145,9 @@ def apply_paper_positions(
     # First pass: open what we can directly.
     structure_blocked_candidates: List[Signal] = []
     for s in ranked:
-        if free_exposure <= 0.25 or daily_new_open_notional_left_usd <= 0.25:
+        if free_exposure <= 0.25:
+            break
+        if daily_open_cap_enabled and daily_new_open_notional_left_usd <= 0.25:
             break
 
         key = (s.slug, s.side)
@@ -2298,9 +2311,12 @@ def apply_paper_positions(
         "effective_trade_size_usd": trade_size_usd,
         "effective_max_open_exposure_usd": max_open_exposure_usd,
         "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+        "new_open_cap_mode": "daily_turnover" if daily_open_cap_enabled else "live_exposure",
         "daily_opened_notional_usd": calc_daily_opened_notional(open_positions, closed_positions, day_cn),
         "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
-        "daily_new_open_notional_left_usd": daily_new_open_notional_left_usd,
+        "daily_new_open_notional_left_usd": (
+            daily_new_open_notional_left_usd if daily_open_cap_enabled else None
+        ),
         **pending_stats,
     }
 
@@ -2366,6 +2382,7 @@ def summarize(
             "effective_trade_size_usd": apply_result.get("effective_trade_size_usd"),
             "effective_max_open_exposure_usd": apply_result.get("effective_max_open_exposure_usd"),
             "effective_daily_stop_loss_usd": apply_result.get("effective_daily_stop_loss_usd"),
+            "new_open_cap_mode": apply_result.get("new_open_cap_mode", "daily_turnover"),
             "daily_opened_notional_usd": apply_result.get("daily_opened_notional_usd", 0.0),
             "daily_new_open_notional_cap_usd": apply_result.get("daily_new_open_notional_cap_usd"),
             "daily_new_open_notional_left_usd": apply_result.get("daily_new_open_notional_left_usd"),
@@ -2435,7 +2452,7 @@ def main() -> None:
         "--daily-new-open-notional-cap-usd",
         type=float,
         default=None,
-        help="Daily cap for newly-opened notional (sum of size_usd opened today)",
+        help="Daily cap for newly-opened notional (sum of size_usd opened today); <=0 disables and uses live-exposure-only mode",
     )
     parser.add_argument(
         "--min-hours-to-expiry",
@@ -2672,7 +2689,7 @@ def main() -> None:
     if args.daily_stop_loss_usd is not None:
         config.daily_stop_loss_usd = float(args.daily_stop_loss_usd)
     if args.daily_new_open_notional_cap_usd is not None:
-        config.daily_new_open_notional_cap_usd = max(0.25, float(args.daily_new_open_notional_cap_usd))
+        config.daily_new_open_notional_cap_usd = float(args.daily_new_open_notional_cap_usd)
     if args.min_hours_to_expiry is not None:
         config.min_hours_to_expiry = max(0.0, float(args.min_hours_to_expiry))
     if args.max_positions_per_city is not None:
@@ -2785,7 +2802,9 @@ def main() -> None:
             state.get("closed_positions", []),
             day_cn,
         )
-        daily_new_open_notional_cap_usd = max(0.25, float(config.daily_new_open_notional_cap_usd))
+        daily_new_open_notional_cap_cfg = float(config.daily_new_open_notional_cap_usd)
+        daily_open_cap_enabled = daily_new_open_notional_cap_cfg > 0.0
+        daily_new_open_notional_cap_usd = max(0.0, daily_new_open_notional_cap_cfg)
 
         apply_result = {
             "opened": 0,
@@ -2810,9 +2829,14 @@ def main() -> None:
             "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
             "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
             "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
+            "new_open_cap_mode": "daily_turnover" if daily_open_cap_enabled else "live_exposure",
             "daily_opened_notional_usd": daily_opened_notional_usd,
             "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
-            "daily_new_open_notional_left_usd": max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd),
+            "daily_new_open_notional_left_usd": (
+                max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
+                if daily_open_cap_enabled
+                else None
+            ),
             **pending_stats,
         }
 

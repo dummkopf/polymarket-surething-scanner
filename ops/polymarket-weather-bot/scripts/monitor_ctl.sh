@@ -16,7 +16,7 @@ CONFIRM_TICKS="${CONFIRM_TICKS:-2}"
 TRADE_SIZE_USD="${TRADE_SIZE_USD:-10}"
 MAX_OPEN_EXPOSURE_USD="${MAX_OPEN_EXPOSURE_USD:-120}"
 DAILY_STOP_LOSS_USD="${DAILY_STOP_LOSS_USD:--50}"
-DAILY_NEW_OPEN_NOTIONAL_CAP_USD="${DAILY_NEW_OPEN_NOTIONAL_CAP_USD:-250}"
+DAILY_NEW_OPEN_NOTIONAL_CAP_USD="${DAILY_NEW_OPEN_NOTIONAL_CAP_USD:-0}"
 PAPER_BANKROLL_USD="${PAPER_BANKROLL_USD:-1000}"
 KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
 KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.08}"
@@ -275,7 +275,7 @@ Env overrides:
   TRADE_SIZE_USD=<float>                           # default 10
   MAX_OPEN_EXPOSURE_USD=<float>                    # default 120
   DAILY_STOP_LOSS_USD=<float>                      # default -50
-  DAILY_NEW_OPEN_NOTIONAL_CAP_USD=<float>          # default 250
+  DAILY_NEW_OPEN_NOTIONAL_CAP_USD=<float>          # default 0 (<=0 disables daily turnover cap; live-exposure mode)
   PAPER_BANKROLL_USD=<float>                       # default 1000
   KELLY_FRACTION_CORE=<float>                      # default 0.20
   KELLY_FRACTION_TAIL=<float>                      # default 0.08
