@@ -98,6 +98,7 @@ class Config:
     kelly_fraction_core: float = 0.20
     kelly_fraction_tail: float = 0.08
     max_bet_fraction: float = 0.01
+    tail_size_cap_fraction: float = 0.5
     min_edge_for_entry: float = 0.02
 
     # Model robustness gate: require edge to remain positive under
