@@ -25,6 +25,7 @@ CN_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo else UTC
 
 WEATHER_SECTION_URL = "https://polymarket.com/climate-science/weather"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
@@ -315,6 +316,95 @@ def fetch_market_by_slug(slug: str, timeout_sec: int) -> Optional[Dict[str, Any]
     if isinstance(data, list) and data:
         return data[0]
     return None
+
+
+def market_token_id_for_side(market: Dict[str, Any], side: str) -> Optional[str]:
+    """Resolve CLOB token id for YES/NO side from Gamma market payload."""
+    token_ids = market.get("clobTokenIds")
+    if isinstance(token_ids, str):
+        try:
+            token_ids = json.loads(token_ids)
+        except Exception:
+            token_ids = None
+
+    if not isinstance(token_ids, list) or len(token_ids) < 2:
+        return None
+
+    idx = 0 if side == "YES" else 1
+    try:
+        token_id = str(token_ids[idx])
+    except Exception:
+        return None
+
+    return token_id or None
+
+
+def fetch_clob_book(token_id: str, timeout_sec: int, cache: Dict[str, Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    if token_id in cache:
+        return cache[token_id]
+
+    try:
+        resp = requests.get(CLOB_BOOK_URL, params={"token_id": token_id}, timeout=timeout_sec)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            cache[token_id] = data
+            return data
+    except Exception:
+        pass
+
+    cache[token_id] = None
+    return None
+
+
+def depth_cap_for_entry(
+    market: Dict[str, Any],
+    side: str,
+    target_price: float,
+    timeout_sec: int,
+    book_cache: Dict[str, Optional[Dict[str, Any]]],
+    depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]],
+) -> Optional[Dict[str, float]]:
+    """Return max fillable shares/usd at target limit price for opening a long side.
+
+    For a buy order, we consume asks with price <= target_price.
+    """
+    slug = str(market.get("slug") or "")
+    cache_key = (slug, side, round(float(target_price), 6))
+    if cache_key in depth_cache:
+        return depth_cache[cache_key]
+
+    token_id = market_token_id_for_side(market, side)
+    if not token_id:
+        depth_cache[cache_key] = None
+        return None
+
+    book = fetch_clob_book(token_id, timeout_sec, book_cache)
+    if not isinstance(book, dict):
+        depth_cache[cache_key] = None
+        return None
+
+    asks = book.get("asks")
+    if not isinstance(asks, list):
+        depth_cache[cache_key] = {"shares": 0.0, "usd": 0.0}
+        return depth_cache[cache_key]
+
+    cap_shares = 0.0
+    px_limit = float(target_price)
+    for lvl in asks:
+        if not isinstance(lvl, dict):
+            continue
+        px = parse_float(lvl.get("price"))
+        sz = parse_float(lvl.get("size"))
+        if px is None or sz is None or sz <= 0:
+            continue
+        if px <= px_limit + 1e-9:
+            cap_shares += float(sz)
+
+    cap_shares = max(0.0, cap_shares)
+    cap_usd = cap_shares * px_limit
+    depth_cache[cache_key] = {"shares": cap_shares, "usd": cap_usd}
+    return depth_cache[cache_key]
 
 
 def parse_temperature_slug(slug: str) -> Optional[ParsedContract]:
@@ -1374,6 +1464,7 @@ def apply_paper_positions(
     blocked_by_confirm = 0
     blocked_by_edge_gate = 0
     blocked_by_kelly = 0
+    blocked_by_depth = 0
     rotated_closed = 0
     rotation_opened = 0
 
@@ -1386,6 +1477,7 @@ def apply_paper_positions(
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
+            "blocked_by_depth": 0,
             "rotated_closed": 0,
             "rotation_opened": 0,
             "stop_triggered": True,
@@ -1414,6 +1506,8 @@ def apply_paper_positions(
     )
 
     signal_map: Dict[Tuple[str, str], Signal] = {(s.slug, s.side): s for s in signals}
+    book_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]] = {}
 
     existing_keys = {(p.get("slug"), p.get("side")) for p in open_positions}
     city_counts: Dict[str, int] = {}
@@ -1426,7 +1520,12 @@ def apply_paper_positions(
         cluster_key_existing = event_cluster_key(c, str(p.get("target_date") or ""))
         cluster_exposure[cluster_key_existing] = cluster_exposure.get(cluster_key_existing, 0.0) + float(p.get("size_usd", 0.0))
 
-    def compute_open_ticket(s: Signal, available_exposure: float, cluster_remaining: float) -> Optional[Dict[str, float]]:
+    def compute_open_ticket(
+        s: Signal,
+        available_exposure: float,
+        cluster_remaining: float,
+        market: Dict[str, Any],
+    ) -> Optional[Dict[str, float]]:
         if s.side_price <= 0:
             return None
 
@@ -1457,6 +1556,22 @@ def apply_paper_positions(
             float(available_exposure),
             float(cluster_remaining),
         )
+
+        depth = depth_cap_for_entry(
+            market=market,
+            side=s.side,
+            target_price=float(s.side_price),
+            timeout_sec=int(config.request_timeout_sec),
+            book_cache=book_cache,
+            depth_cache=depth_cache,
+        )
+        if depth is None:
+            return None
+
+        depth_cap_shares = float(depth.get("shares", 0.0))
+        depth_cap_usd = float(depth.get("usd", 0.0))
+        size_usd = min(size_usd, depth_cap_usd)
+
         if size_usd <= 0.25:
             return None
 
@@ -1467,6 +1582,8 @@ def apply_paper_positions(
             "ttl_bucket": ttl_bucket,
             "kelly_size_usd": float(kelly_size_usd),
             "size_cap_by_policy": float(size_cap_by_policy),
+            "depth_cap_shares": float(depth_cap_shares),
+            "depth_cap_usd": float(depth_cap_usd),
             "size_usd": float(size_usd),
         }
 
@@ -1490,25 +1607,44 @@ def apply_paper_positions(
         if float(s.edge) < float(config.min_edge_for_entry):
             return "min_edge"
 
+        market = market_map.get(s.slug)
+        if not market:
+            return "depth_unavailable"
+
+        depth = depth_cap_for_entry(
+            market=market,
+            side=s.side,
+            target_price=float(s.side_price),
+            timeout_sec=int(config.request_timeout_sec),
+            book_cache=book_cache,
+            depth_cache=depth_cache,
+        )
+        if depth is None:
+            return "depth_unavailable"
+        if float(depth.get("usd", 0.0)) <= 0.25:
+            return "depth_cap"
+
         cluster_key = event_cluster_key(s.city_slug, s.target_date)
         cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure_ref.get(cluster_key, 0.0))
         if cluster_remaining <= 0.25:
             return "cluster_cap"
 
-        ticket = compute_open_ticket(s, available_exposure, cluster_remaining)
+        ticket = compute_open_ticket(s, available_exposure, cluster_remaining, market)
         if ticket is None:
             return "kelly"
 
         return None
 
     def register_block(reason: str) -> None:
-        nonlocal blocked_by_risk, blocked_by_cluster, blocked_by_edge_gate, blocked_by_kelly
+        nonlocal blocked_by_risk, blocked_by_cluster, blocked_by_edge_gate, blocked_by_kelly, blocked_by_depth
         if reason == "cluster_cap":
             blocked_by_cluster += 1
         elif reason == "min_edge":
             blocked_by_edge_gate += 1
         elif reason == "kelly":
             blocked_by_kelly += 1
+        elif reason in {"depth_cap", "depth_unavailable"}:
+            blocked_by_depth += 1
         elif reason in {"city_cap", "bad_price"}:
             blocked_by_risk += 1
 
@@ -1521,7 +1657,10 @@ def apply_paper_positions(
 
         cluster_key = event_cluster_key(s.city_slug, s.target_date)
         cluster_remaining = max(0.0, float(config.max_event_cluster_exposure_usd) - cluster_exposure.get(cluster_key, 0.0))
-        ticket = compute_open_ticket(s, free_exposure, cluster_remaining)
+        market = market_map.get(s.slug)
+        if not market:
+            return False, "depth_unavailable"
+        ticket = compute_open_ticket(s, free_exposure, cluster_remaining, market)
         if ticket is None:
             return False, "kelly"
 
@@ -1545,6 +1684,8 @@ def apply_paper_positions(
             "size_multiplier": round(float(ticket["ttl_mult"]), 4),
             "cluster_remaining_usd_before_entry": round(cluster_remaining, 6),
             "size_cap_by_policy_usd": round(float(ticket["size_cap_by_policy"]), 6),
+            "depth_cap_shares_at_entry": round(float(ticket.get("depth_cap_shares", 0.0)), 6),
+            "depth_cap_usd_at_entry": round(float(ticket.get("depth_cap_usd", 0.0)), 6),
             "kelly_full_fraction": round(float(ticket["full_kelly"]), 6),
             "kelly_fraction_used": round(float(ticket["used_kelly"]), 6),
             "kelly_size_usd_pre_ttl": round(float(ticket["kelly_size_usd"]), 6),
@@ -1771,6 +1912,7 @@ def apply_paper_positions(
         "blocked_by_confirm": blocked_by_confirm,
         "blocked_by_edge_gate": blocked_by_edge_gate,
         "blocked_by_kelly": blocked_by_kelly,
+        "blocked_by_depth": blocked_by_depth,
         "rotated_closed": rotated_closed,
         "rotation_opened": rotation_opened,
         "stop_triggered": False,
@@ -1825,6 +1967,7 @@ def summarize(
             "blocked_by_confirm": apply_result.get("blocked_by_confirm", 0),
             "blocked_by_edge_gate": apply_result.get("blocked_by_edge_gate", 0),
             "blocked_by_kelly": apply_result.get("blocked_by_kelly", 0),
+            "blocked_by_depth": apply_result.get("blocked_by_depth", 0),
             "open_positions": len(open_positions),
             "closed_positions": len(closed_positions),
             "open_exposure_usd": round(calc_exposure(open_positions), 6),
@@ -2199,6 +2342,7 @@ def main() -> None:
             "blocked_by_confirm": 0,
             "blocked_by_edge_gate": 0,
             "blocked_by_kelly": 0,
+            "blocked_by_depth": 0,
             "rotated_closed": 0,
             "rotation_opened": 0,
             "stop_triggered": False,
