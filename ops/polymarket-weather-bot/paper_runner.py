@@ -104,7 +104,7 @@ class Config:
     tail_size_cap_fraction: float = 0.5
     min_edge_for_entry: float = 0.02
     # Ignore tiny entries below this USD notional.
-    min_open_size_usd: float = 1.0
+    min_open_size_usd: float = 10.0
 
     # Model robustness gate: require edge to remain positive under
     # small forecast mean shifts and sigma perturbations.

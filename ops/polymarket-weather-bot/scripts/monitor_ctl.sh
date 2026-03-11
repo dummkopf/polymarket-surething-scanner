@@ -23,7 +23,7 @@ KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.08}"
 MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.10}"
 TAIL_SIZE_CAP_FRACTION="${TAIL_SIZE_CAP_FRACTION:-0.5}"
 MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.02}"
-MIN_OPEN_SIZE_USD="${MIN_OPEN_SIZE_USD:-1}"
+MIN_OPEN_SIZE_USD="${MIN_OPEN_SIZE_USD:-10}"
 ROBUSTNESS_MU_SHIFT_C="${ROBUSTNESS_MU_SHIFT_C:-0.7}"
 ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
 ROBUSTNESS_SIGMA_SCALE_HIGH="${ROBUSTNESS_SIGMA_SCALE_HIGH:-1.15}"
@@ -285,7 +285,7 @@ Env overrides:
   MAX_BET_FRACTION=<float>                         # default 0.10
   TAIL_SIZE_CAP_FRACTION=<float>                   # default 0.5
   MIN_EDGE_FOR_ENTRY=<float>                       # default 0.02
-  MIN_OPEN_SIZE_USD=<float>                        # default 1
+  MIN_OPEN_SIZE_USD=<float>                        # default 10
   ROBUSTNESS_MU_SHIFT_C=<float>                    # default 0.7
   ROBUSTNESS_SIGMA_SCALE_LOW=<float>               # default 0.85
   ROBUSTNESS_SIGMA_SCALE_HIGH=<float>              # default 1.15
