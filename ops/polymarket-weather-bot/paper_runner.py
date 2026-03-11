@@ -129,6 +129,13 @@ class Config:
 
     request_timeout_sec: int = 20
 
+    # Execution-cost model (paper -> live bridge)
+    entry_fee_bps: float = 5.0
+    exit_fee_bps: float = 5.0
+    entry_slippage_bps: float = 10.0
+    exit_slippage_bps: float = 10.0
+    cancel_cost_usd: float = 0.0
+
 
 @dataclass
 class ParsedContract:
@@ -399,6 +406,56 @@ def depth_cap_for_entry(
         if px is None or sz is None or sz <= 0:
             continue
         if px <= px_limit + 1e-9:
+            cap_shares += float(sz)
+
+    cap_shares = max(0.0, cap_shares)
+    cap_usd = cap_shares * px_limit
+    depth_cache[cache_key] = {"shares": cap_shares, "usd": cap_usd}
+    return depth_cache[cache_key]
+
+
+def depth_cap_for_exit(
+    market: Dict[str, Any],
+    side: str,
+    target_price: float,
+    timeout_sec: int,
+    book_cache: Dict[str, Optional[Dict[str, Any]]],
+    depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]],
+) -> Optional[Dict[str, float]]:
+    """Return max fillable shares/usd at target limit price for selling a long side.
+
+    For a sell order, we consume bids with price >= target_price.
+    """
+    slug = str(market.get("slug") or "")
+    cache_key = (f"EXIT:{slug}", side, round(float(target_price), 6))
+    if cache_key in depth_cache:
+        return depth_cache[cache_key]
+
+    token_id = market_token_id_for_side(market, side)
+    if not token_id:
+        depth_cache[cache_key] = None
+        return None
+
+    book = fetch_clob_book(token_id, timeout_sec, book_cache)
+    if not isinstance(book, dict):
+        depth_cache[cache_key] = None
+        return None
+
+    bids = book.get("bids")
+    if not isinstance(bids, list):
+        depth_cache[cache_key] = {"shares": 0.0, "usd": 0.0}
+        return depth_cache[cache_key]
+
+    cap_shares = 0.0
+    px_limit = float(target_price)
+    for lvl in bids:
+        if not isinstance(lvl, dict):
+            continue
+        px = parse_float(lvl.get("price"))
+        sz = parse_float(lvl.get("size"))
+        if px is None or sz is None or sz <= 0:
+            continue
+        if px + 1e-9 >= px_limit:
             cap_shares += float(sz)
 
     cap_shares = max(0.0, cap_shares)
@@ -892,6 +949,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         else:
             brief = "reliable weather+odds, but below quality threshold"
 
+        net_edge = signal_net_edge(float(side_price), float(edge), config)
+
         candidate_row = {
             "slug": slug,
             "question": str(market.get("question") or ""),
@@ -901,6 +960,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "side_prob": round(side_prob, 6),
             "side_price": round(side_price, 6),
             "edge": round(edge, 6),
+            "net_edge": round(net_edge, 6),
             "forecast_max_c": round(forecast_max_c, 6),
             "sigma_c": round(sigma_c, 6),
             "bucket_lower": parsed.lower,
@@ -968,8 +1028,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
 
     counters["signals"] = len(signals)
 
-    signals.sort(key=lambda s: s.edge, reverse=True)
-    radar_rows.sort(key=lambda r: float(r.get("edge", 0.0)), reverse=True)
+    signals.sort(key=lambda s: signal_net_edge(float(s.side_price), float(s.edge), config), reverse=True)
+    radar_rows.sort(key=lambda r: float(r.get("net_edge", r.get("edge", 0.0))), reverse=True)
     return signals, radar_rows, universe_rows, market_map, counters
 
 
@@ -1157,6 +1217,69 @@ def calc_realized_total(closed_positions: List[Dict[str, Any]]) -> float:
     return round(total, 6)
 
 
+def calc_net_realized_today(closed_positions: List[Dict[str, Any]], day_cn: str) -> float:
+    total = 0.0
+    for p in closed_positions:
+        if exclude_from_model_cohort(p):
+            continue
+        closed_at = p.get("closed_at")
+        if not closed_at:
+            continue
+        if today_cn_str(closed_at) != day_cn:
+            continue
+        total += float(p.get("net_realized_pnl_usd", p.get("realized_pnl_usd", 0.0)))
+    return round(total, 6)
+
+
+def calc_net_realized_total(closed_positions: List[Dict[str, Any]]) -> float:
+    total = 0.0
+    for p in closed_positions:
+        if exclude_from_model_cohort(p):
+            continue
+        total += float(p.get("net_realized_pnl_usd", p.get("realized_pnl_usd", 0.0)))
+    return round(total, 6)
+
+
+def entry_cost_rate(config: Config) -> float:
+    return max(0.0, float(config.entry_fee_bps) + float(config.entry_slippage_bps)) / 10000.0
+
+
+def exit_cost_rate(config: Config) -> float:
+    return max(0.0, float(config.exit_fee_bps) + float(config.exit_slippage_bps)) / 10000.0
+
+
+def estimate_entry_cost_usd(size_usd: float, config: Config) -> float:
+    return max(0.0, float(size_usd)) * entry_cost_rate(config)
+
+
+def estimate_exit_cost_usd(exit_notional_usd: float, config: Config) -> float:
+    return max(0.0, float(exit_notional_usd)) * exit_cost_rate(config) + max(0.0, float(config.cancel_cost_usd))
+
+
+def signal_net_edge(side_price: float, gross_edge: float, config: Config) -> float:
+    # Approximate all-in net edge per share after round-trip execution frictions.
+    return float(gross_edge) - float(side_price) * (entry_cost_rate(config) + exit_cost_rate(config))
+
+
+def pending_exit_stats(open_positions: List[Dict[str, Any]]) -> Dict[str, float]:
+    now = datetime.now(UTC)
+    pending = [p for p in open_positions if bool(p.get("pending_exit_not_executable"))]
+    exposure = sum(float(p.get("size_usd", 0.0)) for p in pending)
+
+    max_wait = 0.0
+    for p in pending:
+        since = parse_iso_to_utc(str(p.get("pending_exit_since") or ""))
+        if since is None:
+            continue
+        max_wait = max(max_wait, (now - since).total_seconds() / 60.0)
+
+    return {
+        "pending_exit_count": int(len(pending)),
+        "pending_exit_exposure_usd": round(float(exposure), 6),
+        "pending_exit_max_wait_min": round(float(max_wait), 3),
+    }
+
+
 def kelly_full_fraction(prob: float, price: float) -> float:
     # Binary share with unit payout. Full Kelly for long position.
     # f* = (p - q) / (1 - q)
@@ -1218,7 +1341,31 @@ def calc_unrealized(open_positions: List[Dict[str, Any]], market_map: Dict[str, 
     return round(total, 6)
 
 
-def close_expired_positions(state: Dict[str, Any], market_map: Dict[str, Dict[str, Any]]) -> int:
+def calc_unrealized_net(open_positions: List[Dict[str, Any]], market_map: Dict[str, Dict[str, Any]], config: Config) -> float:
+    total = 0.0
+    for p in open_positions:
+        slug = p.get("slug")
+        side = p.get("side")
+        shares = float(p.get("shares", 0.0))
+        entry = float(p.get("entry_price", 0.0))
+
+        m = market_map.get(slug)
+        if not m:
+            continue
+        px = executable_exit_price_for_side(m, side)
+        if px is None:
+            continue
+
+        gross = shares * (px - entry)
+        entry_cost_remaining = float(p.get("entry_cost_remaining_usd", 0.0))
+        exit_notional_usd = shares * float(px)
+        exit_cost_est = estimate_exit_cost_usd(exit_notional_usd, config)
+        total += gross - entry_cost_remaining - exit_cost_est
+
+    return round(total, 6)
+
+
+def close_expired_positions(state: Dict[str, Any], market_map: Dict[str, Dict[str, Any]], config: Config) -> int:
     now = datetime.now(UTC)
     still_open = []
     closed_new = 0
@@ -1244,12 +1391,25 @@ def close_expired_positions(state: Dict[str, Any], market_map: Dict[str, Dict[st
 
         shares = float(p.get("shares", 0.0))
         entry = float(p.get("entry_price", 0.0))
-        pnl = shares * (settle_px - entry)
+        gross_pnl = shares * (settle_px - entry)
+
+        entry_cost_remaining = float(p.get("entry_cost_remaining_usd", 0.0))
+        exit_notional_usd = shares * float(settle_px)
+        exit_cost_usd = estimate_exit_cost_usd(exit_notional_usd, config)
+        net_pnl = gross_pnl - entry_cost_remaining - exit_cost_usd
 
         p2 = dict(p)
         p2["closed_at"] = iso_now()
         p2["settle_price"] = settle_px
-        p2["realized_pnl_usd"] = round(pnl, 6)
+        p2["realized_pnl_usd"] = round(gross_pnl, 6)
+        p2["net_realized_pnl_usd"] = round(net_pnl, 6)
+        p2["close_entry_cost_alloc_usd"] = round(entry_cost_remaining, 6)
+        p2["close_exit_cost_usd"] = round(exit_cost_usd, 6)
+        p2["entry_cost_remaining_usd"] = 0.0
+        p2.pop("pending_exit_not_executable", None)
+        p2.pop("pending_exit_reason", None)
+        p2.pop("pending_exit_since", None)
+        p2.pop("pending_exit_last_checked_at", None)
         state["closed_positions"].append(p2)
         closed_new += 1
 
@@ -1257,7 +1417,7 @@ def close_expired_positions(state: Dict[str, Any], market_map: Dict[str, Dict[st
     return closed_new
 
 
-def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict[str, Any]]) -> None:
+def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict[str, Any]], config: Config) -> None:
     ts = iso_now()
     for p in state.get("open_positions", []):
         slug = p.get("slug")
@@ -1270,12 +1430,18 @@ def update_open_position_marks(state: Dict[str, Any], market_map: Dict[str, Dict
         if px is None:
             p["mark_price"] = None
             p["unrealized_pnl_usd"] = None
+            p["net_unrealized_pnl_usd"] = None
             p["mark_updated_at"] = ts
             continue
 
-        pnl = shares * (px - entry)
+        gross_pnl = shares * (px - entry)
+        entry_cost_remaining = float(p.get("entry_cost_remaining_usd", 0.0))
+        exit_notional_usd = shares * float(px)
+        exit_cost_est = estimate_exit_cost_usd(exit_notional_usd, config)
+
         p["mark_price"] = round(px, 6)
-        p["unrealized_pnl_usd"] = round(pnl, 6)
+        p["unrealized_pnl_usd"] = round(gross_pnl, 6)
+        p["net_unrealized_pnl_usd"] = round(gross_pnl - entry_cost_remaining - exit_cost_est, 6)
         p["mark_updated_at"] = ts
 
 
@@ -1285,13 +1451,39 @@ def close_edge_decay_positions(
     market_map: Dict[str, Dict[str, Any]],
     config: Config,
 ) -> int:
-    """Close open paper positions when their same-side edge decays below a floor."""
+    """Close (or partially close) positions when edge decays below floor.
+
+    Exit execution is depth-capped at executable bid; if not executable, mark as
+    pending-exit and retry in subsequent loops.
+    """
     now = datetime.now(UTC)
     signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    book_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]] = {}
 
     still_open: List[Dict[str, Any]] = []
     closed_new = 0
+
+    def clear_pending_exit(p: Dict[str, Any]) -> Dict[str, Any]:
+        p2 = dict(p)
+        p2.pop("pending_exit_not_executable", None)
+        p2.pop("pending_exit_reason", None)
+        p2.pop("pending_exit_since", None)
+        p2.pop("pending_exit_last_checked_at", None)
+        p2.pop("pending_exit_edge", None)
+        return p2
+
+    def mark_pending_exit(p: Dict[str, Any], reason: str, edge_now: Optional[float]) -> Dict[str, Any]:
+        p2 = dict(p)
+        p2["pending_exit_not_executable"] = True
+        p2["pending_exit_reason"] = str(reason)
+        if not p2.get("pending_exit_since"):
+            p2["pending_exit_since"] = iso_now()
+        p2["pending_exit_last_checked_at"] = iso_now()
+        if edge_now is not None:
+            p2["pending_exit_edge"] = round(float(edge_now), 6)
+        return p2
 
     for p in state.get("open_positions", []):
         slug = str(p.get("slug") or "")
@@ -1321,32 +1513,79 @@ def close_edge_decay_positions(
             held_minutes = max(0.0, (now - opened_at).total_seconds() / 60)
 
         if held_minutes < float(config.min_holding_minutes_for_edge_exit):
-            still_open.append(p)
+            still_open.append(clear_pending_exit(p))
             continue
 
         if edge_now >= float(config.exit_edge_floor):
-            still_open.append(p)
+            still_open.append(clear_pending_exit(p))
             continue
 
         m = market_map.get(slug)
         px = executable_exit_price_for_side(m, side) if m else None
         if px is None:
-            still_open.append(p)
+            still_open.append(mark_pending_exit(p, "no_bid", edge_now))
+            continue
+
+        depth = depth_cap_for_exit(
+            market=m,
+            side=side,
+            target_price=float(px),
+            timeout_sec=int(config.request_timeout_sec),
+            book_cache=book_cache,
+            depth_cache=depth_cache,
+        ) if m else None
+
+        if depth is None:
+            still_open.append(mark_pending_exit(p, "depth_unavailable", edge_now))
             continue
 
         shares = float(p.get("shares", 0.0))
+        if shares <= 0:
+            continue
+
+        max_close_shares = max(0.0, float(depth.get("shares", 0.0)))
+        close_shares = min(shares, max_close_shares)
+        if close_shares <= 1e-9:
+            still_open.append(mark_pending_exit(p, "depth_zero", edge_now))
+            continue
+
         entry = float(p.get("entry_price", 0.0))
-        pnl = shares * (px - entry)
+        size_usd = float(p.get("size_usd", 0.0))
+        close_frac = min(1.0, close_shares / max(1e-9, shares))
+        close_size_usd = size_usd * close_frac
 
-        p2 = dict(p)
+        gross_pnl = close_shares * (float(px) - entry)
+        entry_cost_remaining = float(p.get("entry_cost_remaining_usd", 0.0))
+        entry_cost_alloc = entry_cost_remaining * close_frac
+        exit_notional_usd = close_shares * float(px)
+        exit_cost_usd = estimate_exit_cost_usd(exit_notional_usd, config)
+        net_pnl = gross_pnl - entry_cost_alloc - exit_cost_usd
+
+        p2 = clear_pending_exit(p)
         p2["closed_at"] = iso_now()
-        p2["settle_price"] = round(px, 6)
-        p2["realized_pnl_usd"] = round(pnl, 6)
+        p2["settle_price"] = round(float(px), 6)
+        p2["realized_pnl_usd"] = round(gross_pnl, 6)
+        p2["net_realized_pnl_usd"] = round(net_pnl, 6)
+        p2["close_entry_cost_alloc_usd"] = round(entry_cost_alloc, 6)
+        p2["close_exit_cost_usd"] = round(exit_cost_usd, 6)
         p2["close_reason"] = "edge_decay"
-        p2["close_edge"] = round(edge_now, 6)
-
+        p2["close_edge"] = round(float(edge_now), 6)
+        p2["shares"] = round(close_shares, 6)
+        p2["entry_cost_remaining_usd"] = 0.0
+        p2["size_usd"] = round(close_size_usd, 6)
+        p2["depth_cap_shares_at_exit"] = round(float(depth.get("shares", 0.0)), 6)
+        p2["depth_cap_usd_at_exit"] = round(float(depth.get("usd", 0.0)), 6)
         state["closed_positions"].append(p2)
         closed_new += 1
+
+        remaining_shares = shares - close_shares
+        if remaining_shares > 1e-9:
+            p_rem = dict(p)
+            rem_frac = remaining_shares / max(1e-9, shares)
+            p_rem["shares"] = round(remaining_shares, 6)
+            p_rem["size_usd"] = round(size_usd * rem_frac, 6)
+            p_rem["entry_cost_remaining_usd"] = round(max(0.0, entry_cost_remaining - entry_cost_alloc), 6)
+            still_open.append(mark_pending_exit(p_rem, "depth_partial", edge_now))
 
     state["open_positions"] = still_open
     return closed_new
@@ -1424,7 +1663,11 @@ def select_signals_for_opening(signals: List[Signal], config: Config, slots_tota
 
     ranked = sorted(
         signals,
-        key=lambda s: (signal_open_score(s, config), float(s.edge), float(s.side_prob)),
+        key=lambda s: (
+            signal_open_score(s, config),
+            signal_net_edge(float(s.side_price), float(s.edge), config),
+            float(s.side_prob),
+        ),
         reverse=True,
     )
     return ranked[:slots_total]
@@ -1441,11 +1684,14 @@ def apply_paper_positions(
 
     day_cn = today_cn_str()
     realized_today = calc_realized_today(closed_positions, day_cn)
+    net_realized_today = calc_net_realized_today(closed_positions, day_cn)
     realized_total = calc_realized_total(closed_positions)
+    net_realized_total = calc_net_realized_total(closed_positions)
     unrealized = calc_unrealized(open_positions, market_map)
+    net_unrealized = calc_unrealized_net(open_positions, market_map, config)
 
-    # Equity reference for Kelly sizing in paper mode.
-    bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + realized_total + unrealized)
+    # Equity reference for Kelly sizing in paper mode (net-of-cost for live realism).
+    bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + net_realized_total + net_unrealized)
     effective_limits = derive_effective_risk_limits(config, bankroll_equity)
 
     trade_size_usd = float(effective_limits["trade_size_usd"])
@@ -1455,7 +1701,7 @@ def apply_paper_positions(
     exposure = calc_exposure(open_positions)
     free_exposure = max(0.0, max_open_exposure_usd - exposure)
 
-    stop_triggered = (realized_today + unrealized) <= daily_stop_loss_usd
+    stop_triggered = (net_realized_today + net_unrealized) <= daily_stop_loss_usd
 
     opened = 0
     skipped_existing = 0
@@ -1469,6 +1715,7 @@ def apply_paper_positions(
     rotation_opened = 0
 
     if stop_triggered:
+        pending_stats = pending_exit_stats(open_positions)
         return {
             "opened": 0,
             "skipped_existing": 0,
@@ -1482,11 +1729,16 @@ def apply_paper_positions(
             "rotation_opened": 0,
             "stop_triggered": True,
             "realized_today": realized_today,
+            "net_realized_today": net_realized_today,
+            "realized_total": realized_total,
+            "net_realized_total": net_realized_total,
             "unrealized": unrealized,
+            "net_unrealized": net_unrealized,
             "bankroll_equity_usd": bankroll_equity,
             "effective_trade_size_usd": trade_size_usd,
             "effective_max_open_exposure_usd": max_open_exposure_usd,
             "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+            **pending_stats,
         }
 
     confirm_counts: Dict[str, int] = state.get("signal_confirm_counts", {})
@@ -1501,7 +1753,11 @@ def apply_paper_positions(
     # Try all ranked confirmed signals (not only top-N) so blocked picks can backfill.
     ranked = sorted(
         confirmed_signals,
-        key=lambda s: (signal_open_score(s, config), float(s.edge), float(s.side_prob)),
+        key=lambda s: (
+            signal_open_score(s, config),
+            signal_net_edge(float(s.side_price), float(s.edge), config),
+            float(s.side_prob),
+        ),
         reverse=True,
     )
 
@@ -1604,7 +1860,8 @@ def apply_paper_positions(
         if s.side_price <= 0:
             return "bad_price"
 
-        if float(s.edge) < float(config.min_edge_for_entry):
+        net_edge = signal_net_edge(float(s.side_price), float(s.edge), config)
+        if float(net_edge) < float(config.min_edge_for_entry):
             return "min_edge"
 
         market = market_map.get(s.slug)
@@ -1693,8 +1950,11 @@ def apply_paper_positions(
             "bankroll_equity_usd_at_entry": round(bankroll_equity, 6),
             "entry_price": round(s.side_price, 6),
             "shares": round(shares, 6),
+            "entry_total_cost_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
+            "entry_cost_remaining_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
             "model_prob": round(s.side_prob, 6),
             "edge": round(s.edge, 6),
+            "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
             "forecast_max_c": round(s.forecast_max_c, 4),
             "sigma_c": round(s.sigma_c, 4),
             "bucket_lower": s.bucket_lower,
@@ -1723,16 +1983,29 @@ def apply_paper_positions(
         opened += 1
         return True, "opened"
 
-    def current_edge_and_prices_for_position(p: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    def current_edge_and_prices_for_position(p: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         slug = str(p.get("slug") or "")
         side = str(p.get("side") or "")
         m = market_map.get(slug)
         if not m:
-            return None, None, None
+            return None, None, None, None
 
         yes_bid, yes_ask, _, _, no_ask, _ = market_prices(m)
         side_ask = yes_ask if side == "YES" else no_ask
-        mark_price = current_price_for_side(m, side)
+        mark_price = executable_exit_price_for_side(m, side)
+
+        depth_shares: Optional[float] = None
+        if mark_price is not None:
+            depth = depth_cap_for_exit(
+                market=m,
+                side=side,
+                target_price=float(mark_price),
+                timeout_sec=int(config.request_timeout_sec),
+                book_cache=book_cache,
+                depth_cache=depth_cache,
+            )
+            if depth is not None:
+                depth_shares = float(depth.get("shares", 0.0))
 
         edge_now: Optional[float] = None
         sig = signal_map.get((slug, side))
@@ -1748,23 +2021,38 @@ def apply_paper_positions(
                 now=datetime.now(UTC),
             )
 
-        return edge_now, side_ask, mark_price
+        return edge_now, side_ask, mark_price, depth_shares
 
     def close_position_for_rotation(p: Dict[str, Any], target_signal: Signal, edge_now: float, mark_price: float) -> None:
         nonlocal free_exposure, rotated_closed
 
         shares = float(p.get("shares", 0.0))
         entry = float(p.get("entry_price", 0.0))
-        pnl = shares * (mark_price - entry)
+        size_usd = float(p.get("size_usd", 0.0))
+        gross_pnl = shares * (mark_price - entry)
+
+        entry_cost_remaining = float(p.get("entry_cost_remaining_usd", 0.0))
+        exit_notional_usd = shares * float(mark_price)
+        exit_cost_usd = estimate_exit_cost_usd(exit_notional_usd, config)
+        net_pnl = gross_pnl - entry_cost_remaining - exit_cost_usd
 
         p2 = dict(p)
         p2["closed_at"] = iso_now()
         p2["settle_price"] = round(mark_price, 6)
-        p2["realized_pnl_usd"] = round(pnl, 6)
+        p2["realized_pnl_usd"] = round(gross_pnl, 6)
+        p2["net_realized_pnl_usd"] = round(net_pnl, 6)
+        p2["close_entry_cost_alloc_usd"] = round(entry_cost_remaining, 6)
+        p2["close_exit_cost_usd"] = round(exit_cost_usd, 6)
+        p2["entry_cost_remaining_usd"] = 0.0
         p2["close_reason"] = "rotation_upgrade"
         p2["close_edge"] = round(float(edge_now), 6)
         p2["replace_with_slug"] = target_signal.slug
         p2["replace_with_side"] = target_signal.side
+        p2.pop("pending_exit_not_executable", None)
+        p2.pop("pending_exit_reason", None)
+        p2.pop("pending_exit_since", None)
+        p2.pop("pending_exit_last_checked_at", None)
+        p2.pop("pending_exit_edge", None)
 
         closed_positions.append(p2)
 
@@ -1779,9 +2067,9 @@ def apply_paper_positions(
         if c:
             city_counts[c] = max(0, city_counts.get(c, 0) - 1)
             ck = event_cluster_key(c, str(p.get("target_date") or ""))
-            cluster_exposure[ck] = max(0.0, cluster_exposure.get(ck, 0.0) - float(p.get("size_usd", 0.0)))
+            cluster_exposure[ck] = max(0.0, cluster_exposure.get(ck, 0.0) - size_usd)
 
-        free_exposure = max(0.0, free_exposure + float(p.get("size_usd", 0.0)))
+        free_exposure = max(0.0, free_exposure + size_usd)
         rotated_closed += 1
 
     # First pass: open what we can directly.
@@ -1846,12 +2134,17 @@ def apply_paper_positions(
                     if held_minutes < float(config.rotation_min_holding_minutes):
                         continue
 
-                edge_now, side_ask, mark_price = current_edge_and_prices_for_position(p)
+                edge_now, side_ask, mark_price, depth_shares = current_edge_and_prices_for_position(p)
                 if edge_now is None or side_ask is None or mark_price is None:
                     continue
 
-                edge_delta = float(s.edge) - float(edge_now)
-                ev_delta = edge_per_dollar(float(s.edge), float(s.side_price)) - edge_per_dollar(float(edge_now), float(side_ask))
+                if depth_shares is None or float(depth_shares) + 1e-9 < float(p.get("shares", 0.0)):
+                    continue
+
+                target_net_edge = signal_net_edge(float(s.side_price), float(s.edge), config)
+                current_net_edge = signal_net_edge(float(side_ask), float(edge_now), config)
+                edge_delta = float(target_net_edge) - float(current_net_edge)
+                ev_delta = edge_per_dollar(float(target_net_edge), float(s.side_price)) - edge_per_dollar(float(current_net_edge), float(side_ask))
 
                 if edge_delta < float(config.rotation_min_edge_delta):
                     continue
@@ -1902,7 +2195,12 @@ def apply_paper_positions(
     state["closed_positions"] = closed_positions
 
     realized_today_final = calc_realized_today(closed_positions, day_cn)
+    net_realized_today_final = calc_net_realized_today(closed_positions, day_cn)
+    realized_total_final = calc_realized_total(closed_positions)
+    net_realized_total_final = calc_net_realized_total(closed_positions)
     unrealized_final = calc_unrealized(open_positions, market_map)
+    net_unrealized_final = calc_unrealized_net(open_positions, market_map, config)
+    pending_stats = pending_exit_stats(open_positions)
 
     return {
         "opened": opened,
@@ -1917,11 +2215,16 @@ def apply_paper_positions(
         "rotation_opened": rotation_opened,
         "stop_triggered": False,
         "realized_today": realized_today_final,
+        "net_realized_today": net_realized_today_final,
+        "realized_total": realized_total_final,
+        "net_realized_total": net_realized_total_final,
         "unrealized": unrealized_final,
-        "bankroll_equity_usd": round(bankroll_equity, 6),
+        "net_unrealized": net_unrealized_final,
+        "bankroll_equity_usd": round(float(config.paper_bankroll_usd) + net_realized_total_final + net_unrealized_final, 6),
         "effective_trade_size_usd": trade_size_usd,
         "effective_max_open_exposure_usd": max_open_exposure_usd,
         "effective_daily_stop_loss_usd": daily_stop_loss_usd,
+        **pending_stats,
     }
 
 
@@ -1946,6 +2249,7 @@ def summarize(
                 "side": s.side,
                 "category": s.category,
                 "edge": round(s.edge, 6),
+                "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
                 "prob": round(s.side_prob, 6),
                 "price": round(s.side_price, 6),
                 "selection_score": round(signal_open_score(s, config), 8),
@@ -1972,7 +2276,14 @@ def summarize(
             "closed_positions": len(closed_positions),
             "open_exposure_usd": round(calc_exposure(open_positions), 6),
             "realized_today_usd": apply_result.get("realized_today", 0.0),
+            "net_realized_today_usd": apply_result.get("net_realized_today", apply_result.get("realized_today", 0.0)),
+            "realized_total_usd": apply_result.get("realized_total", 0.0),
+            "net_realized_total_usd": apply_result.get("net_realized_total", apply_result.get("realized_total", 0.0)),
             "unrealized_usd": apply_result.get("unrealized", 0.0),
+            "net_unrealized_usd": apply_result.get("net_unrealized", apply_result.get("unrealized", 0.0)),
+            "pending_exit_count": apply_result.get("pending_exit_count", 0),
+            "pending_exit_exposure_usd": apply_result.get("pending_exit_exposure_usd", 0.0),
+            "pending_exit_max_wait_min": apply_result.get("pending_exit_max_wait_min", 0.0),
             "bankroll_equity_usd": apply_result.get("bankroll_equity_usd", 0.0),
             "effective_trade_size_usd": apply_result.get("effective_trade_size_usd"),
             "effective_max_open_exposure_usd": apply_result.get("effective_max_open_exposure_usd"),
@@ -2234,6 +2545,36 @@ def main() -> None:
         default=None,
         help="Maximum daily stop-loss absolute USD when compounding is enabled",
     )
+    parser.add_argument(
+        "--entry-fee-bps",
+        type=float,
+        default=None,
+        help="Entry fee in bps for net-PnL/net-edge modeling",
+    )
+    parser.add_argument(
+        "--exit-fee-bps",
+        type=float,
+        default=None,
+        help="Exit fee in bps for net-PnL/net-edge modeling",
+    )
+    parser.add_argument(
+        "--entry-slippage-bps",
+        type=float,
+        default=None,
+        help="Entry slippage in bps for net-PnL/net-edge modeling",
+    )
+    parser.add_argument(
+        "--exit-slippage-bps",
+        type=float,
+        default=None,
+        help="Exit slippage in bps for net-PnL/net-edge modeling",
+    )
+    parser.add_argument(
+        "--cancel-cost-usd",
+        type=float,
+        default=None,
+        help="Per-exit fixed cancel/retry overhead in USD for net-PnL modeling",
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -2310,6 +2651,17 @@ def main() -> None:
     if args.compound_daily_stop_loss_max_abs_usd is not None:
         config.compound_daily_stop_loss_max_abs_usd = max(config.compound_daily_stop_loss_min_abs_usd, float(args.compound_daily_stop_loss_max_abs_usd))
 
+    if args.entry_fee_bps is not None:
+        config.entry_fee_bps = max(0.0, float(args.entry_fee_bps))
+    if args.exit_fee_bps is not None:
+        config.exit_fee_bps = max(0.0, float(args.exit_fee_bps))
+    if args.entry_slippage_bps is not None:
+        config.entry_slippage_bps = max(0.0, float(args.entry_slippage_bps))
+    if args.exit_slippage_bps is not None:
+        config.exit_slippage_bps = max(0.0, float(args.exit_slippage_bps))
+    if args.cancel_cost_usd is not None:
+        config.cancel_cost_usd = max(0.0, float(args.cancel_cost_usd))
+
     env_path = Path(args.env)
     state_path = Path(args.state)
     snapshot_path = Path(args.snapshot)
@@ -2322,18 +2674,23 @@ def main() -> None:
     state = load_state(state_path)
     update_signal_confirm_counts(state, signals)
 
-    closed_new_expiry = close_expired_positions(state, market_map)
+    closed_new_expiry = close_expired_positions(state, market_map, config)
     closed_new_edge = 0
 
     if args.apply:
         closed_new_edge = close_edge_decay_positions(state, signals, market_map, config)
         apply_result = apply_paper_positions(state, signals, market_map, config)
     else:
-        realized_today = calc_realized_today(state.get("closed_positions", []), today_cn_str())
-        unrealized = calc_unrealized(state.get("open_positions", []), market_map)
+        day_cn = today_cn_str()
+        realized_today = calc_realized_today(state.get("closed_positions", []), day_cn)
+        net_realized_today = calc_net_realized_today(state.get("closed_positions", []), day_cn)
         realized_total = calc_realized_total(state.get("closed_positions", []))
-        bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + realized_total + unrealized)
+        net_realized_total = calc_net_realized_total(state.get("closed_positions", []))
+        unrealized = calc_unrealized(state.get("open_positions", []), market_map)
+        net_unrealized = calc_unrealized_net(state.get("open_positions", []), market_map, config)
+        bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + net_realized_total + net_unrealized)
         effective_limits = derive_effective_risk_limits(config, bankroll_equity)
+        pending_stats = pending_exit_stats(state.get("open_positions", []))
 
         apply_result = {
             "opened": 0,
@@ -2347,14 +2704,19 @@ def main() -> None:
             "rotation_opened": 0,
             "stop_triggered": False,
             "realized_today": realized_today,
+            "net_realized_today": net_realized_today,
+            "realized_total": realized_total,
+            "net_realized_total": net_realized_total,
             "unrealized": unrealized,
+            "net_unrealized": net_unrealized,
             "bankroll_equity_usd": round(bankroll_equity, 6),
             "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
             "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
             "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
+            **pending_stats,
         }
 
-    update_open_position_marks(state, market_map)
+    update_open_position_marks(state, market_map, config)
 
     state["last_run"] = iso_now()
     state["last_note"] = {
@@ -2422,6 +2784,11 @@ def main() -> None:
         "compound_max_open_exposure_max_usd": config.compound_max_open_exposure_max_usd,
         "compound_daily_stop_loss_min_abs_usd": config.compound_daily_stop_loss_min_abs_usd,
         "compound_daily_stop_loss_max_abs_usd": config.compound_daily_stop_loss_max_abs_usd,
+        "entry_fee_bps": config.entry_fee_bps,
+        "exit_fee_bps": config.exit_fee_bps,
+        "entry_slippage_bps": config.entry_slippage_bps,
+        "exit_slippage_bps": config.exit_slippage_bps,
+        "cancel_cost_usd": config.cancel_cost_usd,
     }
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
