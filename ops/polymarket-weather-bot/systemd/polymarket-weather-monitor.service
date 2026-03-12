@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/home/kai/.openclaw/workspace/ops/polymarket-weather-bot
 
 # Risk profile (can be overridden with systemctl --user edit ...)
-Environment=INTERVAL_SEC=300
+Environment=INTERVAL_SEC=180
 Environment=MIN_HOURS_TO_EXPIRY=0
 Environment=MAX_POSITIONS_PER_CITY=2
 Environment=MAX_EVENT_CLUSTER_EXPOSURE_USD=100
@@ -24,8 +24,9 @@ Environment=KELLY_FRACTION_CORE=0.20
 Environment=KELLY_FRACTION_TAIL=0.08
 Environment=MAX_BET_FRACTION=0.10
 Environment=TAIL_SIZE_CAP_FRACTION=0.5
-Environment=MIN_EDGE_FOR_ENTRY=0.02
+Environment=MIN_EDGE_FOR_ENTRY=0.10
 Environment=MIN_OPEN_SIZE_USD=10
+Environment=MAX_ENTRY_PARTICIPATION=0.20
 Environment=ROBUSTNESS_MU_SHIFT_C=0.7
 Environment=ROBUSTNESS_SIGMA_SCALE_LOW=0.85
 Environment=ROBUSTNESS_SIGMA_SCALE_HIGH=1.15

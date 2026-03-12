@@ -6,7 +6,7 @@ STATE_DIR="$ROOT_DIR/state"
 PID_FILE="$STATE_DIR/monitor.pid"
 LOG_FILE="$STATE_DIR/monitor.log"
 
-INTERVAL_SEC="${INTERVAL_SEC:-300}"
+INTERVAL_SEC="${INTERVAL_SEC:-180}"
 MIN_HOURS_TO_EXPIRY="${MIN_HOURS_TO_EXPIRY:-0}"
 MAX_POSITIONS_PER_CITY="${MAX_POSITIONS_PER_CITY:-2}"
 MAX_EVENT_CLUSTER_EXPOSURE_USD="${MAX_EVENT_CLUSTER_EXPOSURE_USD:-100}"
@@ -22,8 +22,9 @@ KELLY_FRACTION_CORE="${KELLY_FRACTION_CORE:-0.20}"
 KELLY_FRACTION_TAIL="${KELLY_FRACTION_TAIL:-0.08}"
 MAX_BET_FRACTION="${MAX_BET_FRACTION:-0.10}"
 TAIL_SIZE_CAP_FRACTION="${TAIL_SIZE_CAP_FRACTION:-0.5}"
-MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.02}"
+MIN_EDGE_FOR_ENTRY="${MIN_EDGE_FOR_ENTRY:-0.10}"
 MIN_OPEN_SIZE_USD="${MIN_OPEN_SIZE_USD:-10}"
+MAX_ENTRY_PARTICIPATION="${MAX_ENTRY_PARTICIPATION:-0.20}"
 ROBUSTNESS_MU_SHIFT_C="${ROBUSTNESS_MU_SHIFT_C:-0.7}"
 ROBUSTNESS_SIGMA_SCALE_LOW="${ROBUSTNESS_SIGMA_SCALE_LOW:-0.85}"
 ROBUSTNESS_SIGMA_SCALE_HIGH="${ROBUSTNESS_SIGMA_SCALE_HIGH:-1.15}"
@@ -108,6 +109,7 @@ cmd_start() {
         --tail-size-cap-fraction '$TAIL_SIZE_CAP_FRACTION' \
         --min-edge-for-entry '$MIN_EDGE_FOR_ENTRY' \
         --min-open-size-usd '$MIN_OPEN_SIZE_USD' \
+        --max-entry-participation '$MAX_ENTRY_PARTICIPATION' \
         --robustness-mu-shift-c '$ROBUSTNESS_MU_SHIFT_C' \
         --robustness-sigma-scale-low '$ROBUSTNESS_SIGMA_SCALE_LOW' \
         --robustness-sigma-scale-high '$ROBUSTNESS_SIGMA_SCALE_HIGH' \
@@ -165,7 +167,7 @@ cmd_status() {
     fi
   else
     if is_running; then
-      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, min_open_size_usd=${MIN_OPEN_SIZE_USD}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
+      echo "monitor: running (pid=$(cat "$PID_FILE"), interval=${INTERVAL_SEC}s, min_hours_to_expiry=${MIN_HOURS_TO_EXPIRY}, max_positions_per_city=${MAX_POSITIONS_PER_CITY}, max_event_cluster_exposure_usd=${MAX_EVENT_CLUSTER_EXPOSURE_USD}, trade_size_usd=${TRADE_SIZE_USD}, max_open_exposure_usd=${MAX_OPEN_EXPOSURE_USD}, daily_stop_loss_usd=${DAILY_STOP_LOSS_USD}, daily_new_open_notional_cap_usd=${DAILY_NEW_OPEN_NOTIONAL_CAP_USD}, min_open_size_usd=${MIN_OPEN_SIZE_USD}, max_entry_participation=${MAX_ENTRY_PARTICIPATION}, exit_edge_floor=${EXIT_EDGE_FLOOR}, confirm_ticks=${CONFIRM_TICKS}, kelly_core=${KELLY_FRACTION_CORE}, kelly_tail=${KELLY_FRACTION_TAIL}, tail_size_cap_fraction=${TAIL_SIZE_CAP_FRACTION}, robustness_mu_shift_c=${ROBUSTNESS_MU_SHIFT_C}, robustness_sigma_low=${ROBUSTNESS_SIGMA_SCALE_LOW}, robustness_sigma_high=${ROBUSTNESS_SIGMA_SCALE_HIGH}, robustness_min_edge=${ROBUSTNESS_MIN_EDGE}, edge_rotation=${ENABLE_EDGE_ROTATION}, compound_enabled=${COMPOUND_ENABLED})"
     else
       echo "monitor: stopped"
     fi
@@ -206,6 +208,7 @@ cmd_run_once() {
     --tail-size-cap-fraction "$TAIL_SIZE_CAP_FRACTION" \
     --min-edge-for-entry "$MIN_EDGE_FOR_ENTRY" \
     --min-open-size-usd "$MIN_OPEN_SIZE_USD" \
+    --max-entry-participation "$MAX_ENTRY_PARTICIPATION" \
     --robustness-mu-shift-c "$ROBUSTNESS_MU_SHIFT_C" \
     --robustness-sigma-scale-low "$ROBUSTNESS_SIGMA_SCALE_LOW" \
     --robustness-sigma-scale-high "$ROBUSTNESS_SIGMA_SCALE_HIGH" \
@@ -268,7 +271,7 @@ case "${1:-}" in
 Usage: $(basename "$0") {start|stop|restart|status|run-once|logs [N]}
 
 Env overrides:
-  INTERVAL_SEC=<seconds>                           # default 300
+  INTERVAL_SEC=<seconds>                           # default 180
   MIN_HOURS_TO_EXPIRY=<hours>                      # default 0 (paper can still open near expiry)
   MAX_POSITIONS_PER_CITY=<int>                     # default 2
   MAX_EVENT_CLUSTER_EXPOSURE_USD=<float>           # default 100
@@ -284,8 +287,9 @@ Env overrides:
   KELLY_FRACTION_TAIL=<float>                      # default 0.08
   MAX_BET_FRACTION=<float>                         # default 0.10
   TAIL_SIZE_CAP_FRACTION=<float>                   # default 0.5
-  MIN_EDGE_FOR_ENTRY=<float>                       # default 0.02
+  MIN_EDGE_FOR_ENTRY=<float>                       # default 0.10
   MIN_OPEN_SIZE_USD=<float>                        # default 10
+  MAX_ENTRY_PARTICIPATION=<float>                  # default 0.20 (0..1)
   ROBUSTNESS_MU_SHIFT_C=<float>                    # default 0.7
   ROBUSTNESS_SIGMA_SCALE_LOW=<float>               # default 0.85
   ROBUSTNESS_SIGMA_SCALE_HIGH=<float>              # default 1.15
