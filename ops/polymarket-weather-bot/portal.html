@@ -60,14 +60,14 @@
       <div class="card">
         <h3 style="margin-top:0">Fresh 持仓明细</h3>
         <table>
-          <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Rationale</th><th>Opened</th></tr></thead>
+          <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Cat</th><th>Size</th><th>Entry</th><th>Mark</th><th>Fair Sell</th><th>Gap(vs Mark)</th><th>PnL</th><th>Rationale</th><th>Opened</th></tr></thead>
           <tbody id="positionsBody"></tbody>
         </table>
       </div>
       <div class="card">
         <h3 style="margin-top:0">最新信号</h3>
         <table>
-          <thead><tr><th>City</th><th>Slug</th><th>Side</th><th>Price</th><th>Prob</th><th>Edge</th><th>Rationale</th></tr></thead>
+          <thead><tr><th>City</th><th>Slug</th><th>Side</th><th>Price</th><th>Prob</th><th>Fair Sell</th><th>Gap</th><th>Edge</th><th>Rationale</th></tr></thead>
           <tbody id="signalsBody"></tbody>
         </table>
       </div>
@@ -77,7 +77,7 @@
       <h3 style="margin-top:0">Under Radar（含未达质量阈值）</h3>
       <div class="muted" style="margin-bottom:8px;">来源：最新扫描的可比对候选（reliable weather + executable odds）。</div>
       <table>
-        <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Confirm Ticks</th><th>Status</th><th>Brief</th></tr></thead>
+        <thead><tr><th>City</th><th>Market Link</th><th>Side</th><th>Fair Sell</th><th>Gap</th><th>Confirm Ticks</th><th>Status</th><th>Brief</th></tr></thead>
         <tbody id="radarBody"></tbody>
       </table>
     </div>
@@ -86,7 +86,7 @@
       <h3 style="margin-top:0">All Scanable Weather Universe</h3>
       <div class="muted" style="margin-bottom:8px;">全量扫描视图（含 watch-only / data-missing / out-of-window）。</div>
       <table>
-        <thead><tr><th>City</th><th>Market Link</th><th>Status</th><th>Brief</th></tr></thead>
+        <thead><tr><th>City</th><th>Market Link</th><th>Fair Sell</th><th>Gap</th><th>Status</th><th>Brief</th></tr></thead>
         <tbody id="universeBody"></tbody>
       </table>
     </div>
@@ -148,6 +148,8 @@ const specFromSlug=(slug)=>{
   return date;
 };
 const marketLabel=(x)=> specFromSlug(x?.slug) || x?.target_date || x?.slug || '-';
+const fairSell=(p)=> (p===undefined||p===null||Number.isNaN(+p)) ? null : Number(p);
+const fmtGap=(fair, px)=> (fair===null || px===undefined || px===null || Number.isNaN(+px)) ? '-' : fmt(fair-Number(px),4);
 const shanghaiDay=(t)=>{
   if(!t) return '';
   const d=new Date(t);
@@ -275,24 +277,26 @@ async function refreshAll(){
     renderEquityChart(closedAll, freshMs);
 
     const pb=document.getElementById('positionsBody'); pb.innerHTML='';
-    if(!open.length) pb.innerHTML='<tr><td colspan="10" class="muted">暂无 fresh 持仓</td></tr>';
+    if(!open.length) pb.innerHTML='<tr><td colspan="12" class="muted">暂无 fresh 持仓</td></tr>';
     open.forEach(p=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(p.edge,4)} | model_p=${fmt(p.model_prob,4)} | liq=${fmt(p.liquidity,0)} | spread=${fmt(p.yes_spread,4)}`;
       const pLabel=marketLabel(p);
       const pLink=(p.slug?`<a href="${marketUrl(p.slug)}" target="_blank" rel="noreferrer" title="${p.question||''}">${pLabel}</a>`:'-');
-      tr.innerHTML=`<td>${p.city_slug||'-'}</td><td>${pLink}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
+      const fair = fairSell(p.model_prob);
+      tr.innerHTML=`<td>${p.city_slug||'-'}</td><td>${pLink}</td><td>${p.side||''}</td><td>${p.category||''}</td><td>$${fmt(p.size_usd,2)}</td><td>${fmt(p.entry_price,4)}</td><td>${fmt(p.mark_price,4)}</td><td>${fair===null?'-':fmt(fair,4)}</td><td>${fmtGap(fair,p.mark_price)}</td><td class="${cls(+p.unrealized_pnl_usd||0)}">$${fmt(p.unrealized_pnl_usd,4)}</td><td title="${rationale}">${rationale}</td><td>${fmtTime(p.opened_at)}</td>`;
       pb.appendChild(tr);
     });
 
     const sb=document.getElementById('signalsBody'); sb.innerHTML='';
     const sigs=(latest&&latest.signals)?latest.signals:[];
-    if(!sigs.length) sb.innerHTML='<tr><td colspan="7" class="muted">无新信号</td></tr>';
+    if(!sigs.length) sb.innerHTML='<tr><td colspan="9" class="muted">无新信号</td></tr>';
     sigs.forEach(s=>{
       const tr=document.createElement('tr');
       const rationale = `edge=${fmt(s.edge,4)} | p=${fmt(s.side_prob,4)} | liq=${fmt(s.liquidity,0)} | spread=${fmt(s.yes_spread,4)}`;
       const sLink=(s.slug?`<a href="${marketUrl(s.slug)}" target="_blank" rel="noreferrer">${marketLabel(s)}</a>`:'-');
-      tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${sLink}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
+      const fair = fairSell(s.side_prob);
+      tr.innerHTML=`<td>${s.city_slug||'-'}</td><td>${sLink}</td><td>${s.side||''}</td><td>${fmt(s.side_price,4)}</td><td>${fmt(s.side_prob,4)}</td><td>${fair===null?'-':fmt(fair,4)}</td><td>${fmtGap(fair,s.side_price)}</td><td>${fmt(s.edge,4)}</td><td title="${rationale}">${rationale}</td>`;
       sb.appendChild(tr);
     });
 
@@ -306,6 +310,8 @@ async function refreshAll(){
         slug:r.slug,
         side:r.side||'-',
         city:r.city_slug||cityFromSlug(r.slug),
+        side_prob:r.side_prob,
+        side_price:r.side_price,
         confirm:'-',
         status:r.status || (liveSignalSet.has(`${r.slug}|${r.side||''}`)?'quality-pass':'watch-only'),
         brief:r.brief || `edge=${fmt(r.edge,4)} | p=${fmt(r.side_prob,4)} | liq=${fmt(r.liquidity,0)} | spread=${fmt(r.yes_spread,4)}`,
@@ -320,6 +326,8 @@ async function refreshAll(){
             slug,
             side:side||'-',
             city:cityFromSlug(slug),
+            side_prob:null,
+            side_price:null,
             confirm:Number(v)||0,
             status: inSignal?'quality-pass':'watch-only',
             brief: inSignal ? '当前已达质量阈值，可执行' : '仍在观察：未达质量阈值或当期无可执行价格',
@@ -330,11 +338,12 @@ async function refreshAll(){
     }
 
     if(!radarRows.length){
-      rb.innerHTML='<tr><td colspan="6" class="muted">暂无 radar 候选</td></tr>';
+      rb.innerHTML='<tr><td colspan="8" class="muted">暂无 radar 候选</td></tr>';
     } else {
       radarRows.forEach(r=>{
         const tr=document.createElement('tr');
-        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${specFromSlug(r.slug)||r.slug}</a></td><td>${r.side}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
+        const fair = fairSell(r.side_prob);
+        tr.innerHTML=`<td>${r.city}</td><td><a href="${marketUrl(r.slug)}" target="_blank" rel="noreferrer">${specFromSlug(r.slug)||r.slug}</a></td><td>${r.side}</td><td>${fair===null?'-':fmt(fair,4)}</td><td>${fmtGap(fair,r.side_price)}</td><td>${r.confirm}</td><td class="${r.status==='quality-pass'?'ok':'warn'}">${r.status}</td><td>${r.brief}</td>`;
         rb.appendChild(tr);
       });
     }
@@ -343,12 +352,13 @@ async function refreshAll(){
     const ub=document.getElementById('universeBody'); ub.innerHTML='';
     const uni=(latest && Array.isArray(latest.universe)) ? latest.universe.slice(0,80) : [];
     if(!uni.length){
-      ub.innerHTML='<tr><td colspan="4" class="muted">暂无 universe 数据（跑一次扫描后会出现）</td></tr>';
+      ub.innerHTML='<tr><td colspan="6" class="muted">暂无 universe 数据（跑一次扫描后会出现）</td></tr>';
     } else {
       uni.forEach(u=>{
         const tr=document.createElement('tr');
         const st=u.status||'watch-only';
-        tr.innerHTML=`<td>${u.city_slug||cityFromSlug(u.slug)}</td><td><a href="${marketUrl(u.slug)}" target="_blank" rel="noreferrer">${specFromSlug(u.slug)||u.slug}</a></td><td class="${st==='quality-pass'?'ok':(st==='data-missing'?'bad':'warn')}">${st}</td><td>${u.brief||''}</td>`;
+        const fair = fairSell(u.side_prob ?? u.model_prob);
+        tr.innerHTML=`<td>${u.city_slug||cityFromSlug(u.slug)}</td><td><a href="${marketUrl(u.slug)}" target="_blank" rel="noreferrer">${specFromSlug(u.slug)||u.slug}</a></td><td>${fair===null?'-':fmt(fair,4)}</td><td>${fmtGap(fair,u.side_price)}</td><td class="${st==='quality-pass'?'ok':(st==='data-missing'?'bad':'warn')}">${st}</td><td>${u.brief||''}</td>`;
         ub.appendChild(tr);
       });
     }
