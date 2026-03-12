@@ -104,6 +104,8 @@ class Config:
     max_bet_fraction: float = 0.01
     tail_size_cap_fraction: float = 0.5
     min_edge_for_entry: float = 0.02
+    # Dynamic spread penalty on entry gate: effective_net_edge = net_edge - yes_spread * multiplier.
+    entry_spread_penalty_mult: float = 1.0
     # Ignore tiny entries below this USD notional.
     min_open_size_usd: float = 10.0
     # Max share of currently executable entry depth to take per order.
@@ -1013,6 +1015,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             brief = "reliable weather+odds, but below quality threshold"
 
         net_edge = signal_net_edge(float(side_price), float(edge), config)
+        entry_spread_penalty = spread_penalty_for_entry(yes_spread, config)
+        effective_net_edge = net_edge - entry_spread_penalty
 
         candidate_row = {
             "slug": slug,
@@ -1024,6 +1028,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "side_price": round(side_price, 6),
             "edge": round(edge, 6),
             "net_edge": round(net_edge, 6),
+            "entry_spread_penalty": round(entry_spread_penalty, 6),
+            "effective_net_edge": round(effective_net_edge, 6),
             "forecast_max_c": round(forecast_max_c, 6),
             "sigma_c": round(sigma_c, 6),
             "bucket_lower": parsed.lower,
@@ -1091,8 +1097,14 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
 
     counters["signals"] = len(signals)
 
-    signals.sort(key=lambda s: signal_net_edge(float(s.side_price), float(s.edge), config), reverse=True)
-    radar_rows.sort(key=lambda r: float(r.get("net_edge", r.get("edge", 0.0))), reverse=True)
+    signals.sort(
+        key=lambda s: effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
+        reverse=True,
+    )
+    radar_rows.sort(
+        key=lambda r: float(r.get("effective_net_edge", r.get("net_edge", r.get("edge", 0.0)))),
+        reverse=True,
+    )
     return signals, radar_rows, universe_rows, market_map, counters
 
 
@@ -1341,6 +1353,18 @@ def estimate_exit_cost_usd(exit_notional_usd: float, config: Config) -> float:
 def signal_net_edge(side_price: float, gross_edge: float, config: Config) -> float:
     # Approximate all-in net edge per share after round-trip execution frictions.
     return float(gross_edge) - float(side_price) * (entry_cost_rate(config) + exit_cost_rate(config))
+
+
+def spread_penalty_for_entry(yes_spread: Optional[float], config: Config) -> float:
+    if yes_spread is None:
+        return 0.0
+    spread = max(0.0, float(yes_spread))
+    mult = max(0.0, float(config.entry_spread_penalty_mult))
+    return spread * mult
+
+
+def effective_net_edge_for_entry(side_price: float, gross_edge: float, yes_spread: Optional[float], config: Config) -> float:
+    return signal_net_edge(side_price, gross_edge, config) - spread_penalty_for_entry(yes_spread, config)
 
 
 def pending_exit_stats(open_positions: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -1746,7 +1770,7 @@ def select_signals_for_opening(signals: List[Signal], config: Config, slots_tota
         signals,
         key=lambda s: (
             signal_open_score(s, config),
-            signal_net_edge(float(s.side_price), float(s.edge), config),
+            effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
             float(s.edge),
             float(s.side_prob),
         ),
@@ -1856,7 +1880,7 @@ def apply_paper_positions(
         confirmed_signals,
         key=lambda s: (
             signal_open_score(s, config),
-            signal_net_edge(float(s.side_price), float(s.edge), config),
+            effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
             float(s.edge),
             float(s.side_prob),
         ),
@@ -1974,8 +1998,13 @@ def apply_paper_positions(
         if s.side_price <= 0:
             return "bad_price"
 
-        net_edge = signal_net_edge(float(s.side_price), float(s.edge), config)
-        if float(net_edge) < float(config.min_edge_for_entry):
+        effective_net_edge = effective_net_edge_for_entry(
+            float(s.side_price),
+            float(s.edge),
+            s.yes_spread,
+            config,
+        )
+        if float(effective_net_edge) < float(config.min_edge_for_entry):
             return "min_edge"
 
         market = market_map.get(s.slug)
@@ -2098,6 +2127,11 @@ def apply_paper_positions(
             "model_prob": round(s.side_prob, 6),
             "edge": round(s.edge, 6),
             "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
+            "entry_spread_penalty": round(spread_penalty_for_entry(s.yes_spread, config), 6),
+            "effective_net_edge": round(
+                effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
+                6,
+            ),
             "forecast_max_c": round(s.forecast_max_c, 4),
             "sigma_c": round(s.sigma_c, 4),
             "bucket_lower": s.bucket_lower,
@@ -2295,7 +2329,12 @@ def apply_paper_positions(
                 if depth_shares is None or float(depth_shares) + 1e-9 < float(p.get("shares", 0.0)):
                     continue
 
-                target_net_edge = signal_net_edge(float(s.side_price), float(s.edge), config)
+                target_net_edge = effective_net_edge_for_entry(
+                    float(s.side_price),
+                    float(s.edge),
+                    s.yes_spread,
+                    config,
+                )
                 current_net_edge = signal_net_edge(float(side_ask), float(edge_now), config)
                 edge_delta = float(target_net_edge) - float(current_net_edge)
                 ev_delta = edge_per_dollar(float(target_net_edge), float(s.side_price)) - edge_per_dollar(float(current_net_edge), float(side_ask))
@@ -2418,6 +2457,11 @@ def summarize(
                 "category": s.category,
                 "edge": round(s.edge, 6),
                 "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
+                "entry_spread_penalty": round(spread_penalty_for_entry(s.yes_spread, config), 6),
+                "effective_net_edge": round(
+                    effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
+                    6,
+                ),
                 "prob": round(s.side_prob, 6),
                 "price": round(s.side_price, 6),
                 "selection_score": round(signal_open_score(s, config), 8),
@@ -2600,6 +2644,12 @@ def main() -> None:
         type=float,
         default=None,
         help="Global minimum edge threshold required for entry",
+    )
+    parser.add_argument(
+        "--entry-spread-penalty-mult",
+        type=float,
+        default=None,
+        help="Spread penalty multiplier for entry gate: effective_net_edge = net_edge - yes_spread * mult",
     )
     parser.add_argument(
         "--min-open-size-usd",
@@ -2801,6 +2851,8 @@ def main() -> None:
         config.tail_size_cap_fraction = max(0.0, float(args.tail_size_cap_fraction))
     if args.min_edge_for_entry is not None:
         config.min_edge_for_entry = max(0.0, float(args.min_edge_for_entry))
+    if args.entry_spread_penalty_mult is not None:
+        config.entry_spread_penalty_mult = max(0.0, float(args.entry_spread_penalty_mult))
     if args.min_open_size_usd is not None:
         config.min_open_size_usd = max(0.25, float(args.min_open_size_usd))
     if args.max_entry_participation is not None:
@@ -2980,6 +3032,7 @@ def main() -> None:
         "max_bet_fraction": config.max_bet_fraction,
         "tail_size_cap_fraction": config.tail_size_cap_fraction,
         "min_edge_for_entry": config.min_edge_for_entry,
+        "entry_spread_penalty_mult": config.entry_spread_penalty_mult,
         "min_open_size_usd": config.min_open_size_usd,
         "max_entry_participation": config.max_entry_participation,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
