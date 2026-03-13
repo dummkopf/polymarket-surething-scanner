@@ -676,21 +676,29 @@ def fetch_forecast_max_temp_c(
     # Prefer station-level coordinates from resolutionSource (e.g. ZSPD/KLGA)
     # so model input matches market settlement station.
     station_code = resolution_station_code_for_market(market)
-    coords = None
-    coord_key = f"city:{city_slug}"
-    if station_code and station_code in STATION_COORDS:
-        coords = STATION_COORDS[station_code]
+
+    if station_code:
+        # If market explicitly specifies a station, require mapped station coords.
+        # Fail closed (do not silently fallback to city center) when unmapped.
         coord_key = f"station:{station_code}"
+        key = (coord_key, target_date)
+        if key in cache:
+            return cache[key]
 
-    key = (coord_key, target_date)
-    if key in cache:
-        return cache[key]
+        coords = STATION_COORDS.get(station_code)
+        if not coords:
+            cache[key] = None
+            return None
+    else:
+        coord_key = f"city:{city_slug}"
+        key = (coord_key, target_date)
+        if key in cache:
+            return cache[key]
 
-    if coords is None:
         coords = geocode_city(city_slug, timeout_sec)
-    if not coords:
-        cache[key] = None
-        return None
+        if not coords:
+            cache[key] = None
+            return None
 
     lat, lon = coords
     try:
@@ -1002,6 +1010,12 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         if yes_spread is not None and yes_spread > config.max_yes_spread:
             row["status"] = "watch-only"
             row["brief"] = "spread too wide"
+            universe_rows.append(row)
+            continue
+
+        if station_code and station_code not in STATION_COORDS:
+            row["status"] = "data-missing"
+            row["brief"] = f"unmapped resolution station ({station_code})"
             universe_rows.append(row)
             continue
 
