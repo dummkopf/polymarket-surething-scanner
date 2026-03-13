@@ -29,6 +29,7 @@ GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+AVIATION_WEATHER_METAR_URL = "https://aviationweather.gov/api/data/metar"
 
 MONTH_TO_NUM = {
     "january": 1,
@@ -666,12 +667,75 @@ def resolution_station_code_for_market(market: Optional[Dict[str, Any]]) -> Opti
     return None
 
 
+def station_observed_max_c_so_far(
+    station_code: str,
+    target_date: str,
+    timezone_name: str,
+    timeout_sec: int,
+    cache: Dict[Tuple[str, str], Optional[float]],
+) -> Optional[float]:
+    """Best-effort observed max temp (°C) so far for target local date from METAR."""
+    key = (station_code, target_date)
+    if key in cache:
+        return cache[key]
+
+    if not timezone_name:
+        cache[key] = None
+        return None
+
+    try:
+        tz = ZoneInfo(timezone_name) if ZoneInfo else UTC
+    except Exception:
+        tz = UTC
+
+    now_local = datetime.now(tz)
+    if now_local.date().isoformat() != target_date:
+        cache[key] = None
+        return None
+
+    try:
+        resp = requests.get(
+            AVIATION_WEATHER_METAR_URL,
+            params={"ids": station_code, "format": "json", "hours": 36},
+            timeout=timeout_sec,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+
+        observed: List[float] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                t = parse_float(row.get("temp"))
+                obs_ts = row.get("obsTime")
+                if t is None or obs_ts is None:
+                    continue
+                try:
+                    dt_local = datetime.fromtimestamp(int(obs_ts), UTC).astimezone(tz)
+                except Exception:
+                    continue
+                if dt_local.date().isoformat() != target_date:
+                    continue
+                if dt_local > now_local:
+                    continue
+                observed.append(float(t))
+
+        value = max(observed) if observed else None
+        cache[key] = value
+        return value
+    except Exception:
+        cache[key] = None
+        return None
+
+
 def fetch_forecast_max_temp_c(
     city_slug: str,
     target_date: str,
     timeout_sec: int,
     cache: Dict[Tuple[str, str], Optional[float]],
     market: Optional[Dict[str, Any]] = None,
+    observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
 ) -> Optional[float]:
     # Prefer station-level coordinates from resolutionSource (e.g. ZSPD/KLGA)
     # so model input matches market settlement station.
@@ -715,12 +779,31 @@ def fetch_forecast_max_temp_c(
             timeout=timeout_sec,
         )
         resp.raise_for_status()
-        daily = resp.json().get("daily") or {}
+        body = resp.json()
+        daily = body.get("daily") or {}
         dates = daily.get("time") or []
         temps = daily.get("temperature_2m_max") or []
 
         date_to_temp = {d: t for d, t in zip(dates, temps)}
         value = parse_float(date_to_temp.get(target_date))
+
+        # Intraday probability hardening: for station-based markets, floor today's
+        # model mean by observed station max-so-far to avoid stale/lagging forecast
+        # understating already-observed daytime heating.
+        if value is not None and station_code:
+            if observed_cache is None:
+                observed_cache = {}
+            timezone_name = str(body.get("timezone") or "")
+            observed_max = station_observed_max_c_so_far(
+                station_code=station_code,
+                target_date=target_date,
+                timezone_name=timezone_name,
+                timeout_sec=timeout_sec,
+                cache=observed_cache,
+            )
+            if observed_max is not None:
+                value = max(float(value), float(observed_max))
+
         cache[key] = value
         return value
     except Exception:
@@ -927,6 +1010,7 @@ def market_prices(
 def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
     market_map: Dict[str, Dict[str, Any]] = {}
 
     counters = {
@@ -1025,6 +1109,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             config.request_timeout_sec,
             forecast_cache,
             market=market,
+            observed_cache=observed_cache,
         )
         if forecast_max_c is None:
             row["status"] = "data-missing"
@@ -1265,6 +1350,7 @@ def current_edge_for_position(
     market: Dict[str, Any],
     config: Config,
     forecast_cache: Dict[Tuple[str, str], Optional[float]],
+    observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]],
     now: datetime,
 ) -> Optional[float]:
     parsed = parse_temperature_slug(slug)
@@ -1288,6 +1374,7 @@ def current_edge_for_position(
         config.request_timeout_sec,
         forecast_cache,
         market=market,
+        observed_cache=observed_cache,
     )
     if forecast_max_c is None:
         return None
@@ -1637,6 +1724,7 @@ def close_edge_decay_positions(
     now = datetime.now(UTC)
     signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
     book_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]] = {}
 
@@ -1678,6 +1766,7 @@ def close_edge_decay_positions(
                     market=m,
                     config=config,
                     forecast_cache=forecast_cache,
+                    observed_cache=observed_cache,
                     now=now,
                 )
 
@@ -2270,6 +2359,7 @@ def apply_paper_positions(
                 market=m,
                 config=config,
                 forecast_cache={},
+                observed_cache={},
                 now=datetime.now(UTC),
             )
 
