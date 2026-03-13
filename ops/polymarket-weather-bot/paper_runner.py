@@ -839,6 +839,39 @@ def prob_yes_from_contract(
     return max(0.0, min(1.0, p))
 
 
+def observed_max_in_contract_unit(observed_max_c: float, contract: ParsedContract) -> float:
+    if contract.unit == "F":
+        return observed_max_c * 9 / 5 + 32
+    return observed_max_c
+
+
+def apply_observed_max_constraints(
+    p_yes: float,
+    contract: ParsedContract,
+    observed_max_c: Optional[float],
+) -> float:
+    """Deterministic clipping from observed max-so-far (same station/day).
+
+    - If observed max already exceeds/equals contract upper bound, YES is impossible.
+    - For "or higher" contracts (no upper bound), once observed max reaches lower bound,
+      YES is already locked in.
+    """
+    if observed_max_c is None:
+        return max(0.0, min(1.0, float(p_yes)))
+
+    obs_u = observed_max_in_contract_unit(float(observed_max_c), contract)
+    lower = contract.lower
+    upper = contract.upper
+
+    if upper is not None and obs_u >= float(upper):
+        return 0.0
+
+    if lower is not None and upper is None and obs_u >= float(lower):
+        return 1.0
+
+    return max(0.0, min(1.0, float(p_yes)))
+
+
 def side_prob_from_p_yes(p_yes: float, side: str) -> float:
     return p_yes if side == "YES" else (1.0 - p_yes)
 
@@ -1121,7 +1154,9 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         # Sigma should be anchored to actual time-to-resolution (endDate), not target-date midnight.
         horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
         sigma_c = sigma_by_horizon_days(horizon_days)
-        p_yes = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+        observed_max_c = observed_cache.get((station_code, parsed.target_date)) if station_code else None
+        p_yes_model = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+        p_yes = apply_observed_max_constraints(p_yes_model, parsed, observed_max_c)
 
         yes_edge = p_yes - yes_ask
         no_prob = 1 - p_yes
@@ -1187,6 +1222,9 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "entry_spread_penalty": round(entry_spread_penalty, 6),
             "effective_net_edge": round(effective_net_edge, 6),
             "forecast_max_c": round(forecast_max_c, 6),
+            "observed_max_c": (None if observed_max_c is None else round(float(observed_max_c), 6)),
+            "p_yes_model_raw": round(float(p_yes_model), 6),
+            "p_yes_after_observed_constraints": round(float(p_yes), 6),
             "sigma_c": round(sigma_c, 6),
             "bucket_lower": parsed.lower,
             "bucket_upper": parsed.upper,
@@ -1389,7 +1427,14 @@ def current_edge_for_position(
         )
 
     sigma_c = sigma_by_horizon_days(horizon_days)
-    p_yes = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+    station_code = resolution_station_code_for_market(market)
+    observed_max_c = (
+        observed_cache.get((station_code, parsed.target_date))
+        if (station_code and observed_cache is not None)
+        else None
+    )
+    p_yes_model = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+    p_yes = apply_observed_max_constraints(p_yes_model, parsed, observed_max_c)
     side_prob = p_yes if side == "YES" else (1 - p_yes)
     return float(side_prob - side_ask)
 
