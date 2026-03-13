@@ -30,6 +30,7 @@ CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 AVIATION_WEATHER_METAR_URL = "https://aviationweather.gov/api/data/metar"
+AVIATION_WEATHER_TAF_URL = "https://aviationweather.gov/api/data/taf"
 
 MONTH_TO_NUM = {
     "january": 1,
@@ -729,6 +730,67 @@ def station_observed_max_c_so_far(
         return None
 
 
+def parse_taf_temp_token_to_c(token: str) -> Optional[float]:
+    token = str(token or "").strip().upper()
+    if not token:
+        return None
+    neg = token.startswith("M")
+    raw = token[1:] if neg else token
+    if not re.fullmatch(r"\d{2}", raw):
+        return None
+    v = float(int(raw))
+    return -v if neg else v
+
+
+def station_taf_max_c_for_date(
+    station_code: str,
+    target_date: str,
+    timeout_sec: int,
+    cache: Dict[Tuple[str, str], Optional[float]],
+) -> Optional[float]:
+    """Best-effort station TAF TX max (°C) for target UTC day code in raw TAF."""
+    key = (station_code, target_date)
+    if key in cache:
+        return cache[key]
+
+    try:
+        target_day = int(target_date[-2:])
+    except Exception:
+        cache[key] = None
+        return None
+
+    try:
+        resp = requests.get(
+            AVIATION_WEATHER_TAF_URL,
+            params={"ids": station_code, "format": "json"},
+            timeout=timeout_sec,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+
+        vals: List[float] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                raw_taf = str(row.get("rawTAF") or "")
+                for m in re.finditer(r"\bTX(M?\d{2})/(\d{2})\d{2}Z\b", raw_taf):
+                    tok = m.group(1)
+                    day = int(m.group(2))
+                    if day != target_day:
+                        continue
+                    t = parse_taf_temp_token_to_c(tok)
+                    if t is not None:
+                        vals.append(float(t))
+
+        value = max(vals) if vals else None
+        cache[key] = value
+        return value
+    except Exception:
+        cache[key] = None
+        return None
+
+
 def fetch_forecast_max_temp_c(
     city_slug: str,
     target_date: str,
@@ -736,6 +798,7 @@ def fetch_forecast_max_temp_c(
     cache: Dict[Tuple[str, str], Optional[float]],
     market: Optional[Dict[str, Any]] = None,
     observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
 ) -> Optional[float]:
     # Prefer station-level coordinates from resolutionSource (e.g. ZSPD/KLGA)
     # so model input matches market settlement station.
@@ -765,6 +828,10 @@ def fetch_forecast_max_temp_c(
             return None
 
     lat, lon = coords
+    value: Optional[float] = None
+    timezone_name = ""
+
+    # Open-Meteo baseline forecast.
     try:
         resp = requests.get(
             OPEN_METEO_FORECAST_URL,
@@ -780,20 +847,34 @@ def fetch_forecast_max_temp_c(
         )
         resp.raise_for_status()
         body = resp.json()
+        timezone_name = str(body.get("timezone") or "")
         daily = body.get("daily") or {}
         dates = daily.get("time") or []
         temps = daily.get("temperature_2m_max") or []
 
         date_to_temp = {d: t for d, t in zip(dates, temps)}
         value = parse_float(date_to_temp.get(target_date))
+    except Exception:
+        value = None
 
-        # Intraday probability hardening: for station-based markets, floor today's
-        # model mean by observed station max-so-far to avoid stale/lagging forecast
-        # understating already-observed daytime heating.
-        if value is not None and station_code:
+    if station_code:
+        # Station-specific TAF max is a second station-native signal.
+        # Use the higher of Open-Meteo station grid vs TAF TX to avoid cold-grid bias.
+        if taf_cache is None:
+            taf_cache = {}
+        taf_max = station_taf_max_c_for_date(
+            station_code=station_code,
+            target_date=target_date,
+            timeout_sec=timeout_sec,
+            cache=taf_cache,
+        )
+        if taf_max is not None:
+            value = float(taf_max) if value is None else max(float(value), float(taf_max))
+
+        # Intraday hardening: floor by observed station max-so-far (same day).
+        if value is not None:
             if observed_cache is None:
                 observed_cache = {}
-            timezone_name = str(body.get("timezone") or "")
             observed_max = station_observed_max_c_so_far(
                 station_code=station_code,
                 target_date=target_date,
@@ -804,11 +885,8 @@ def fetch_forecast_max_temp_c(
             if observed_max is not None:
                 value = max(float(value), float(observed_max))
 
-        cache[key] = value
-        return value
-    except Exception:
-        cache[key] = None
-        return None
+    cache[key] = value
+    return value
 
 
 def prob_yes_from_contract(
@@ -1044,6 +1122,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
     observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
     market_map: Dict[str, Dict[str, Any]] = {}
 
     counters = {
@@ -1143,6 +1222,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             forecast_cache,
             market=market,
             observed_cache=observed_cache,
+            taf_cache=taf_cache,
         )
         if forecast_max_c is None:
             row["status"] = "data-missing"
@@ -1389,6 +1469,7 @@ def current_edge_for_position(
     config: Config,
     forecast_cache: Dict[Tuple[str, str], Optional[float]],
     observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]],
+    taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]],
     now: datetime,
 ) -> Optional[float]:
     parsed = parse_temperature_slug(slug)
@@ -1413,6 +1494,7 @@ def current_edge_for_position(
         forecast_cache,
         market=market,
         observed_cache=observed_cache,
+        taf_cache=taf_cache,
     )
     if forecast_max_c is None:
         return None
@@ -1770,6 +1852,7 @@ def close_edge_decay_positions(
     signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
     observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
     book_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     depth_cache: Dict[Tuple[str, str, float], Optional[Dict[str, float]]] = {}
 
@@ -1812,6 +1895,7 @@ def close_edge_decay_positions(
                     config=config,
                     forecast_cache=forecast_cache,
                     observed_cache=observed_cache,
+                    taf_cache=taf_cache,
                     now=now,
                 )
 
@@ -2405,6 +2489,7 @@ def apply_paper_positions(
                 config=config,
                 forecast_cache={},
                 observed_cache={},
+                taf_cache={},
                 now=datetime.now(UTC),
             )
 
