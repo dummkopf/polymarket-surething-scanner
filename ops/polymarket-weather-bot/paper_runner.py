@@ -62,6 +62,32 @@ CITY_COORDS = {
     "seattle": (47.6062, -122.3321),
 }
 
+# Resolution-source station coordinates (airport stations used by Polymarket
+# weather market rules; typically from Wunderground station ids in
+# `resolutionSource`). Values are (lat, lon).
+STATION_COORDS = {
+    "LTAC": (40.1280, 32.9950),
+    "KATL": (33.6297, -84.4422),
+    "SAEZ": (-34.8220, -58.5360),
+    "KORD": (41.9602, -87.9316),
+    "KDAL": (32.8384, -96.8358),
+    "EGLC": (51.5050, 0.0550),
+    "VILK": (26.7610, 80.8890),
+    "KMIA": (25.7881, -80.3169),
+    "EDDM": (48.3480, 11.8130),
+    "KLGA": (40.7794, -73.8803),
+    "LFPG": (49.0150, 2.5340),
+    "SBGR": (-23.4320, -46.4690),
+    "KSEA": (47.4447, -122.3144),
+    "RKSI": (37.4690, 126.4510),
+    "ZSPD": (31.1460, 121.8000),
+    "WSSS": (1.3680, 103.9820),
+    "LLBG": (32.0110, 34.8870),
+    "RJTT": (35.5530, 139.7810),
+    "CYYZ": (43.6790, -79.6290),
+    "NZWN": (-41.3310, 174.8060),
+}
+
 
 @dataclass
 class Config:
@@ -624,17 +650,44 @@ def geocode_city(city_slug: str, timeout_sec: int) -> Optional[Tuple[float, floa
         return None
 
 
+def resolution_station_code_for_market(market: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract station code (e.g. ZSPD/KLGA/NZWN) from market resolutionSource URL."""
+    if not isinstance(market, dict):
+        return None
+
+    src = str(market.get("resolutionSource") or "").strip()
+    if not src:
+        return None
+
+    tail = src.rstrip("/").split("/")[-1]
+    tail = tail.split("?")[0].split("#")[0].strip()
+    if re.fullmatch(r"[A-Za-z0-9]{3,6}", tail):
+        return tail.upper()
+    return None
+
+
 def fetch_forecast_max_temp_c(
     city_slug: str,
     target_date: str,
     timeout_sec: int,
     cache: Dict[Tuple[str, str], Optional[float]],
+    market: Optional[Dict[str, Any]] = None,
 ) -> Optional[float]:
-    key = (city_slug, target_date)
+    # Prefer station-level coordinates from resolutionSource (e.g. ZSPD/KLGA)
+    # so model input matches market settlement station.
+    station_code = resolution_station_code_for_market(market)
+    coords = None
+    coord_key = f"city:{city_slug}"
+    if station_code and station_code in STATION_COORDS:
+        coords = STATION_COORDS[station_code]
+        coord_key = f"station:{station_code}"
+
+    key = (coord_key, target_date)
     if key in cache:
         return cache[key]
 
-    coords = geocode_city(city_slug, timeout_sec)
+    if coords is None:
+        coords = geocode_city(city_slug, timeout_sec)
     if not coords:
         cache[key] = None
         return None
@@ -896,11 +949,13 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             continue
         counters["parseable"] += 1
 
+        station_code = resolution_station_code_for_market(market)
         row = {
             "slug": slug,
             "question": str(market.get("question") or ""),
             "city_slug": parsed.city_slug,
             "target_date": parsed.target_date,
+            "resolution_station_code": station_code,
             "status": "watch-only",
             "brief": "parseable, pending checks",
         }
@@ -955,6 +1010,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             parsed.target_date,
             config.request_timeout_sec,
             forecast_cache,
+            market=market,
         )
         if forecast_max_c is None:
             row["status"] = "data-missing"
@@ -1023,6 +1079,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "question": str(market.get("question") or ""),
             "city_slug": parsed.city_slug,
             "target_date": parsed.target_date,
+            "resolution_station_code": station_code,
             "side": side,
             "side_prob": round(side_prob, 6),
             "side_price": round(side_price, 6),
@@ -1216,6 +1273,7 @@ def current_edge_for_position(
         parsed.target_date,
         config.request_timeout_sec,
         forecast_cache,
+        market=market,
     )
     if forecast_max_c is None:
         return None
@@ -2101,6 +2159,7 @@ def apply_paper_positions(
             "question": s.question,
             "city_slug": s.city_slug,
             "target_date": s.target_date,
+            "resolution_station_code": resolution_station_code_for_market(market),
             "end_date": s.end_date,
             "event_cluster_key": cluster_key,
             "side": s.side,
