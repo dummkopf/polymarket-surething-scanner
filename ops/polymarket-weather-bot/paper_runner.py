@@ -203,8 +203,10 @@ class Config:
     robustness_bootstrap_iters: int = 200
     robustness_subsample_frac: float = 0.7
 
-    # NO-side synthetic ask penalty (in absolute price dollars)
+    # NO-side synthetic ask penalty: when NO ask is inferred from YES bid,
+    # use a conservative uplift of max(fixed_penalty, yes_spread * multiplier).
     no_synthetic_ask_penalty: float = 0.01
+    no_synthetic_ask_spread_mult: float = 0.25
 
     # Execution-cost model (paper -> live bridge)
     entry_fee_bps: float = 5.0
@@ -230,6 +232,8 @@ class Signal:
     question: str
     city_slug: str
     target_date: str
+    resolution_station_code: Optional[str]
+    forecast_coord_key: str
     side: str  # YES/NO
     category: str  # core/tail
 
@@ -243,6 +247,8 @@ class Signal:
     yes_bid: Optional[float]
     yes_ask: Optional[float]
     no_bid: Optional[float]
+    no_ask_raw: Optional[float]
+    no_ask_penalty_applied: float
     no_ask: Optional[float]
     yes_spread: Optional[float]
 
@@ -1186,6 +1192,7 @@ def model_probability_for_market(
         p_yes_model_post_shrink = p_yes_model_raw
 
     station_code = resolution_station_code_for_market(market)
+    coord_key = f"station:{station_code}" if station_code else f"city:{parsed.city_slug}"
     observed_max_c = (
         observed_cache.get((station_code, parsed.target_date))
         if station_code
@@ -1203,6 +1210,8 @@ def model_probability_for_market(
         "p_yes_model_post_shrink": float(p_yes_model_post_shrink),
         "p_yes": float(p_yes),
         "observed_max_c": observed_max_c,
+        "resolution_station_code": station_code,
+        "forecast_coord_key": coord_key,
     }
 
 
@@ -1281,13 +1290,26 @@ def side_price_source_label(market: Dict[str, Any], side: str) -> str:
     return "unknown"
 
 
-def apply_no_ask_penalty(no_ask: Optional[float], source: str, config: Config) -> Optional[float]:
+def no_ask_penalty_amount(source: str, yes_spread: Optional[float], config: Config) -> float:
+    if source != "no_ask_synthetic_from_yes_bid":
+        return 0.0
+    fixed = max(0.0, float(config.no_synthetic_ask_penalty))
+    spread = max(0.0, float(yes_spread or 0.0))
+    dyn = spread * max(0.0, float(config.no_synthetic_ask_spread_mult))
+    return max(fixed, dyn)
+
+
+def apply_no_ask_penalty(
+    no_ask: Optional[float],
+    source: str,
+    yes_spread: Optional[float],
+    config: Config,
+) -> Optional[float]:
     if no_ask is None:
         return None
 
     px = float(no_ask)
-    if source == "no_ask_synthetic_from_yes_bid":
-        px += max(0.0, float(config.no_synthetic_ask_penalty))
+    px += no_ask_penalty_amount(source, yes_spread, config)
     return clamp01(px)
 
 
@@ -1516,12 +1538,14 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         counters["parseable"] += 1
 
         station_code = resolution_station_code_for_market(market)
+        coord_key = f"station:{station_code}" if station_code else f"city:{parsed.city_slug}"
         row = {
             "slug": slug,
             "question": str(market.get("question") or ""),
             "city_slug": parsed.city_slug,
             "target_date": parsed.target_date,
             "resolution_station_code": station_code,
+            "forecast_coord_key": coord_key,
             "status": "watch-only",
             "brief": "parseable, pending checks",
         }
@@ -1605,7 +1629,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         observed_max_c = model.get("observed_max_c")
 
         no_price_source = side_price_source_label(market, "NO")
-        no_ask_effective = apply_no_ask_penalty(no_ask, no_price_source, config)
+        no_ask_effective = apply_no_ask_penalty(no_ask, no_price_source, yes_spread, config)
         if no_ask_effective is None:
             row["status"] = "data-missing"
             row["brief"] = "missing executable prices"
@@ -1671,12 +1695,15 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         entry_spread_penalty = spread_penalty_for_entry(yes_spread, config)
         effective_net_edge = net_edge - entry_spread_penalty
 
+        no_ask_penalty_applied = no_ask_penalty_amount(no_price_source, yes_spread, config)
+
         candidate_row = {
             "slug": slug,
             "question": str(market.get("question") or ""),
             "city_slug": parsed.city_slug,
             "target_date": parsed.target_date,
             "resolution_station_code": station_code,
+            "forecast_coord_key": coord_key,
             "side": side,
             "side_prob": round(side_prob, 6),
             "side_price": round(side_price, 6),
@@ -1709,6 +1736,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "yes_spread": None if yes_spread is None else round(yes_spread, 6),
             "no_bid": None if no_bid is None else round(no_bid, 6),
             "no_ask_raw": None if no_ask is None else round(no_ask, 6),
+            "no_ask_penalty_applied": round(float(no_ask_penalty_applied), 6),
             "no_ask": round(no_ask_effective, 6),
             "no_mid": None if no_mid is None else round(no_mid, 6),
             "end_date": end_date_raw,
@@ -1728,6 +1756,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             question=str(market.get("question") or ""),
             city_slug=parsed.city_slug,
             target_date=parsed.target_date,
+            resolution_station_code=station_code,
+            forecast_coord_key=coord_key,
             side=side,
             category=category,
             side_prob=side_prob,
@@ -1738,6 +1768,8 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             yes_bid=yes_bid,
             yes_ask=yes_ask,
             no_bid=no_bid,
+            no_ask_raw=no_ask,
+            no_ask_penalty_applied=float(no_ask_penalty_applied),
             no_ask=no_ask_effective,
             yes_spread=yes_spread,
             forecast_max_c=forecast_max_c,
@@ -1870,8 +1902,13 @@ def current_edge_for_position(
     if parsed is None:
         return None
 
-    _, yes_ask, _, _, no_ask, _ = market_prices(market)
-    no_ask_effective = apply_no_ask_penalty(no_ask, side_price_source_label(market, "NO"), config)
+    _, yes_ask, yes_spread, _, no_ask, _ = market_prices(market)
+    no_ask_effective = apply_no_ask_penalty(
+        no_ask,
+        side_price_source_label(market, "NO"),
+        yes_spread,
+        config,
+    )
 
     if side == "YES":
         side_ask = yes_ask
@@ -2778,7 +2815,8 @@ def apply_paper_positions(
             "question": s.question,
             "city_slug": s.city_slug,
             "target_date": s.target_date,
-            "resolution_station_code": resolution_station_code_for_market(market),
+            "resolution_station_code": s.resolution_station_code,
+            "forecast_coord_key": s.forecast_coord_key,
             "end_date": s.end_date,
             "event_cluster_key": cluster_key,
             "side": s.side,
@@ -2799,12 +2837,14 @@ def apply_paper_positions(
             "selection_score": round(selection_score, 8),
             "bankroll_equity_usd_at_entry": round(bankroll_equity, 6),
             "entry_price": round(s.side_price, 6),
+            "entry_price_source": s.side_price_source,
             "shares": round(shares, 6),
             "entry_total_cost_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
             "entry_cost_remaining_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
             "model_prob": round(s.side_prob, 6),
             "edge": round(s.edge, 6),
             "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
+            "spread_at_entry": (None if s.yes_spread is None else round(float(s.yes_spread), 6)),
             "entry_spread_penalty": round(spread_penalty_for_entry(s.yes_spread, config), 6),
             "effective_net_edge": round(
                 effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
@@ -2815,6 +2855,8 @@ def apply_paper_positions(
             "bucket_lower": s.bucket_lower,
             "bucket_upper": s.bucket_upper,
             "side_price_source": s.side_price_source,
+            "no_ask_raw_at_entry": (None if s.no_ask_raw is None else round(float(s.no_ask_raw), 6)),
+            "no_ask_penalty_applied_at_entry": round(float(s.no_ask_penalty_applied), 6),
             "robustness_mu_shift_c": round(s.robustness_mu_shift_c, 4),
             "robustness_sigma_low_c": round(s.robustness_sigma_low_c, 4),
             "robustness_sigma_high_c": round(s.robustness_sigma_high_c, 4),
@@ -3344,6 +3386,18 @@ def main() -> None:
         help="Max share of executable entry depth to consume per order (0..1)",
     )
     parser.add_argument(
+        "--no-synthetic-ask-penalty",
+        type=float,
+        default=None,
+        help="Minimum absolute price penalty added to NO ask when derived from YES bid",
+    )
+    parser.add_argument(
+        "--no-synthetic-ask-spread-mult",
+        type=float,
+        default=None,
+        help="Additional NO synthetic ask penalty = yes_spread * multiplier",
+    )
+    parser.add_argument(
         "--robustness-mu-shift-c",
         type=float,
         default=None,
@@ -3537,6 +3591,10 @@ def main() -> None:
         config.min_open_size_usd = max(0.25, float(args.min_open_size_usd))
     if args.max_entry_participation is not None:
         config.max_entry_participation = min(1.0, max(0.01, float(args.max_entry_participation)))
+    if args.no_synthetic_ask_penalty is not None:
+        config.no_synthetic_ask_penalty = max(0.0, float(args.no_synthetic_ask_penalty))
+    if args.no_synthetic_ask_spread_mult is not None:
+        config.no_synthetic_ask_spread_mult = max(0.0, float(args.no_synthetic_ask_spread_mult))
     if args.robustness_mu_shift_c is not None:
         config.robustness_mu_shift_c = max(0.0, float(args.robustness_mu_shift_c))
     if args.robustness_sigma_scale_low is not None:
@@ -3735,6 +3793,9 @@ def main() -> None:
         "compound_max_open_exposure_max_usd": config.compound_max_open_exposure_max_usd,
         "compound_daily_stop_loss_min_abs_usd": config.compound_daily_stop_loss_min_abs_usd,
         "compound_daily_stop_loss_max_abs_usd": config.compound_daily_stop_loss_max_abs_usd,
+        "max_yes_spread": config.max_yes_spread,
+        "no_synthetic_ask_penalty": config.no_synthetic_ask_penalty,
+        "no_synthetic_ask_spread_mult": config.no_synthetic_ask_spread_mult,
         "entry_fee_bps": config.entry_fee_bps,
         "exit_fee_bps": config.exit_fee_bps,
         "entry_slippage_bps": config.entry_slippage_bps,
