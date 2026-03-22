@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,6 +29,7 @@ WEATHER_SECTION_URL = "https://polymarket.com/climate-science/weather"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 AVIATION_WEATHER_METAR_URL = "https://aviationweather.gov/api/data/metar"
 AVIATION_WEATHER_TAF_URL = "https://aviationweather.gov/api/data/taf"
@@ -90,6 +92,28 @@ STATION_COORDS = {
     "NZWN": (-41.3310, 174.8060),
 }
 
+# Fallback sigma baseline by city (day-1 RMSE, °C). Used only when ensemble
+# probabilities are unavailable.
+CITY_SIGMA_BASE = {
+    "nyc": 1.8,
+    "new-york-city": 1.8,
+    "chicago": 2.3,
+    "seoul": 2.0,
+    "london": 1.4,
+    "miami": 1.2,
+    "denver": 2.5,
+    "dallas": 2.0,
+    "atlanta": 1.7,
+    "seattle": 1.5,
+    "los-angeles": 1.3,
+    "buenos-aires": 1.6,
+    "toronto": 2.1,
+    "ankara": 2.2,
+    "paris": 1.5,
+    "lucknow": 1.4,
+    "wellington": 1.6,
+}
+
 
 @dataclass
 class Config:
@@ -145,7 +169,7 @@ class Config:
     robustness_mu_shift_c: float = 0.7
     robustness_sigma_scale_low: float = 0.85
     robustness_sigma_scale_high: float = 1.15
-    robustness_min_edge: float = 0.0
+    robustness_min_edge: float = 0.01
 
     # Rotation: allow replacing weaker profitable positions with stronger candidates.
     enable_edge_rotation: bool = True
@@ -168,6 +192,19 @@ class Config:
     compound_daily_stop_loss_max_abs_usd: float = 120.0
 
     request_timeout_sec: int = 20
+
+    # Forecast model controls
+    forecast_ensemble_models: str = "gfs_seamless"
+    forecast_fallback_model: str = "gfs_seamless"
+    ensemble_prob_shrink_alpha: float = 1.0
+    ensemble_prob_shrink_beta: float = 1.0
+
+    # Ensemble robustness gate
+    robustness_bootstrap_iters: int = 200
+    robustness_subsample_frac: float = 0.7
+
+    # NO-side synthetic ask penalty (in absolute price dollars)
+    no_synthetic_ask_penalty: float = 0.01
 
     # Execution-cost model (paper -> live bridge)
     entry_fee_bps: float = 5.0
@@ -211,6 +248,10 @@ class Signal:
 
     forecast_max_c: float
     sigma_c: float
+    model_mode: str
+    ensemble_member_count: int
+    p_yes_model_raw: float
+    p_yes_model_post_shrink: float
     bucket_lower: Optional[float]
     bucket_upper: Optional[float]
     side_price_source: str
@@ -251,11 +292,72 @@ def norm_cdf(x: float, mu: float, sigma: float) -> float:
     return 0.5 * (1 + math.erf(z))
 
 
-def sigma_by_horizon_days(h: float) -> float:
-    # Conservative baseline for daily max-temp forecast uncertainty.
-    # 0d: ~1.6C, 1d: ~2.0C, 2d: ~2.4C
+def sigma_by_horizon_days(h: float, city_slug: str = "") -> float:
+    # Fallback uncertainty model (used when ensemble member distribution
+    # is unavailable).
     h = max(0.0, h)
-    return min(4.0, 1.6 + 0.4 * h)
+    base = float(CITY_SIGMA_BASE.get(city_slug, 2.0))
+    return min(6.0, base + 0.6 * math.sqrt(h))
+
+
+def temp_c_to_contract_unit(temp_c: float, contract: ParsedContract) -> float:
+    if contract.unit == "F":
+        return float(temp_c) * 9.0 / 5.0 + 32.0
+    return float(temp_c)
+
+
+def temp_in_contract_bucket(temp_contract_unit: float, contract: ParsedContract) -> bool:
+    lower = contract.lower
+    upper = contract.upper
+
+    if lower is not None and temp_contract_unit <= float(lower):
+        return False
+    if upper is not None and temp_contract_unit >= float(upper):
+        return False
+    return True
+
+
+def prob_yes_from_contract_ensemble(member_temps_c: List[float], contract: ParsedContract) -> float:
+    if not member_temps_c:
+        return 0.0
+
+    hit = 0
+    for t_c in member_temps_c:
+        t_u = temp_c_to_contract_unit(float(t_c), contract)
+        if temp_in_contract_bucket(t_u, contract):
+            hit += 1
+
+    return clamp01(hit / max(1, len(member_temps_c)))
+
+
+def shrink_probability(p: float, n: int, alpha: float, beta: float) -> float:
+    # Beta-Binomial shrinkage to avoid small-sample overconfidence.
+    n = max(0, int(n))
+    if n <= 0:
+        return clamp01(float(p))
+
+    alpha = max(0.0, float(alpha))
+    beta = max(0.0, float(beta))
+    if alpha == 0.0 and beta == 0.0:
+        return clamp01(float(p))
+
+    k = clamp01(float(p)) * n
+    return clamp01((k + alpha) / (n + alpha + beta))
+
+
+def ensemble_stats(member_temps_c: List[float], fallback_sigma_c: float) -> Tuple[float, float]:
+    if not member_temps_c:
+        return 0.0, max(0.05, float(fallback_sigma_c))
+
+    n = len(member_temps_c)
+    mu = sum(float(x) for x in member_temps_c) / n
+
+    if n < 2:
+        return float(mu), max(0.05, float(fallback_sigma_c))
+
+    var = sum((float(x) - mu) ** 2 for x in member_temps_c) / (n - 1)
+    sigma = max(0.05, math.sqrt(max(0.0, var)))
+    return float(mu), float(sigma)
 
 
 def load_env(env_path: Path) -> Dict[str, str]:
@@ -668,6 +770,25 @@ def resolution_station_code_for_market(market: Optional[Dict[str, Any]]) -> Opti
     return None
 
 
+def forecast_coords_for_market(
+    city_slug: str,
+    target_date: str,
+    timeout_sec: int,
+    market: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[Tuple[float, float]], Optional[str]]:
+    station_code = resolution_station_code_for_market(market)
+    if station_code:
+        coord_key = f"station:{station_code}"
+        coords = STATION_COORDS.get(station_code)
+        if not coords:
+            return coord_key, None, station_code
+        return coord_key, coords, station_code
+
+    coord_key = f"city:{city_slug}"
+    coords = geocode_city(city_slug, timeout_sec)
+    return coord_key, coords, None
+
+
 def station_observed_max_c_so_far(
     station_code: str,
     target_date: str,
@@ -791,6 +912,99 @@ def station_taf_max_c_for_date(
         return None
 
 
+def fetch_ensemble_max_temps_c(
+    city_slug: str,
+    target_date: str,
+    timeout_sec: int,
+    cache: Dict[Tuple[str, str, str], Optional[List[float]]],
+    market: Optional[Dict[str, Any]] = None,
+    observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    models: str = "gfs_seamless",
+) -> Optional[List[float]]:
+    coord_key, coords, station_code = forecast_coords_for_market(
+        city_slug=city_slug,
+        target_date=target_date,
+        timeout_sec=timeout_sec,
+        market=market,
+    )
+    key = (coord_key, target_date, str(models or ""))
+    if key in cache:
+        return cache[key]
+
+    if not coords:
+        cache[key] = None
+        return None
+
+    lat, lon = coords
+    timezone_name = ""
+    member_temps: List[float] = []
+
+    try:
+        resp = requests.get(
+            OPEN_METEO_ENSEMBLE_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "start_date": target_date,
+                "end_date": target_date,
+                "models": str(models or "gfs_seamless"),
+            },
+            timeout=timeout_sec,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        timezone_name = str(body.get("timezone") or "")
+        daily = body.get("daily") or {}
+
+        for key_name, values in daily.items():
+            if "temperature_2m_max" not in str(key_name):
+                continue
+            if not isinstance(values, list) or not values:
+                continue
+            v = parse_float(values[0])
+            if v is None:
+                continue
+            member_temps.append(float(v))
+    except Exception:
+        member_temps = []
+
+    if not member_temps:
+        cache[key] = None
+        return None
+
+    if station_code:
+        # Station-specific TAF max is a second station-native signal.
+        # Use the higher of model grid vs TAF TX to avoid cold-grid bias.
+        if taf_cache is None:
+            taf_cache = {}
+        taf_max = station_taf_max_c_for_date(
+            station_code=station_code,
+            target_date=target_date,
+            timeout_sec=timeout_sec,
+            cache=taf_cache,
+        )
+        if taf_max is not None:
+            member_temps = [max(float(t), float(taf_max)) for t in member_temps]
+
+        # Intraday hardening: floor by observed station max-so-far (same day).
+        if observed_cache is None:
+            observed_cache = {}
+        observed_max = station_observed_max_c_so_far(
+            station_code=station_code,
+            target_date=target_date,
+            timezone_name=timezone_name,
+            timeout_sec=timeout_sec,
+            cache=observed_cache,
+        )
+        if observed_max is not None:
+            member_temps = [max(float(t), float(observed_max)) for t in member_temps]
+
+    cache[key] = member_temps
+    return member_temps
+
+
 def fetch_forecast_max_temp_c(
     city_slug: str,
     target_date: str,
@@ -799,39 +1013,28 @@ def fetch_forecast_max_temp_c(
     market: Optional[Dict[str, Any]] = None,
     observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
     taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    model: str = "gfs_seamless",
 ) -> Optional[float]:
-    # Prefer station-level coordinates from resolutionSource (e.g. ZSPD/KLGA)
-    # so model input matches market settlement station.
-    station_code = resolution_station_code_for_market(market)
+    # Deterministic fallback path (used when ensemble endpoint is unavailable).
+    coord_key, coords, station_code = forecast_coords_for_market(
+        city_slug=city_slug,
+        target_date=target_date,
+        timeout_sec=timeout_sec,
+        market=market,
+    )
 
-    if station_code:
-        # If market explicitly specifies a station, require mapped station coords.
-        # Fail closed (do not silently fallback to city center) when unmapped.
-        coord_key = f"station:{station_code}"
-        key = (coord_key, target_date)
-        if key in cache:
-            return cache[key]
+    key = (coord_key, target_date)
+    if key in cache:
+        return cache[key]
 
-        coords = STATION_COORDS.get(station_code)
-        if not coords:
-            cache[key] = None
-            return None
-    else:
-        coord_key = f"city:{city_slug}"
-        key = (coord_key, target_date)
-        if key in cache:
-            return cache[key]
-
-        coords = geocode_city(city_slug, timeout_sec)
-        if not coords:
-            cache[key] = None
-            return None
+    if not coords:
+        cache[key] = None
+        return None
 
     lat, lon = coords
     value: Optional[float] = None
     timezone_name = ""
 
-    # Open-Meteo baseline forecast.
     try:
         resp = requests.get(
             OPEN_METEO_FORECAST_URL,
@@ -841,7 +1044,9 @@ def fetch_forecast_max_temp_c(
                 "daily": "temperature_2m_max",
                 # Contract date is city-local. Using auto timezone avoids UTC date skew.
                 "timezone": "auto",
-                "forecast_days": 16,
+                "start_date": target_date,
+                "end_date": target_date,
+                "models": str(model or "gfs_seamless"),
             },
             timeout=timeout_sec,
         )
@@ -915,6 +1120,90 @@ def prob_yes_from_contract(
 
     p = norm_cdf(upper, mu, sigma) - norm_cdf(lower, mu, sigma)
     return max(0.0, min(1.0, p))
+
+
+def model_probability_for_market(
+    parsed: ParsedContract,
+    market: Dict[str, Any],
+    now: datetime,
+    config: Config,
+    ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]],
+    forecast_cache: Dict[Tuple[str, str], Optional[float]],
+    observed_cache: Dict[Tuple[str, str], Optional[float]],
+    taf_cache: Dict[Tuple[str, str], Optional[float]],
+) -> Optional[Dict[str, Any]]:
+    end_date = parse_iso_to_utc(str(market.get("endDate") or ""))
+    if end_date is not None:
+        horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
+    else:
+        horizon_days = max(
+            0.0,
+            (datetime.fromisoformat(parsed.target_date).replace(tzinfo=UTC) - now).total_seconds() / 86400,
+        )
+
+    fallback_sigma_c = sigma_by_horizon_days(horizon_days, parsed.city_slug)
+
+    member_temps_c = fetch_ensemble_max_temps_c(
+        parsed.city_slug,
+        parsed.target_date,
+        config.request_timeout_sec,
+        ensemble_cache,
+        market=market,
+        observed_cache=observed_cache,
+        taf_cache=taf_cache,
+        models=config.forecast_ensemble_models,
+    )
+
+    model_mode = "ensemble"
+    ensemble_member_count = 0
+
+    if member_temps_c:
+        ensemble_member_count = len(member_temps_c)
+        forecast_max_c, sigma_c = ensemble_stats(member_temps_c, fallback_sigma_c)
+        p_yes_model_raw = prob_yes_from_contract_ensemble(member_temps_c, parsed)
+        p_yes_model_post_shrink = shrink_probability(
+            p_yes_model_raw,
+            ensemble_member_count,
+            config.ensemble_prob_shrink_alpha,
+            config.ensemble_prob_shrink_beta,
+        )
+    else:
+        model_mode = "gaussian_fallback"
+        forecast_max_c = fetch_forecast_max_temp_c(
+            parsed.city_slug,
+            parsed.target_date,
+            config.request_timeout_sec,
+            forecast_cache,
+            market=market,
+            observed_cache=observed_cache,
+            taf_cache=taf_cache,
+            model=config.forecast_fallback_model,
+        )
+        if forecast_max_c is None:
+            return None
+        sigma_c = fallback_sigma_c
+        p_yes_model_raw = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
+        p_yes_model_post_shrink = p_yes_model_raw
+
+    station_code = resolution_station_code_for_market(market)
+    observed_max_c = (
+        observed_cache.get((station_code, parsed.target_date))
+        if station_code
+        else None
+    )
+    p_yes = apply_observed_max_constraints(p_yes_model_post_shrink, parsed, observed_max_c)
+
+    return {
+        "forecast_max_c": float(forecast_max_c),
+        "sigma_c": float(max(0.05, sigma_c)),
+        "model_mode": model_mode,
+        "ensemble_member_count": int(ensemble_member_count),
+        "member_temps_c": member_temps_c,
+        "p_yes_model_raw": float(p_yes_model_raw),
+        "p_yes_model_post_shrink": float(p_yes_model_post_shrink),
+        "p_yes": float(p_yes),
+        "observed_max_c": observed_max_c,
+    }
 
 
 def observed_max_in_contract_unit(observed_max_c: float, contract: ParsedContract) -> float:
@@ -992,6 +1281,76 @@ def side_price_source_label(market: Dict[str, Any], side: str) -> str:
     return "unknown"
 
 
+def apply_no_ask_penalty(no_ask: Optional[float], source: str, config: Config) -> Optional[float]:
+    if no_ask is None:
+        return None
+
+    px = float(no_ask)
+    if source == "no_ask_synthetic_from_yes_bid":
+        px += max(0.0, float(config.no_synthetic_ask_penalty))
+    return clamp01(px)
+
+
+def calc_robustness_metrics_ensemble(
+    member_temps_c: List[float],
+    contract: ParsedContract,
+    side: str,
+    side_price: float,
+    config: Config,
+) -> Dict[str, Any]:
+    if not member_temps_c:
+        return {
+            "mu_shift_c": 0.0,
+            "sigma_low_c": 0.0,
+            "sigma_high_c": 0.0,
+            "min_prob": 0.0,
+            "max_prob": 0.0,
+            "min_edge": -1.0,
+            "max_edge": -1.0,
+            "p05_edge": -1.0,
+            "p10_edge": -1.0,
+            "pass": False,
+        }
+
+    n = len(member_temps_c)
+    n_bootstrap = max(20, int(config.robustness_bootstrap_iters))
+    frac = min(1.0, max(0.1, float(config.robustness_subsample_frac)))
+    k = max(3, min(n, int(round(n * frac))))
+
+    probs: List[float] = []
+    edges: List[float] = []
+
+    rng = random.Random(f"{contract.slug}|{side}|{n}|{round(side_price, 6)}")
+    for _ in range(n_bootstrap):
+        sample = member_temps_c if k >= n else rng.sample(member_temps_c, k)
+        p_yes = prob_yes_from_contract_ensemble(sample, contract)
+        side_prob = side_prob_from_p_yes(p_yes, side)
+        probs.append(side_prob)
+        edges.append(side_prob - side_price)
+
+    edges_sorted = sorted(edges)
+    idx05 = max(0, min(len(edges_sorted) - 1, int(math.floor(0.05 * (len(edges_sorted) - 1)))))
+    idx10 = max(0, min(len(edges_sorted) - 1, int(math.floor(0.10 * (len(edges_sorted) - 1)))))
+    p05_edge = float(edges_sorted[idx05])
+    p10_edge = float(edges_sorted[idx10])
+
+    # Gate on p10 edge (90% of bootstrap samples must still keep edge above threshold).
+    min_edge_for_gate = p10_edge
+
+    return {
+        "mu_shift_c": 0.0,
+        "sigma_low_c": 0.0,
+        "sigma_high_c": 0.0,
+        "min_prob": float(min(probs)),
+        "max_prob": float(max(probs)),
+        "min_edge": float(min_edge_for_gate),
+        "max_edge": float(max(edges)),
+        "p05_edge": p05_edge,
+        "p10_edge": p10_edge,
+        "pass": float(min_edge_for_gate) >= float(config.robustness_min_edge),
+    }
+
+
 def calc_robustness_metrics(
     forecast_max_c: float,
     sigma_c: float,
@@ -1033,6 +1392,8 @@ def calc_robustness_metrics(
         "max_prob": max_prob,
         "min_edge": min_edge,
         "max_edge": max_edge,
+        "p05_edge": min_edge,
+        "p10_edge": min_edge,
         "pass": min_edge >= float(config.robustness_min_edge),
     }
 
@@ -1121,6 +1482,7 @@ def market_prices(
 def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]] = {}
     observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
     taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
     market_map: Dict[str, Dict[str, Any]] = {}
@@ -1215,32 +1577,44 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             universe_rows.append(row)
             continue
 
-        forecast_max_c = fetch_forecast_max_temp_c(
-            parsed.city_slug,
-            parsed.target_date,
-            config.request_timeout_sec,
-            forecast_cache,
+        model = model_probability_for_market(
+            parsed=parsed,
             market=market,
+            now=now,
+            config=config,
+            ensemble_cache=ensemble_cache,
+            forecast_cache=forecast_cache,
             observed_cache=observed_cache,
             taf_cache=taf_cache,
         )
-        if forecast_max_c is None:
+        if model is None:
             row["status"] = "data-missing"
             row["brief"] = "weather forecast unavailable"
             universe_rows.append(row)
             continue
         counters["model_ready"] += 1
 
-        # Sigma should be anchored to actual time-to-resolution (endDate), not target-date midnight.
-        horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
-        sigma_c = sigma_by_horizon_days(horizon_days)
-        observed_max_c = observed_cache.get((station_code, parsed.target_date)) if station_code else None
-        p_yes_model = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
-        p_yes = apply_observed_max_constraints(p_yes_model, parsed, observed_max_c)
+        forecast_max_c = float(model["forecast_max_c"])
+        sigma_c = float(model["sigma_c"])
+        model_mode = str(model["model_mode"])
+        ensemble_member_count = int(model["ensemble_member_count"])
+        member_temps_c = model.get("member_temps_c")
+        p_yes_model_raw = float(model["p_yes_model_raw"])
+        p_yes_model_post_shrink = float(model["p_yes_model_post_shrink"])
+        p_yes = float(model["p_yes"])
+        observed_max_c = model.get("observed_max_c")
+
+        no_price_source = side_price_source_label(market, "NO")
+        no_ask_effective = apply_no_ask_penalty(no_ask, no_price_source, config)
+        if no_ask_effective is None:
+            row["status"] = "data-missing"
+            row["brief"] = "missing executable prices"
+            universe_rows.append(row)
+            continue
 
         yes_edge = p_yes - yes_ask
         no_prob = 1 - p_yes
-        no_edge = no_prob - no_ask
+        no_edge = no_prob - no_ask_effective
 
         # Pick side with stronger positive edge.
         if yes_edge >= no_edge:
@@ -1251,18 +1625,27 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         else:
             side = "NO"
             side_prob = no_prob
-            side_price = no_ask
+            side_price = no_ask_effective
             edge = no_edge
 
         side_price_source = side_price_source_label(market, side)
-        robustness = calc_robustness_metrics(
-            forecast_max_c=forecast_max_c,
-            sigma_c=sigma_c,
-            contract=parsed,
-            side=side,
-            side_price=side_price,
-            config=config,
-        )
+        if isinstance(member_temps_c, list) and member_temps_c:
+            robustness = calc_robustness_metrics_ensemble(
+                member_temps_c=[float(x) for x in member_temps_c],
+                contract=parsed,
+                side=side,
+                side_price=side_price,
+                config=config,
+            )
+        else:
+            robustness = calc_robustness_metrics(
+                forecast_max_c=forecast_max_c,
+                sigma_c=sigma_c,
+                contract=parsed,
+                side=side,
+                side_price=side_price,
+                config=config,
+            )
 
         base_core = side_prob >= config.core_prob_min and edge >= config.core_edge_min
         base_tail = (
@@ -1303,7 +1686,10 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "effective_net_edge": round(effective_net_edge, 6),
             "forecast_max_c": round(forecast_max_c, 6),
             "observed_max_c": (None if observed_max_c is None else round(float(observed_max_c), 6)),
-            "p_yes_model_raw": round(float(p_yes_model), 6),
+            "model_mode": model_mode,
+            "ensemble_member_count": int(ensemble_member_count),
+            "p_yes_model_raw": round(float(p_yes_model_raw), 6),
+            "p_yes_model_post_shrink": round(float(p_yes_model_post_shrink), 6),
             "p_yes_after_observed_constraints": round(float(p_yes), 6),
             "sigma_c": round(sigma_c, 6),
             "bucket_lower": parsed.lower,
@@ -1316,11 +1702,14 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "robustness_max_prob": round(float(robustness["max_prob"]), 6),
             "robustness_min_edge": round(float(robustness["min_edge"]), 6),
             "robustness_max_edge": round(float(robustness["max_edge"]), 6),
+            "robustness_p05_edge": round(float(robustness.get("p05_edge", robustness["min_edge"])), 6),
+            "robustness_p10_edge": round(float(robustness.get("p10_edge", robustness["min_edge"])), 6),
             "robustness_pass": bool(robustness["pass"]),
             "liquidity": round(liquidity, 6),
             "yes_spread": None if yes_spread is None else round(yes_spread, 6),
             "no_bid": None if no_bid is None else round(no_bid, 6),
-            "no_ask": None if no_ask is None else round(no_ask, 6),
+            "no_ask_raw": None if no_ask is None else round(no_ask, 6),
+            "no_ask": round(no_ask_effective, 6),
             "no_mid": None if no_mid is None else round(no_mid, 6),
             "end_date": end_date_raw,
             "status": "quality-pass" if category else "watch-only",
@@ -1345,14 +1734,18 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             side_price=side_price,
             edge=edge,
             yes_price=yes_ask,
-            no_price=no_ask,
+            no_price=no_ask_effective,
             yes_bid=yes_bid,
             yes_ask=yes_ask,
             no_bid=no_bid,
-            no_ask=no_ask,
+            no_ask=no_ask_effective,
             yes_spread=yes_spread,
             forecast_max_c=forecast_max_c,
             sigma_c=sigma_c,
+            model_mode=model_mode,
+            ensemble_member_count=ensemble_member_count,
+            p_yes_model_raw=p_yes_model_raw,
+            p_yes_model_post_shrink=p_yes_model_post_shrink,
             bucket_lower=parsed.lower,
             bucket_upper=parsed.upper,
             side_price_source=side_price_source,
@@ -1468,6 +1861,7 @@ def current_edge_for_position(
     market: Dict[str, Any],
     config: Config,
     forecast_cache: Dict[Tuple[str, str], Optional[float]],
+    ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]],
     observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]],
     taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]],
     now: datetime,
@@ -1477,46 +1871,37 @@ def current_edge_for_position(
         return None
 
     _, yes_ask, _, _, no_ask, _ = market_prices(market)
+    no_ask_effective = apply_no_ask_penalty(no_ask, side_price_source_label(market, "NO"), config)
+
     if side == "YES":
         side_ask = yes_ask
     elif side == "NO":
-        side_ask = no_ask
+        side_ask = no_ask_effective
     else:
         return None
 
     if side_ask is None:
         return None
 
-    forecast_max_c = fetch_forecast_max_temp_c(
-        parsed.city_slug,
-        parsed.target_date,
-        config.request_timeout_sec,
-        forecast_cache,
+    if observed_cache is None:
+        observed_cache = {}
+    if taf_cache is None:
+        taf_cache = {}
+
+    model = model_probability_for_market(
+        parsed=parsed,
         market=market,
+        now=now,
+        config=config,
+        ensemble_cache=ensemble_cache,
+        forecast_cache=forecast_cache,
         observed_cache=observed_cache,
         taf_cache=taf_cache,
     )
-    if forecast_max_c is None:
+    if model is None:
         return None
 
-    end_date = parse_iso_to_utc(str(market.get("endDate") or ""))
-    if end_date is not None:
-        horizon_days = max(0.0, (end_date - now).total_seconds() / 86400)
-    else:
-        horizon_days = max(
-            0.0,
-            (datetime.fromisoformat(parsed.target_date).replace(tzinfo=UTC) - now).total_seconds() / 86400,
-        )
-
-    sigma_c = sigma_by_horizon_days(horizon_days)
-    station_code = resolution_station_code_for_market(market)
-    observed_max_c = (
-        observed_cache.get((station_code, parsed.target_date))
-        if (station_code and observed_cache is not None)
-        else None
-    )
-    p_yes_model = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
-    p_yes = apply_observed_max_constraints(p_yes_model, parsed, observed_max_c)
+    p_yes = float(model["p_yes"])
     side_prob = p_yes if side == "YES" else (1 - p_yes)
     return float(side_prob - side_ask)
 
@@ -1851,6 +2236,7 @@ def close_edge_decay_positions(
     now = datetime.now(UTC)
     signal_edge = {(s.slug, s.side): float(s.edge) for s in signals}
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]] = {}
     observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
     taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
     book_cache: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -1894,6 +2280,7 @@ def close_edge_decay_positions(
                     market=m,
                     config=config,
                     forecast_cache=forecast_cache,
+                    ensemble_cache=ensemble_cache,
                     observed_cache=observed_cache,
                     taf_cache=taf_cache,
                     now=now,
