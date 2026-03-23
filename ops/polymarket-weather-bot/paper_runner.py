@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 from dotenv import dotenv_values
@@ -222,6 +222,9 @@ class Config:
     # do not open new NO exposure on that market.
     external_no_consensus_gate_enabled: bool = True
     external_no_consensus_margin_c: float = 0.0
+
+    # API-budget control: cap number of unique coord+date weather keys per tick.
+    max_coord_dates_per_tick: int = 30
 
     # Execution-cost model (paper -> live bridge)
     entry_fee_bps: float = 5.0
@@ -1310,12 +1313,13 @@ def model_probability_for_market(
             config.ensemble_prob_shrink_beta,
         )
 
+        required_families = max(1, int(config.min_model_family_count))
         if model_family_count >= 2:
             model_prob_range = max(family_prob_map.values()) - min(family_prob_map.values())
             if model_prob_range > float(config.model_discrepancy_max):
                 model_discrepancy_block = True
                 model_discrepancy_reason = "model_disagreement"
-        elif len(model_families) >= int(config.min_model_family_count):
+        if model_family_count < required_families:
             model_discrepancy_block = True
             model_discrepancy_reason = "insufficient_model_families"
     else:
@@ -1670,6 +1674,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         "model_ready": 0,
         "quality_pass": 0,
         "edge_sanity_blocked": 0,
+        "coord_budget_blocked": 0,
         "signals": 0,
     }
 
@@ -1677,7 +1682,10 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
     radar_rows: List[Dict[str, Any]] = []
     universe_rows: List[Dict[str, Any]] = []
     weather_markets = fetch_weather_markets(config.request_timeout_sec)
+    # Budget-first ordering: evaluate higher-liquidity markets first.
+    weather_markets.sort(key=lambda m: parse_float(m.get("liquidity")) or 0.0, reverse=True)
     counters["total_slugs"] = len(weather_markets)
+    modeled_coord_dates: Set[Tuple[str, str]] = set()
 
     for market in weather_markets:
         slug = str(market.get("slug") or "")
@@ -1754,6 +1762,15 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             row["brief"] = f"unmapped resolution station ({station_code})"
             universe_rows.append(row)
             continue
+
+        coord_date_key = (coord_key, parsed.target_date)
+        if coord_date_key not in modeled_coord_dates and len(modeled_coord_dates) >= int(config.max_coord_dates_per_tick):
+            counters["coord_budget_blocked"] += 1
+            row["status"] = "watch-only"
+            row["brief"] = "coord-date budget limit"
+            universe_rows.append(row)
+            continue
+        modeled_coord_dates.add(coord_date_key)
 
         model = model_probability_for_market(
             parsed=parsed,
@@ -3748,6 +3765,25 @@ def main() -> None:
         help="If enabled, empty scans / zero-model-ready scans disable opens and rotations for the tick",
     )
     parser.add_argument(
+        "--max-coord-dates-per-tick",
+        type=int,
+        default=None,
+        help="API-budget cap: maximum unique forecast coord+date keys to model per tick",
+    )
+    parser.add_argument(
+        "--external-no-consensus-gate-enabled",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Enable external-consensus gate that blocks new NO when external max reaches bucket midpoint",
+    )
+    parser.add_argument(
+        "--external-no-consensus-margin-c",
+        type=float,
+        default=None,
+        help="Additional C margin above bucket midpoint for external NO consensus blocking",
+    )
+    parser.add_argument(
         "--no-synthetic-ask-penalty",
         type=float,
         default=None,
@@ -3979,6 +4015,12 @@ def main() -> None:
         config.model_discrepancy_max = max(0.0, float(args.model_discrepancy_max))
     if args.fail_closed_on_empty_scan is not None:
         config.fail_closed_on_empty_scan = bool(int(args.fail_closed_on_empty_scan))
+    if args.max_coord_dates_per_tick is not None:
+        config.max_coord_dates_per_tick = max(1, int(args.max_coord_dates_per_tick))
+    if args.external_no_consensus_gate_enabled is not None:
+        config.external_no_consensus_gate_enabled = bool(int(args.external_no_consensus_gate_enabled))
+    if args.external_no_consensus_margin_c is not None:
+        config.external_no_consensus_margin_c = float(args.external_no_consensus_margin_c)
     if args.no_synthetic_ask_penalty is not None:
         config.no_synthetic_ask_penalty = max(0.0, float(args.no_synthetic_ask_penalty))
     if args.no_synthetic_ask_spread_mult is not None:
@@ -4131,6 +4173,7 @@ def main() -> None:
         "min_model_family_count": config.min_model_family_count,
         "model_discrepancy_max": config.model_discrepancy_max,
         "fail_closed_on_empty_scan": config.fail_closed_on_empty_scan,
+        "max_coord_dates_per_tick": config.max_coord_dates_per_tick,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
         "robustness_sigma_scale_high": config.robustness_sigma_scale_high,

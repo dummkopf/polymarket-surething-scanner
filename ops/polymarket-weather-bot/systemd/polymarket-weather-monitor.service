@@ -8,8 +8,8 @@ Type=simple
 WorkingDirectory=/home/kai/.openclaw/workspace/ops/polymarket-weather-bot
 
 # Risk profile (can be overridden with systemctl --user edit ...)
-Environment=INTERVAL_SEC=900
-Environment=RUN_TIMEOUT_SEC=420
+Environment=INTERVAL_SEC=7200
+Environment=RUN_TIMEOUT_SEC=1200
 Environment=MIN_HOURS_TO_EXPIRY=0
 Environment=MAX_POSITIONS_PER_CITY=2
 Environment=MAX_EVENT_CLUSTER_EXPOSURE_USD=100
@@ -36,6 +36,9 @@ Environment=ENSEMBLE_PROB_SHRINK_BETA=1.0
 Environment=MIN_MODEL_FAMILY_COUNT=2
 Environment=MODEL_DISCREPANCY_MAX=0.25
 Environment=FAIL_CLOSED_ON_EMPTY_SCAN=1
+Environment=MAX_COORD_DATES_PER_TICK=30
+Environment=EXTERNAL_NO_CONSENSUS_GATE_ENABLED=1
+Environment=EXTERNAL_NO_CONSENSUS_MARGIN_C=0.0
 Environment=ROBUSTNESS_MU_SHIFT_C=0.7
 Environment=ROBUSTNESS_SIGMA_SCALE_LOW=0.85
 Environment=ROBUSTNESS_SIGMA_SCALE_HIGH=1.15

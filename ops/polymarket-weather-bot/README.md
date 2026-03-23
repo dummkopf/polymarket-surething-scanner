@@ -44,6 +44,17 @@ Execution-first weather workflow for Polymarket.
   - `robustness_sigma_scale_low=0.85`
   - `robustness_sigma_scale_high=1.15`
   - `robustness_min_edge=0.0`
+- edge-rotation defaults (upgrade weaker profitable positions):
+  - `enable_edge_rotation=1`
+  - `rotation_min_edge_delta=0.05`
+  - `rotation_min_ev_per_usd_delta=0.08`
+  - `rotation_min_holding_minutes=10`
+  - `max_rotations_per_run=1`
+- compounding defaults (equity-based dynamic caps):
+  - `compound_enabled=1`
+  - `trade_size ≈ equity * 1%` (bounded by 10~25)
+  - `max_open_exposure ≈ equity * 12%` (bounded by 120~300)
+  - `daily_stop_loss ≈ -equity * 3%` (bounded by -30~-120)
 - no new position when `<12h` to expiry (can override)
 
 ## Paper Allocation Plan (Starting Fund = $1000)
@@ -140,6 +151,36 @@ python3 -m http.server 8787 --bind 127.0.0.1
 # then visit http://localhost:8787/portal.html
 ```
 
+## Runtime Profiles (2h stable + 30m low-API)
+
+Use the profile helper:
+
+```bash
+cd /home/kai/.openclaw/workspace/ops/polymarket-weather-bot
+./scripts/apply_runtime_profile.sh stable-2h
+# or
+./scripts/apply_runtime_profile.sh fast-30m-lowapi
+```
+
+Profile meaning:
+- `stable-2h`:
+  - `INTERVAL_SEC=7200`
+  - full 3-model ensemble
+  - `MAX_COORD_DATES_PER_TICK=30`
+  - designed to stay under Open-Meteo free daily quota more safely
+- `fast-30m-lowapi`:
+  - `INTERVAL_SEC=1800`
+  - single-model ensemble (`gfs_seamless`)
+  - `MIN_MODEL_FAMILY_COUNT=1`
+  - `MAX_COORD_DATES_PER_TICK=24`
+  - keeps external NO-consensus guard enabled while cutting calls
+
+Clear runtime drop-in override:
+
+```bash
+./scripts/apply_runtime_profile.sh clear
+```
+
 ## Continuous monitor (paper)
 
 Control script:
@@ -188,6 +229,22 @@ ROBUSTNESS_MU_SHIFT_C=0.7 \
 ROBUSTNESS_SIGMA_SCALE_LOW=0.85 \
 ROBUSTNESS_SIGMA_SCALE_HIGH=1.15 \
 ROBUSTNESS_MIN_EDGE=0.0 \
+ENABLE_EDGE_ROTATION=1 \
+ROTATION_MIN_EDGE_DELTA=0.05 \
+ROTATION_MIN_EV_PER_USD_DELTA=0.08 \
+ROTATION_MIN_HOLDING_MINUTES=10 \
+MAX_ROTATIONS_PER_RUN=1 \
+ROTATION_REQUIRE_PROFIT=1 \
+COMPOUND_ENABLED=1 \
+COMPOUND_TRADE_SIZE_FRACTION=0.01 \
+COMPOUND_MAX_OPEN_EXPOSURE_FRACTION=0.12 \
+COMPOUND_DAILY_STOP_LOSS_FRACTION=0.03 \
+COMPOUND_TRADE_SIZE_MIN_USD=10 \
+COMPOUND_TRADE_SIZE_MAX_USD=25 \
+COMPOUND_MAX_OPEN_EXPOSURE_MIN_USD=120 \
+COMPOUND_MAX_OPEN_EXPOSURE_MAX_USD=300 \
+COMPOUND_DAILY_STOP_LOSS_MIN_ABS_USD=30 \
+COMPOUND_DAILY_STOP_LOSS_MAX_ABS_USD=120 \
 ./scripts/monitor_ctl.sh restart
 ```
 
@@ -249,6 +306,8 @@ Applied takeaways currently implemented:
 - Reject brittle signals with a robustness gate across mean/sigma perturbations
 - Store audit fields so every entry can be inspected after the fact
 - Size entries with fractional Kelly + hard max-bet cap
+- Upgrade-capital rotation: replace weaker profitable positions when edge/EV uplift is large enough
+- Equity-linked compounding mode for next-day risk caps (bounded by safety min/max)
 - Keep full replayable snapshots for pseudo-backtest and diagnostics
 
 Kelly formula used (binary share):
