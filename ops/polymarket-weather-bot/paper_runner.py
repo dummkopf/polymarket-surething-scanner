@@ -194,10 +194,13 @@ class Config:
     request_timeout_sec: int = 20
 
     # Forecast model controls
-    forecast_ensemble_models: str = "gfs_seamless"
+    forecast_ensemble_models: str = "gfs_seamless,ecmwf_ifs025,icon_seamless"
     forecast_fallback_model: str = "gfs_seamless"
     ensemble_prob_shrink_alpha: float = 1.0
     ensemble_prob_shrink_beta: float = 1.0
+    min_model_family_count: int = 2
+    model_discrepancy_max: float = 0.25
+    fail_closed_on_empty_scan: bool = True
 
     # Ensemble robustness gate
     robustness_bootstrap_iters: int = 200
@@ -207,6 +210,18 @@ class Config:
     # use a conservative uplift of max(fixed_penalty, yes_spread * multiplier).
     no_synthetic_ask_penalty: float = 0.01
     no_synthetic_ask_spread_mult: float = 0.25
+
+    # Sanity gate for extreme single-tick opportunities.
+    # Very large one-shot edges are frequently caused by stale book/model mismatch,
+    # parser drift, or temporary data glitches. Block and review instead of auto-trading.
+    max_edge_sanity: float = 0.35
+    max_effective_net_edge_sanity: float = 0.30
+
+    # External-consensus guardrail (NO side):
+    # if an independent daily max forecast reaches contract bucket midpoint,
+    # do not open new NO exposure on that market.
+    external_no_consensus_gate_enabled: bool = True
+    external_no_consensus_margin_c: float = 0.0
 
     # Execution-cost model (paper -> live bridge)
     entry_fee_bps: float = 5.0
@@ -256,6 +271,12 @@ class Signal:
     sigma_c: float
     model_mode: str
     ensemble_member_count: int
+    model_family_count: int
+    model_prob_range: Optional[float]
+    model_family_probs: Dict[str, float]
+    model_discrepancy_block: bool
+    edge_sanity_block: bool
+    edge_sanity_reason: str
     p_yes_model_raw: float
     p_yes_model_post_shrink: float
     bucket_lower: Optional[float]
@@ -321,6 +342,17 @@ def temp_in_contract_bucket(temp_contract_unit: float, contract: ParsedContract)
     if upper is not None and temp_contract_unit >= float(upper):
         return False
     return True
+
+
+def contract_midpoint_temp_c(contract: ParsedContract) -> Optional[float]:
+    lower = contract.lower
+    upper = contract.upper
+    if lower is None or upper is None:
+        return None
+    mid = (float(lower) + float(upper)) / 2.0
+    if contract.unit == "F":
+        return (mid - 32.0) * 5.0 / 9.0
+    return mid
 
 
 def prob_yes_from_contract_ensemble(member_temps_c: List[float], contract: ParsedContract) -> float:
@@ -1100,6 +1132,88 @@ def fetch_forecast_max_temp_c(
     return value
 
 
+def fetch_external_consensus_max_temp_c(
+    city_slug: str,
+    target_date: str,
+    timeout_sec: int,
+    cache: Dict[Tuple[str, str], Optional[float]],
+    market: Optional[Dict[str, Any]] = None,
+    observed_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+    taf_cache: Optional[Dict[Tuple[str, str], Optional[float]]] = None,
+) -> Optional[float]:
+    """
+    Independent daily-max signal from Open-Meteo default consensus blend
+    (no explicit `models=` pin), then station-aware hardening (TAF / observed floor).
+    """
+    coord_key, coords, station_code = forecast_coords_for_market(
+        city_slug=city_slug,
+        target_date=target_date,
+        timeout_sec=timeout_sec,
+        market=market,
+    )
+    key = (coord_key, target_date)
+    if key in cache:
+        return cache[key]
+
+    if not coords:
+        cache[key] = None
+        return None
+
+    lat, lon = coords
+    value: Optional[float] = None
+    timezone_name = ""
+    try:
+        resp = requests.get(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "timezone": "auto",
+                "start_date": target_date,
+                "end_date": target_date,
+            },
+            timeout=timeout_sec,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        timezone_name = str(body.get("timezone") or "")
+        daily = body.get("daily") or {}
+        dates = daily.get("time") or []
+        temps = daily.get("temperature_2m_max") or []
+        value = parse_float({d: t for d, t in zip(dates, temps)}.get(target_date))
+    except Exception:
+        value = None
+
+    if station_code:
+        if taf_cache is None:
+            taf_cache = {}
+        taf_max = station_taf_max_c_for_date(
+            station_code=station_code,
+            target_date=target_date,
+            timeout_sec=timeout_sec,
+            cache=taf_cache,
+        )
+        if taf_max is not None:
+            value = float(taf_max) if value is None else max(float(value), float(taf_max))
+
+        if value is not None:
+            if observed_cache is None:
+                observed_cache = {}
+            observed_max = station_observed_max_c_so_far(
+                station_code=station_code,
+                target_date=target_date,
+                timezone_name=timezone_name,
+                timeout_sec=timeout_sec,
+                cache=observed_cache,
+            )
+            if observed_max is not None:
+                value = max(float(value), float(observed_max))
+
+    cache[key] = value
+    return value
+
+
 def prob_yes_from_contract(
     forecast_max_c: float,
     sigma_c: float,
@@ -1128,6 +1242,11 @@ def prob_yes_from_contract(
     return max(0.0, min(1.0, p))
 
 
+def configured_model_families(models_csv: str) -> List[str]:
+    vals = [str(x).strip() for x in str(models_csv or "").split(",")]
+    return [x for x in vals if x]
+
+
 def model_probability_for_market(
     parsed: ParsedContract,
     market: Dict[str, Any],
@@ -1148,22 +1267,39 @@ def model_probability_for_market(
         )
 
     fallback_sigma_c = sigma_by_horizon_days(horizon_days, parsed.city_slug)
+    model_families = configured_model_families(config.forecast_ensemble_models)
 
-    member_temps_c = fetch_ensemble_max_temps_c(
-        parsed.city_slug,
-        parsed.target_date,
-        config.request_timeout_sec,
-        ensemble_cache,
-        market=market,
-        observed_cache=observed_cache,
-        taf_cache=taf_cache,
-        models=config.forecast_ensemble_models,
-    )
+    family_member_map: Dict[str, List[float]] = {}
+    family_prob_map: Dict[str, float] = {}
+    merged_member_temps: List[float] = []
+    for family in model_families:
+        vals = fetch_ensemble_max_temps_c(
+            parsed.city_slug,
+            parsed.target_date,
+            config.request_timeout_sec,
+            ensemble_cache,
+            market=market,
+            observed_cache=observed_cache,
+            taf_cache=taf_cache,
+            models=family,
+        )
+        if not vals:
+            continue
+        vals_f = [float(x) for x in vals]
+        family_member_map[family] = vals_f
+        family_prob_map[family] = float(prob_yes_from_contract_ensemble(vals_f, parsed))
+        merged_member_temps.extend(vals_f)
 
     model_mode = "ensemble"
     ensemble_member_count = 0
+    model_family_count = len(family_prob_map)
+    model_prob_range: Optional[float] = None
+    model_discrepancy_block = False
+    model_discrepancy_reason = ""
+    member_temps_c: Optional[List[float]] = None
 
-    if member_temps_c:
+    if merged_member_temps:
+        member_temps_c = merged_member_temps
         ensemble_member_count = len(member_temps_c)
         forecast_max_c, sigma_c = ensemble_stats(member_temps_c, fallback_sigma_c)
         p_yes_model_raw = prob_yes_from_contract_ensemble(member_temps_c, parsed)
@@ -1173,6 +1309,15 @@ def model_probability_for_market(
             config.ensemble_prob_shrink_alpha,
             config.ensemble_prob_shrink_beta,
         )
+
+        if model_family_count >= 2:
+            model_prob_range = max(family_prob_map.values()) - min(family_prob_map.values())
+            if model_prob_range > float(config.model_discrepancy_max):
+                model_discrepancy_block = True
+                model_discrepancy_reason = "model_disagreement"
+        elif len(model_families) >= int(config.min_model_family_count):
+            model_discrepancy_block = True
+            model_discrepancy_reason = "insufficient_model_families"
     else:
         model_mode = "gaussian_fallback"
         forecast_max_c = fetch_forecast_max_temp_c(
@@ -1190,6 +1335,8 @@ def model_probability_for_market(
         sigma_c = fallback_sigma_c
         p_yes_model_raw = prob_yes_from_contract(forecast_max_c, sigma_c, parsed)
         p_yes_model_post_shrink = p_yes_model_raw
+        model_discrepancy_block = True
+        model_discrepancy_reason = "ensemble_unavailable_fallback_only"
 
     station_code = resolution_station_code_for_market(market)
     coord_key = f"station:{station_code}" if station_code else f"city:{parsed.city_slug}"
@@ -1205,6 +1352,11 @@ def model_probability_for_market(
         "sigma_c": float(max(0.05, sigma_c)),
         "model_mode": model_mode,
         "ensemble_member_count": int(ensemble_member_count),
+        "model_family_count": int(model_family_count),
+        "model_prob_range": (None if model_prob_range is None else float(model_prob_range)),
+        "model_family_probs": {k: float(v) for k, v in family_prob_map.items()},
+        "model_discrepancy_block": bool(model_discrepancy_block),
+        "model_discrepancy_reason": model_discrepancy_reason,
         "member_temps_c": member_temps_c,
         "p_yes_model_raw": float(p_yes_model_raw),
         "p_yes_model_post_shrink": float(p_yes_model_post_shrink),
@@ -1504,6 +1656,7 @@ def market_prices(
 def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, int]]:
     now = datetime.now(UTC)
     forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    external_consensus_cache: Dict[Tuple[str, str], Optional[float]] = {}
     ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]] = {}
     observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
     taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
@@ -1516,6 +1669,7 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         "future_window": 0,
         "model_ready": 0,
         "quality_pass": 0,
+        "edge_sanity_blocked": 0,
         "signals": 0,
     }
 
@@ -1622,11 +1776,26 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         sigma_c = float(model["sigma_c"])
         model_mode = str(model["model_mode"])
         ensemble_member_count = int(model["ensemble_member_count"])
+        model_family_count = int(model.get("model_family_count", 0))
+        model_prob_range = model.get("model_prob_range")
+        model_family_probs = dict(model.get("model_family_probs") or {})
+        model_discrepancy_block = bool(model.get("model_discrepancy_block", False))
+        model_discrepancy_reason = str(model.get("model_discrepancy_reason") or "")
         member_temps_c = model.get("member_temps_c")
         p_yes_model_raw = float(model["p_yes_model_raw"])
         p_yes_model_post_shrink = float(model["p_yes_model_post_shrink"])
         p_yes = float(model["p_yes"])
         observed_max_c = model.get("observed_max_c")
+
+        external_consensus_max_c = fetch_external_consensus_max_temp_c(
+            city_slug=parsed.city_slug,
+            target_date=parsed.target_date,
+            timeout_sec=config.request_timeout_sec,
+            cache=external_consensus_cache,
+            market=market,
+            observed_cache=observed_cache,
+            taf_cache=taf_cache,
+        )
 
         no_price_source = side_price_source_label(market, "NO")
         no_ask_effective = apply_no_ask_penalty(no_ask, no_price_source, yes_spread, config)
@@ -1678,24 +1847,59 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             and side_price <= config.tail_price_max
         )
 
+        net_edge = signal_net_edge(float(side_price), float(edge), config)
+        entry_spread_penalty = spread_penalty_for_entry(yes_spread, config)
+        effective_net_edge = net_edge - entry_spread_penalty
+
+        edge_sanity_reasons: List[str] = []
+        if float(edge) > float(config.max_edge_sanity):
+            edge_sanity_reasons.append(f"edge>{float(config.max_edge_sanity):.2f}")
+        if float(effective_net_edge) > float(config.max_effective_net_edge_sanity):
+            edge_sanity_reasons.append(
+                f"effective_net_edge>{float(config.max_effective_net_edge_sanity):.2f}"
+            )
+        edge_sanity_block = len(edge_sanity_reasons) > 0
+        edge_sanity_reason = ",".join(edge_sanity_reasons)
+
+        bucket_mid_c = contract_midpoint_temp_c(parsed)
+        external_no_consensus_block = False
+        external_no_consensus_reason = ""
+        if (
+            bool(config.external_no_consensus_gate_enabled)
+            and side == "NO"
+            and bucket_mid_c is not None
+            and external_consensus_max_c is not None
+        ):
+            threshold_c = float(bucket_mid_c) + float(config.external_no_consensus_margin_c)
+            if float(external_consensus_max_c) >= threshold_c:
+                external_no_consensus_block = True
+                external_no_consensus_reason = (
+                    f"external_consensus_max_c={float(external_consensus_max_c):.2f}>=bucket_mid_c={float(threshold_c):.2f}"
+                )
+
         category = None
-        if base_core and robustness["pass"]:
-            category = "core"
-        elif base_tail and robustness["pass"]:
-            category = "tail"
+        if not model_discrepancy_block and not edge_sanity_block and not external_no_consensus_block:
+            if base_core and robustness["pass"]:
+                category = "core"
+            elif base_tail and robustness["pass"]:
+                category = "tail"
 
         if category:
             brief = "meets quality + robustness gates"
+        elif model_discrepancy_block:
+            brief = f"fails model agreement gate ({model_discrepancy_reason})"
+        elif external_no_consensus_block:
+            brief = f"fails external NO consensus gate ({external_no_consensus_reason})"
+        elif edge_sanity_block:
+            brief = f"fails edge sanity gate ({edge_sanity_reason})"
         elif base_core or base_tail:
             brief = "fails robustness gate"
         else:
             brief = "reliable weather+odds, but below quality threshold"
 
-        net_edge = signal_net_edge(float(side_price), float(edge), config)
-        entry_spread_penalty = spread_penalty_for_entry(yes_spread, config)
-        effective_net_edge = net_edge - entry_spread_penalty
-
         no_ask_penalty_applied = no_ask_penalty_amount(no_price_source, yes_spread, config)
+        if edge_sanity_block:
+            counters["edge_sanity_blocked"] += 1
 
         candidate_row = {
             "slug": slug,
@@ -1715,6 +1919,17 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             "observed_max_c": (None if observed_max_c is None else round(float(observed_max_c), 6)),
             "model_mode": model_mode,
             "ensemble_member_count": int(ensemble_member_count),
+            "model_family_count": int(model_family_count),
+            "model_prob_range": (None if model_prob_range is None else round(float(model_prob_range), 6)),
+            "model_family_probs": {k: round(float(v), 6) for k, v in model_family_probs.items()},
+            "model_discrepancy_block": bool(model_discrepancy_block),
+            "model_discrepancy_reason": model_discrepancy_reason,
+            "edge_sanity_block": bool(edge_sanity_block),
+            "edge_sanity_reason": edge_sanity_reason,
+            "external_consensus_max_c": (None if external_consensus_max_c is None else round(float(external_consensus_max_c), 6)),
+            "bucket_mid_c": (None if bucket_mid_c is None else round(float(bucket_mid_c), 6)),
+            "external_no_consensus_block": bool(external_no_consensus_block),
+            "external_no_consensus_reason": external_no_consensus_reason,
             "p_yes_model_raw": round(float(p_yes_model_raw), 6),
             "p_yes_model_post_shrink": round(float(p_yes_model_post_shrink), 6),
             "p_yes_after_observed_constraints": round(float(p_yes), 6),
@@ -1776,6 +1991,12 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
             sigma_c=sigma_c,
             model_mode=model_mode,
             ensemble_member_count=ensemble_member_count,
+            model_family_count=model_family_count,
+            model_prob_range=(None if model_prob_range is None else float(model_prob_range)),
+            model_family_probs={k: float(v) for k, v in model_family_probs.items()},
+            model_discrepancy_block=bool(model_discrepancy_block),
+            edge_sanity_block=bool(edge_sanity_block),
+            edge_sanity_reason=edge_sanity_reason,
             p_yes_model_raw=p_yes_model_raw,
             p_yes_model_post_shrink=p_yes_model_post_shrink,
             bucket_lower=parsed.lower,
@@ -1805,6 +2026,19 @@ def build_signals(config: Config) -> Tuple[List[Signal], List[Dict[str, Any]], L
         reverse=True,
     )
     return signals, radar_rows, universe_rows, market_map, counters
+
+
+def degraded_reasons_from_scan(counters: Dict[str, int], config: Config) -> List[str]:
+    reasons: List[str] = []
+    if not bool(config.fail_closed_on_empty_scan):
+        return reasons
+    if int(counters.get("total_slugs", 0)) <= 0:
+        reasons.append("empty_scan_total_slugs")
+    if int(counters.get("fetched", 0)) <= 0:
+        reasons.append("empty_scan_fetched")
+    if int(counters.get("future_window", 0)) > 0 and int(counters.get("model_ready", 0)) <= 0:
+        reasons.append("no_model_ready_markets")
+    return reasons
 
 
 def load_state(path: Path) -> Dict[str, Any]:
@@ -2091,6 +2325,68 @@ def pending_exit_stats(open_positions: List[Dict[str, Any]]) -> Dict[str, float]
         "pending_exit_count": int(len(pending)),
         "pending_exit_exposure_usd": round(float(exposure), 6),
         "pending_exit_max_wait_min": round(float(max_wait), 3),
+    }
+
+
+def passive_apply_result(
+    state: Dict[str, Any],
+    market_map: Dict[str, Dict[str, Any]],
+    config: Config,
+    degraded_reasons: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    day_cn = today_cn_str()
+    realized_today = calc_realized_today(state.get("closed_positions", []), day_cn)
+    net_realized_today = calc_net_realized_today(state.get("closed_positions", []), day_cn)
+    realized_total = calc_realized_total(state.get("closed_positions", []))
+    net_realized_total = calc_net_realized_total(state.get("closed_positions", []))
+    unrealized = calc_unrealized(state.get("open_positions", []), market_map)
+    net_unrealized = calc_unrealized_net(state.get("open_positions", []), market_map, config)
+    bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + net_realized_total + net_unrealized)
+    effective_limits = derive_effective_risk_limits(config, bankroll_equity)
+    pending_stats = pending_exit_stats(state.get("open_positions", []))
+    daily_opened_notional_usd = calc_daily_opened_notional(
+        state.get("open_positions", []),
+        state.get("closed_positions", []),
+        day_cn,
+    )
+    daily_new_open_notional_cap_cfg = float(config.daily_new_open_notional_cap_usd)
+    daily_open_cap_enabled = daily_new_open_notional_cap_cfg > 0.0
+    daily_new_open_notional_cap_usd = max(0.0, daily_new_open_notional_cap_cfg)
+
+    return {
+        "opened": 0,
+        "skipped_existing": 0,
+        "blocked_by_risk": 0,
+        "blocked_by_cluster": 0,
+        "blocked_by_daily_open_cap": 0,
+        "blocked_by_confirm": 0,
+        "blocked_by_edge_gate": 0,
+        "blocked_by_kelly": 0,
+        "blocked_by_depth": 0,
+        "rotated_closed": 0,
+        "rotation_opened": 0,
+        "stop_triggered": False,
+        "degraded_mode": bool(degraded_reasons),
+        "degraded_reasons": list(degraded_reasons or []),
+        "realized_today": realized_today,
+        "net_realized_today": net_realized_today,
+        "realized_total": realized_total,
+        "net_realized_total": net_realized_total,
+        "unrealized": unrealized,
+        "net_unrealized": net_unrealized,
+        "bankroll_equity_usd": round(bankroll_equity, 6),
+        "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
+        "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
+        "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
+        "new_open_cap_mode": "daily_turnover" if daily_open_cap_enabled else "live_exposure",
+        "daily_opened_notional_usd": daily_opened_notional_usd,
+        "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
+        "daily_new_open_notional_left_usd": (
+            max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
+            if daily_open_cap_enabled
+            else None
+        ),
+        **pending_stats,
     }
 
 
@@ -2546,6 +2842,11 @@ def apply_paper_positions(
     rotated_closed = 0
     rotation_opened = 0
 
+    forecast_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    ensemble_cache: Dict[Tuple[str, str, str], Optional[List[float]]] = {}
+    observed_cache: Dict[Tuple[str, str], Optional[float]] = {}
+    taf_cache: Dict[Tuple[str, str], Optional[float]] = {}
+
     if stop_triggered:
         pending_stats = pending_exit_stats(open_positions)
         return {
@@ -2561,6 +2862,8 @@ def apply_paper_positions(
             "rotated_closed": 0,
             "rotation_opened": 0,
             "stop_triggered": True,
+            "degraded_mode": False,
+            "degraded_reasons": [],
             "realized_today": realized_today,
             "net_realized_today": net_realized_today,
             "realized_total": realized_total,
@@ -2842,6 +3145,12 @@ def apply_paper_positions(
             "entry_total_cost_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
             "entry_cost_remaining_usd": round(estimate_entry_cost_usd(size_usd, config), 6),
             "model_prob": round(s.side_prob, 6),
+            "model_mode": s.model_mode,
+            "ensemble_member_count": int(s.ensemble_member_count),
+            "model_family_count": int(s.model_family_count),
+            "model_prob_range": (None if s.model_prob_range is None else round(float(s.model_prob_range), 6)),
+            "model_family_probs": {k: round(float(v), 6) for k, v in s.model_family_probs.items()},
+            "model_discrepancy_block": bool(s.model_discrepancy_block),
             "edge": round(s.edge, 6),
             "net_edge": round(signal_net_edge(float(s.side_price), float(s.edge), config), 6),
             "spread_at_entry": (None if s.yes_spread is None else round(float(s.yes_spread), 6)),
@@ -2889,8 +3198,14 @@ def apply_paper_positions(
         if not m:
             return None, None, None, None
 
-        yes_bid, yes_ask, _, _, no_ask, _ = market_prices(m)
-        side_ask = yes_ask if side == "YES" else no_ask
+        yes_bid, yes_ask, yes_spread, _, no_ask, _ = market_prices(m)
+        no_ask_effective = apply_no_ask_penalty(
+            no_ask,
+            side_price_source_label(m, "NO"),
+            yes_spread,
+            config,
+        )
+        side_ask = yes_ask if side == "YES" else no_ask_effective
         mark_price = executable_exit_price_for_side(m, side)
 
         depth_shares: Optional[float] = None
@@ -2916,9 +3231,10 @@ def apply_paper_positions(
                 side=side,
                 market=m,
                 config=config,
-                forecast_cache={},
-                observed_cache={},
-                taf_cache={},
+                forecast_cache=forecast_cache,
+                ensemble_cache=ensemble_cache,
+                observed_cache=observed_cache,
+                taf_cache=taf_cache,
                 now=datetime.now(UTC),
             )
 
@@ -3184,6 +3500,9 @@ def summarize(
                     effective_net_edge_for_entry(float(s.side_price), float(s.edge), s.yes_spread, config),
                     6,
                 ),
+                "model_mode": s.model_mode,
+                "model_family_count": int(s.model_family_count),
+                "model_prob_range": (None if s.model_prob_range is None else round(float(s.model_prob_range), 6)),
                 "prob": round(s.side_prob, 6),
                 "price": round(s.side_price, 6),
                 "selection_score": round(signal_open_score(s, config), 8),
@@ -3228,6 +3547,8 @@ def summarize(
             "daily_new_open_notional_cap_usd": apply_result.get("daily_new_open_notional_cap_usd"),
             "daily_new_open_notional_left_usd": apply_result.get("daily_new_open_notional_left_usd"),
             "stop_triggered": bool(apply_result.get("stop_triggered", False)),
+            "degraded_mode": bool(apply_result.get("degraded_mode", False)),
+            "degraded_reasons": apply_result.get("degraded_reasons", []),
         },
     }
     return summary
@@ -3386,6 +3707,47 @@ def main() -> None:
         help="Max share of executable entry depth to consume per order (0..1)",
     )
     parser.add_argument(
+        "--forecast-ensemble-models",
+        default=None,
+        help="Comma-separated ensemble model families used for default probability input",
+    )
+    parser.add_argument(
+        "--forecast-fallback-model",
+        default=None,
+        help="Pinned deterministic model used only when ensemble data is unavailable",
+    )
+    parser.add_argument(
+        "--ensemble-prob-shrink-alpha",
+        type=float,
+        default=None,
+        help="Beta prior alpha used to shrink ensemble probability away from overconfidence",
+    )
+    parser.add_argument(
+        "--ensemble-prob-shrink-beta",
+        type=float,
+        default=None,
+        help="Beta prior beta used to shrink ensemble probability away from overconfidence",
+    )
+    parser.add_argument(
+        "--min-model-family-count",
+        type=int,
+        default=None,
+        help="Minimum number of individual model families required before a signal can pass",
+    )
+    parser.add_argument(
+        "--model-discrepancy-max",
+        type=float,
+        default=None,
+        help="Watch-only gate: if max(model_prob)-min(model_prob) exceeds this value, block the signal",
+    )
+    parser.add_argument(
+        "--fail-closed-on-empty-scan",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="If enabled, empty scans / zero-model-ready scans disable opens and rotations for the tick",
+    )
+    parser.add_argument(
         "--no-synthetic-ask-penalty",
         type=float,
         default=None,
@@ -3396,6 +3758,18 @@ def main() -> None:
         type=float,
         default=None,
         help="Additional NO synthetic ask penalty = yes_spread * multiplier",
+    )
+    parser.add_argument(
+        "--max-edge-sanity",
+        type=float,
+        default=None,
+        help="Watch-only gate: block abnormally large raw edge to prevent bug/staleness-driven entries",
+    )
+    parser.add_argument(
+        "--max-effective-net-edge-sanity",
+        type=float,
+        default=None,
+        help="Watch-only gate: block abnormally large effective net edge to prevent bug/staleness-driven entries",
     )
     parser.add_argument(
         "--robustness-mu-shift-c",
@@ -3591,10 +3965,28 @@ def main() -> None:
         config.min_open_size_usd = max(0.25, float(args.min_open_size_usd))
     if args.max_entry_participation is not None:
         config.max_entry_participation = min(1.0, max(0.01, float(args.max_entry_participation)))
+    if args.forecast_ensemble_models is not None:
+        config.forecast_ensemble_models = str(args.forecast_ensemble_models)
+    if args.forecast_fallback_model is not None:
+        config.forecast_fallback_model = str(args.forecast_fallback_model)
+    if args.ensemble_prob_shrink_alpha is not None:
+        config.ensemble_prob_shrink_alpha = max(0.0, float(args.ensemble_prob_shrink_alpha))
+    if args.ensemble_prob_shrink_beta is not None:
+        config.ensemble_prob_shrink_beta = max(0.0, float(args.ensemble_prob_shrink_beta))
+    if args.min_model_family_count is not None:
+        config.min_model_family_count = max(1, int(args.min_model_family_count))
+    if args.model_discrepancy_max is not None:
+        config.model_discrepancy_max = max(0.0, float(args.model_discrepancy_max))
+    if args.fail_closed_on_empty_scan is not None:
+        config.fail_closed_on_empty_scan = bool(int(args.fail_closed_on_empty_scan))
     if args.no_synthetic_ask_penalty is not None:
         config.no_synthetic_ask_penalty = max(0.0, float(args.no_synthetic_ask_penalty))
     if args.no_synthetic_ask_spread_mult is not None:
         config.no_synthetic_ask_spread_mult = max(0.0, float(args.no_synthetic_ask_spread_mult))
+    if args.max_edge_sanity is not None:
+        config.max_edge_sanity = max(0.0, float(args.max_edge_sanity))
+    if args.max_effective_net_edge_sanity is not None:
+        config.max_effective_net_edge_sanity = max(0.0, float(args.max_effective_net_edge_sanity))
     if args.robustness_mu_shift_c is not None:
         config.robustness_mu_shift_c = max(0.0, float(args.robustness_mu_shift_c))
     if args.robustness_sigma_scale_low is not None:
@@ -3659,67 +4051,23 @@ def main() -> None:
     signals, radar_rows, universe_rows, market_map, counters = build_signals(config)
 
     state = load_state(state_path)
-    update_signal_confirm_counts(state, signals)
+    degraded_reasons = degraded_reasons_from_scan(counters, config)
+    if not degraded_reasons:
+        update_signal_confirm_counts(state, signals)
 
     closed_new_expiry = close_expired_positions(state, market_map, config)
     closed_new_edge = 0
 
     if args.apply:
-        closed_new_edge = close_edge_decay_positions(state, signals, market_map, config)
-        apply_result = apply_paper_positions(state, signals, market_map, config)
+        if degraded_reasons:
+            apply_result = passive_apply_result(state, market_map, config, degraded_reasons)
+        else:
+            closed_new_edge = close_edge_decay_positions(state, signals, market_map, config)
+            apply_result = apply_paper_positions(state, signals, market_map, config)
+            apply_result["degraded_mode"] = False
+            apply_result["degraded_reasons"] = []
     else:
-        day_cn = today_cn_str()
-        realized_today = calc_realized_today(state.get("closed_positions", []), day_cn)
-        net_realized_today = calc_net_realized_today(state.get("closed_positions", []), day_cn)
-        realized_total = calc_realized_total(state.get("closed_positions", []))
-        net_realized_total = calc_net_realized_total(state.get("closed_positions", []))
-        unrealized = calc_unrealized(state.get("open_positions", []), market_map)
-        net_unrealized = calc_unrealized_net(state.get("open_positions", []), market_map, config)
-        bankroll_equity = max(1.0, float(config.paper_bankroll_usd) + net_realized_total + net_unrealized)
-        effective_limits = derive_effective_risk_limits(config, bankroll_equity)
-        pending_stats = pending_exit_stats(state.get("open_positions", []))
-        daily_opened_notional_usd = calc_daily_opened_notional(
-            state.get("open_positions", []),
-            state.get("closed_positions", []),
-            day_cn,
-        )
-        daily_new_open_notional_cap_cfg = float(config.daily_new_open_notional_cap_usd)
-        daily_open_cap_enabled = daily_new_open_notional_cap_cfg > 0.0
-        daily_new_open_notional_cap_usd = max(0.0, daily_new_open_notional_cap_cfg)
-
-        apply_result = {
-            "opened": 0,
-            "skipped_existing": 0,
-            "blocked_by_risk": 0,
-            "blocked_by_cluster": 0,
-            "blocked_by_daily_open_cap": 0,
-            "blocked_by_confirm": 0,
-            "blocked_by_edge_gate": 0,
-            "blocked_by_kelly": 0,
-            "blocked_by_depth": 0,
-            "rotated_closed": 0,
-            "rotation_opened": 0,
-            "stop_triggered": False,
-            "realized_today": realized_today,
-            "net_realized_today": net_realized_today,
-            "realized_total": realized_total,
-            "net_realized_total": net_realized_total,
-            "unrealized": unrealized,
-            "net_unrealized": net_unrealized,
-            "bankroll_equity_usd": round(bankroll_equity, 6),
-            "effective_trade_size_usd": effective_limits.get("trade_size_usd"),
-            "effective_max_open_exposure_usd": effective_limits.get("max_open_exposure_usd"),
-            "effective_daily_stop_loss_usd": effective_limits.get("daily_stop_loss_usd"),
-            "new_open_cap_mode": "daily_turnover" if daily_open_cap_enabled else "live_exposure",
-            "daily_opened_notional_usd": daily_opened_notional_usd,
-            "daily_new_open_notional_cap_usd": daily_new_open_notional_cap_usd,
-            "daily_new_open_notional_left_usd": (
-                max(0.0, daily_new_open_notional_cap_usd - daily_opened_notional_usd)
-                if daily_open_cap_enabled
-                else None
-            ),
-            **pending_stats,
-        }
+        apply_result = passive_apply_result(state, market_map, config, degraded_reasons)
 
     update_open_position_marks(state, market_map, config)
 
@@ -3729,6 +4077,7 @@ def main() -> None:
         "env_missing": missing,
         "scan_total": counters.get("total_slugs", 0),
         "signals": len(signals),
+        "degraded_reasons": degraded_reasons,
     }
 
     save_state(state_path, state)
@@ -3736,6 +4085,7 @@ def main() -> None:
     snapshot_payload = {
         "ts": iso_now(),
         "scan": counters,
+        "degraded_reasons": degraded_reasons,
         "signals": [asdict(s) for s in signals],
         "radar": radar_rows,
         "universe": universe_rows,
@@ -3753,6 +4103,7 @@ def main() -> None:
     )
     summary["env_missing_keys"] = missing
     summary["apply_mode"] = bool(args.apply)
+    summary["degraded_reasons"] = degraded_reasons
     summary["config"] = {
         "trade_size_usd": config.trade_size_usd,
         "max_open_exposure_usd": config.max_open_exposure_usd,
@@ -3773,6 +4124,13 @@ def main() -> None:
         "entry_spread_penalty_mult": config.entry_spread_penalty_mult,
         "min_open_size_usd": config.min_open_size_usd,
         "max_entry_participation": config.max_entry_participation,
+        "forecast_ensemble_models": config.forecast_ensemble_models,
+        "forecast_fallback_model": config.forecast_fallback_model,
+        "ensemble_prob_shrink_alpha": config.ensemble_prob_shrink_alpha,
+        "ensemble_prob_shrink_beta": config.ensemble_prob_shrink_beta,
+        "min_model_family_count": config.min_model_family_count,
+        "model_discrepancy_max": config.model_discrepancy_max,
+        "fail_closed_on_empty_scan": config.fail_closed_on_empty_scan,
         "robustness_mu_shift_c": config.robustness_mu_shift_c,
         "robustness_sigma_scale_low": config.robustness_sigma_scale_low,
         "robustness_sigma_scale_high": config.robustness_sigma_scale_high,
@@ -3796,6 +4154,10 @@ def main() -> None:
         "max_yes_spread": config.max_yes_spread,
         "no_synthetic_ask_penalty": config.no_synthetic_ask_penalty,
         "no_synthetic_ask_spread_mult": config.no_synthetic_ask_spread_mult,
+        "max_edge_sanity": config.max_edge_sanity,
+        "max_effective_net_edge_sanity": config.max_effective_net_edge_sanity,
+        "external_no_consensus_gate_enabled": config.external_no_consensus_gate_enabled,
+        "external_no_consensus_margin_c": config.external_no_consensus_margin_c,
         "entry_fee_bps": config.entry_fee_bps,
         "exit_fee_bps": config.exit_fee_bps,
         "entry_slippage_bps": config.entry_slippage_bps,

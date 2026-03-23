@@ -9,7 +9,7 @@ WorkingDirectory=/home/kai/.openclaw/workspace/ops/polymarket-weather-bot
 
 # Risk profile (can be overridden with systemctl --user edit ...)
 Environment=INTERVAL_SEC=900
-Environment=RUN_TIMEOUT_SEC=300
+Environment=RUN_TIMEOUT_SEC=420
 Environment=MIN_HOURS_TO_EXPIRY=0
 Environment=MAX_POSITIONS_PER_CITY=2
 Environment=MAX_EVENT_CLUSTER_EXPOSURE_USD=100
@@ -29,10 +29,21 @@ Environment=MIN_EDGE_FOR_ENTRY=0.10
 Environment=ENTRY_SPREAD_PENALTY_MULT=1.0
 Environment=MIN_OPEN_SIZE_USD=10
 Environment=MAX_ENTRY_PARTICIPATION=0.20
+Environment=FORECAST_ENSEMBLE_MODELS=gfs_seamless,ecmwf_ifs025,icon_seamless
+Environment=FORECAST_FALLBACK_MODEL=gfs_seamless
+Environment=ENSEMBLE_PROB_SHRINK_ALPHA=1.0
+Environment=ENSEMBLE_PROB_SHRINK_BETA=1.0
+Environment=MIN_MODEL_FAMILY_COUNT=2
+Environment=MODEL_DISCREPANCY_MAX=0.25
+Environment=FAIL_CLOSED_ON_EMPTY_SCAN=1
 Environment=ROBUSTNESS_MU_SHIFT_C=0.7
 Environment=ROBUSTNESS_SIGMA_SCALE_LOW=0.85
 Environment=ROBUSTNESS_SIGMA_SCALE_HIGH=1.15
-Environment=ROBUSTNESS_MIN_EDGE=0.0
+Environment=ROBUSTNESS_MIN_EDGE=0.01
+Environment=NO_SYNTHETIC_ASK_PENALTY=0.01
+Environment=NO_SYNTHETIC_ASK_SPREAD_MULT=0.25
+Environment=MAX_EDGE_SANITY=0.35
+Environment=MAX_EFFECTIVE_NET_EDGE_SANITY=0.30
 Environment=ENABLE_EDGE_ROTATION=1
 Environment=ROTATION_MIN_EDGE_DELTA=0.05
 Environment=ROTATION_MIN_EV_PER_USD_DELTA=0.08
