@@ -1,8 +1,8 @@
 scanner:
   hours_ahead: 72
-  price_min: 0.95
+  price_min: 0.92
   price_max: 0.99
-  min_depth_usd: 50.0
+  min_depth_usd: 10.0
   gamma_page_size: 100
   clob_pause_sec: 0.5
   stale_disagree_threshold: 0.05
