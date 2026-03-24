@@ -5,7 +5,7 @@ scanner:
   min_depth_usd: 10.0
   gamma_page_size: 100
   clob_pause_sec: 0.5
-  stale_disagree_threshold: 0.05
+  stale_disagree_threshold: 0.07
   filter_restricted: false
 
 output:
