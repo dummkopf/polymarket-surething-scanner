@@ -351,15 +351,30 @@ def update_paper_state(paper_state_path: Path, candidates: list[CandidateMarket]
 
     candidates_by_market = {c.market_id: c for c in candidates if c.market_id}
     opened_new = 0
+    added_existing = 0
 
     for mid, c in candidates_by_market.items():
-        if mid in existing:
-            continue
         entry = float(c.best_ask)
         if entry <= 0:
             continue
         size_usd = 1.0
-        shares = size_usd / entry
+        add_shares = size_usd / entry
+
+        if mid in existing:
+            p = existing[mid]
+            old_shares = float(p.get("shares", 0) or 0)
+            old_size = float(p.get("size_usd", 0) or 0)
+            new_shares = old_shares + add_shares
+            new_size = old_size + size_usd
+            avg_entry = (old_size + size_usd) / new_shares if new_shares > 0 else entry
+
+            p["shares"] = round(new_shares, 8)
+            p["size_usd"] = round(new_size, 2)
+            p["entry_price"] = round(avg_entry, 4)
+            p["last_added_at"] = now_iso
+            added_existing += 1
+            continue
+
         positions.append(
             {
                 "market_id": c.market_id,
@@ -369,13 +384,12 @@ def update_paper_state(paper_state_path: Path, candidates: list[CandidateMarket]
                 "opened_at": now_iso,
                 "entry_price": round(entry, 4),
                 "size_usd": round(size_usd, 2),
-                "shares": round(shares, 8),
+                "shares": round(add_shares, 8),
                 "last_mark": round(entry, 4),
                 "unrealized_pnl": 0.0,
             }
         )
         opened_new += 1
-
     # update marks + pnl using latest candidate best ask if available
     total_invested = 0.0
     total_unrealized = 0.0
@@ -393,16 +407,20 @@ def update_paper_state(paper_state_path: Path, candidates: list[CandidateMarket]
         total_invested += size_usd
         total_unrealized += pnl
 
+    orders_this_run = opened_new + added_existing
+
     state["positions"] = positions
     state["last_run"] = now_iso
     daily_orders = state.setdefault("daily_orders", {})
-    daily_orders[day_key] = int(daily_orders.get(day_key, 0)) + opened_new
+    daily_orders[day_key] = int(daily_orders.get(day_key, 0)) + orders_this_run
     state["totals"] = {
         "positions": len(positions),
         "invested_usd": round(total_invested, 2),
         "unrealized_pnl_usd": round(total_unrealized, 4),
         "equity_usd": round(total_invested + total_unrealized, 4),
         "opened_new_this_run": opened_new,
+        "added_existing_this_run": added_existing,
+        "orders_this_run": orders_this_run,
         "opened_today": int(daily_orders.get(day_key, 0)),
     }
 

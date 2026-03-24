@@ -1,9 +1,9 @@
 {
-  "scanned_at": "2026-03-24T00:31:42.695962+00:00",
-  "total_scanned": 0,
+  "scanned_at": "2026-03-24T00:35:20.745452+00:00",
+  "total_scanned": 35362,
   "quick_pass_count": 0,
   "candidates_count": 0,
   "stale_skips": 0,
-  "restricted_skips": 0,
+  "restricted_skips": 35308,
   "crypto_skips": 0
 }

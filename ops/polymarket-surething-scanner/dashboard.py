@@ -82,7 +82,9 @@ small {{ color: #9fb0db; }}
 <div>Total invested: ${totals.get('invested_usd', 'NA')}</div>
 <div>Unrealized PnL: ${totals.get('unrealized_pnl_usd', 'NA')}</div>
 <div>Paper equity: ${totals.get('equity_usd', 'NA')}</div>
-<div>Opened this run: {totals.get('opened_new_this_run', 'NA')}</div>
+<div>Orders this run ($1 each): {totals.get('orders_this_run', totals.get('opened_new_this_run', 'NA'))}</div>
+<div>New markets this run: {totals.get('opened_new_this_run', 'NA')}</div>
+<div>Adds to existing this run: {totals.get('added_existing_this_run', 'NA')}</div>
 </div>
 <div class='card'>
 <table>
