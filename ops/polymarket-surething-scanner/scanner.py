@@ -206,11 +206,13 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     min_depth = float(sc["min_depth_usd"])
     page_size = int(sc["gamma_page_size"])
     stale_threshold = float(sc.get("stale_disagree_threshold", 0.05))
+    filter_restricted = bool(sc.get("filter_restricted", False))
 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
     stale_skips = 0
     restricted_skips = 0
+    restricted_seen = 0
     crypto_skips = 0
 
     async with httpx.AsyncClient() as client:
@@ -220,8 +222,10 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
             if m.get("closed") or not m.get("active") or not m.get("enableOrderBook"):
                 continue
             if is_restricted_market(m):
-                restricted_skips += 1
-                continue
+                restricted_seen += 1
+                if filter_restricted:
+                    restricted_skips += 1
+                    continue
             if is_crypto_market(m):
                 crypto_skips += 1
                 continue
@@ -306,8 +310,10 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
         "quick_pass_count": len(quick_pass),
         "candidates_count": len(candidates),
         "stale_skips": stale_skips,
+        "restricted_seen": restricted_seen,
         "restricted_skips": restricted_skips,
         "crypto_skips": crypto_skips,
+        "filter_restricted": filter_restricted,
     }
     return candidates, metrics
 

@@ -6,6 +6,7 @@ scanner:
   gamma_page_size: 100
   clob_pause_sec: 0.5
   stale_disagree_threshold: 0.05
+  filter_restricted: false
 
 output:
   candidates_json: state/latest_candidates.json

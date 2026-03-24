@@ -66,6 +66,7 @@ small {{ color: #9fb0db; }}
 <div><strong>Quick-pass markets:</strong> {metrics.get('quick_pass_count', 'NA')}</div>
 <div><strong>Candidates:</strong> {metrics.get('candidates_count', len(candidates))}</div>
 <div><strong>Book/price stale skips:</strong> {metrics.get('stale_skips', 'NA')}</div>
+<div><strong>Restricted seen:</strong> {metrics.get('restricted_seen', 'NA')}</div>
 <div><strong>Restricted skips:</strong> {metrics.get('restricted_skips', 'NA')}</div>
 <div><strong>Crypto skips:</strong> {metrics.get('crypto_skips', 'NA')}</div>
 </div>
