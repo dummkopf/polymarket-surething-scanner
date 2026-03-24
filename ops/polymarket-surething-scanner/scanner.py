@@ -14,10 +14,20 @@ from models import CandidateMarket
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
+CST = timezone(timedelta(hours=8))
 
 
 def load_config(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
 def parse_json_field(value: Any, default: list[Any] | None = None) -> list[Any]:
@@ -291,16 +301,137 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     return candidates, metrics
 
 
+def update_daily_stats(daily_stats_path: Path, candidates: list[CandidateMarket]) -> dict[str, Any]:
+    now_cst = datetime.now(CST)
+    day_key = now_cst.strftime("%Y-%m-%d")
+
+    state = load_json(daily_stats_path, {"by_day": {}})
+    by_day = state.setdefault("by_day", {})
+    day = by_day.setdefault(
+        day_key,
+        {
+            "scans": 0,
+            "total_candidates_seen": 0,
+            "latest_candidates_count": 0,
+            "unique_market_ids": [],
+            "orders_placed": 0,
+        },
+    )
+
+    day["scans"] = int(day.get("scans", 0)) + 1
+    day["latest_candidates_count"] = len(candidates)
+    day["total_candidates_seen"] = int(day.get("total_candidates_seen", 0)) + len(candidates)
+
+    unique_ids = set(day.get("unique_market_ids", []))
+    unique_ids.update(c.market_id for c in candidates if c.market_id)
+    day["unique_market_ids"] = sorted(unique_ids)
+    day["unique_candidates_count"] = len(day["unique_market_ids"])
+
+    daily_stats_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
+
+
+def update_paper_state(paper_state_path: Path, candidates: list[CandidateMarket], daily_stats_state: dict[str, Any]) -> dict[str, Any]:
+    now_cst = datetime.now(CST)
+    now_iso = now_cst.isoformat()
+    day_key = now_cst.strftime("%Y-%m-%d")
+
+    state = load_json(
+        paper_state_path,
+        {
+            "positions": [],
+            "totals": {},
+            "last_run": None,
+            "daily_orders": {},
+            "order_size_usd": 1.0,
+        },
+    )
+    positions = state.setdefault("positions", [])
+    existing = {str(p.get("market_id", "")): p for p in positions}
+
+    candidates_by_market = {c.market_id: c for c in candidates if c.market_id}
+    opened_new = 0
+
+    for mid, c in candidates_by_market.items():
+        if mid in existing:
+            continue
+        entry = float(c.best_ask)
+        if entry <= 0:
+            continue
+        size_usd = 1.0
+        shares = size_usd / entry
+        positions.append(
+            {
+                "market_id": c.market_id,
+                "token_id": c.token_id,
+                "question": c.question,
+                "slug": c.slug,
+                "opened_at": now_iso,
+                "entry_price": round(entry, 4),
+                "size_usd": round(size_usd, 2),
+                "shares": round(shares, 8),
+                "last_mark": round(entry, 4),
+                "unrealized_pnl": 0.0,
+            }
+        )
+        opened_new += 1
+
+    # update marks + pnl using latest candidate best ask if available
+    total_invested = 0.0
+    total_unrealized = 0.0
+    for p in positions:
+        mid = str(p.get("market_id", ""))
+        c = candidates_by_market.get(mid)
+        if c is not None:
+            p["last_mark"] = round(float(c.best_ask), 4)
+        entry = float(p.get("entry_price", 0) or 0)
+        mark = float(p.get("last_mark", entry) or entry)
+        shares = float(p.get("shares", 0) or 0)
+        size_usd = float(p.get("size_usd", 0) or 0)
+        pnl = (mark - entry) * shares
+        p["unrealized_pnl"] = round(pnl, 4)
+        total_invested += size_usd
+        total_unrealized += pnl
+
+    state["positions"] = positions
+    state["last_run"] = now_iso
+    daily_orders = state.setdefault("daily_orders", {})
+    daily_orders[day_key] = int(daily_orders.get(day_key, 0)) + opened_new
+    state["totals"] = {
+        "positions": len(positions),
+        "invested_usd": round(total_invested, 2),
+        "unrealized_pnl_usd": round(total_unrealized, 4),
+        "equity_usd": round(total_invested + total_unrealized, 4),
+        "opened_new_this_run": opened_new,
+        "opened_today": int(daily_orders.get(day_key, 0)),
+    }
+
+    # sync daily order count into daily stats view
+    by_day = daily_stats_state.setdefault("by_day", {})
+    day = by_day.setdefault(day_key, {})
+    day["orders_placed"] = int(daily_orders.get(day_key, 0))
+
+    paper_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
+
+
 def persist_outputs(base_dir: Path, config: dict[str, Any], candidates: list[CandidateMarket], metrics: dict[str, Any]) -> None:
     out = config["output"]
     candidates_path = (base_dir / out["candidates_json"]).resolve()
     metrics_path = (base_dir / out["metrics_json"]).resolve()
     dashboard_path = (base_dir / out["dashboard_html"]).resolve()
+    paper_state_path = (base_dir / out.get("paper_state_json", "state/paper_state.json")).resolve()
+    daily_stats_path = (base_dir / out.get("daily_stats_json", "state/daily_stats.json")).resolve()
 
     candidates_path.parent.mkdir(parents=True, exist_ok=True)
     candidates_path.write_text(json.dumps([c.to_dict() for c in candidates], ensure_ascii=False, indent=2), encoding="utf-8")
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-    render_dashboard(candidates_path, metrics_path, dashboard_path)
+
+    daily_stats_state = update_daily_stats(daily_stats_path, candidates)
+    update_paper_state(paper_state_path, candidates, daily_stats_state)
+    daily_stats_path.write_text(json.dumps(daily_stats_state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    render_dashboard(candidates_path, metrics_path, dashboard_path, paper_state_path, daily_stats_path)
 
 
 def main() -> None:
