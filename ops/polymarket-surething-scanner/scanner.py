@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -89,20 +90,13 @@ def is_crypto_market(m: dict[str, Any]) -> bool:
                 ]
             ).lower()
 
-    crypto_tokens = [
-        "crypto",
-        "bitcoin",
-        "btc",
-        "ethereum",
-        "eth",
-        "solana",
-        "sol",
-        "doge",
-        "xrp",
-        "ada",
-        "bnb",
-    ]
-    return any(t in hay for t in crypto_tokens)
+    # Use token-level matching for short tickers (btc/eth/sol/xrp/ada/bnb)
+    # to avoid substring false positives (e.g. "whether" contains "eth").
+    tokens = set(re.findall(r"[a-z0-9]+", hay))
+    crypto_words = ["crypto", "bitcoin", "ethereum", "solana", "doge", "cardano", "ripple"]
+    crypto_tickers = {"btc", "eth", "sol", "xrp", "ada", "bnb"}
+
+    return any(w in hay for w in crypto_words) or any(t in tokens for t in crypto_tickers)
 
 
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
