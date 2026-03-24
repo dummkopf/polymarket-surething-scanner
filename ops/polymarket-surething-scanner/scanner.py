@@ -272,6 +272,16 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
             if not end_date:
                 continue
 
+            events = m.get("events") if isinstance(m.get("events"), list) else []
+            event_slug = ""
+            if events and isinstance(events[0], dict):
+                event_slug = str(events[0].get("slug") or "")
+            if not event_slug:
+                event_slug = str(m.get("eventSlug") or "")
+            if not event_slug:
+                # Fallback for single-market events where market slug == event slug.
+                event_slug = str(m.get("slug") or "")
+
             candidates.append(
                 CandidateMarket(
                     market_id=str(m.get("id", "")),
@@ -286,6 +296,7 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                     category_tag=str(m.get("category", "")),
                     volume=float(m.get("volume", 0) or 0),
                     slug=str(m.get("slug", "")),
+                    event_slug=event_slug,
                 )
             )
 

@@ -28,7 +28,8 @@ def render_dashboard(
 
     rows = []
     for c in candidates:
-        market_url = f"https://polymarket.com/event/{c.get('slug', '')}" if c.get("slug") else ""
+        event_slug = c.get("event_slug") or c.get("slug") or ""
+        market_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
         rows.append(
             "<tr>"
             f"<td><a href='{html.escape(market_url)}' target='_blank'>open</a></td>"

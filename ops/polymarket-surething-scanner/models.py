@@ -19,6 +19,7 @@ class CandidateMarket:
     category_tag: str
     volume: float
     slug: str
+    event_slug: str
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
