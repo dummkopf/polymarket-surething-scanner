@@ -43,6 +43,58 @@ def parse_iso(ts: str | None) -> datetime | None:
         return None
 
 
+def is_restricted_market(m: dict[str, Any]) -> bool:
+    if bool(m.get("restricted", False)):
+        return True
+    events = m.get("events")
+    if isinstance(events, list):
+        for e in events:
+            if isinstance(e, dict) and bool(e.get("restricted", False)):
+                return True
+    return False
+
+
+def is_crypto_market(m: dict[str, Any]) -> bool:
+    hay = " ".join(
+        [
+            str(m.get("category", "")),
+            str(m.get("slug", "")),
+            str(m.get("question", "")),
+            str(m.get("description", "")),
+            str(m.get("seriesSlug", "")),
+        ]
+    ).lower()
+
+    events = m.get("events")
+    if isinstance(events, list):
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            hay += " " + " ".join(
+                [
+                    str(e.get("slug", "")),
+                    str(e.get("title", "")),
+                    str(e.get("seriesSlug", "")),
+                    str(e.get("ticker", "")),
+                ]
+            ).lower()
+
+    crypto_tokens = [
+        "crypto",
+        "bitcoin",
+        "btc",
+        "ethereum",
+        "eth",
+        "solana",
+        "sol",
+        "doge",
+        "xrp",
+        "ada",
+        "bnb",
+    ]
+    return any(t in hay for t in crypto_tokens)
+
+
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
     all_markets: list[dict[str, Any]] = []
     offset = 0
@@ -148,12 +200,20 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
     stale_skips = 0
+    restricted_skips = 0
+    crypto_skips = 0
 
     async with httpx.AsyncClient() as client:
         markets = await fetch_markets(client, page_size)
 
         for m in markets:
             if m.get("closed") or not m.get("active") or not m.get("enableOrderBook"):
+                continue
+            if is_restricted_market(m):
+                restricted_skips += 1
+                continue
+            if is_crypto_market(m):
+                crypto_skips += 1
                 continue
             end_date = parse_iso(m.get("endDate"))
             if not end_date:
@@ -225,6 +285,8 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
         "quick_pass_count": len(quick_pass),
         "candidates_count": len(candidates),
         "stale_skips": stale_skips,
+        "restricted_skips": restricted_skips,
+        "crypto_skips": crypto_skips,
     }
     return candidates, metrics
 
