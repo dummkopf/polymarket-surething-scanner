@@ -20,6 +20,7 @@ class CandidateMarket:
     volume: float
     slug: str
     event_slug: str
+    restricted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

@@ -1,3 +1,18 @@
+runtime:
+  mode: paper
+  state_root: state/runtime
+  execution_defaults:
+    confirm_scans_required: 2
+    order_size_usd: 1.0
+    max_position_usd_per_market: 5.0
+    max_total_exposure_usd: 20.0
+    max_open_positions: 10
+    max_orders_per_run: 1
+    max_daily_orders: 10
+    min_minutes_to_expiry: 90
+    min_depth_multiple: 8.0
+    allow_add_to_existing: false
+
 scanner:
   hours_ahead: 72
   price_min: 0.92
@@ -7,8 +22,56 @@ scanner:
   clob_pause_sec: 0.5
   stale_disagree_threshold: 0.07
   filter_restricted: false
+  exclude_crypto: true
+  exclude_stock_related: true
+  exclude_sports_related: true
+
+paper:
+  order_size_usd: 1.0
+  max_position_usd_per_market: 50.0
+  max_total_exposure_usd: 50.0
+  max_open_positions: 50
+  max_orders_per_run: 10
+  max_daily_orders: 999
+
+shadow:
+  order_size_usd: 2.0
+  max_position_usd_per_market: 10.0
+  max_total_exposure_usd: 25.0
+  max_open_positions: 10
+  max_orders_per_run: 2
+  max_daily_orders: 10
+
+live:
+  enabled: false
+  env_file: .env.live
+  require_env_live_enabled: true
+  order_size_usd: 2.0
+  max_position_usd_per_market: 10.0
+  max_total_exposure_usd: 25.0
+  max_open_positions: 10
+  max_orders_per_run: 1
+  max_daily_orders: 6
+  min_minutes_to_expiry: 120
+  min_depth_multiple: 12.0
+  allow_add_to_existing: false
+  order_type: FOK
+  post_only: false
+  signature_type: 0
+  min_collateral_balance_usd: 5.0
+  require_empty_open_orders: true
+  max_consecutive_errors: 3
+
+risk:
+  # Global guardrails applied before any execution mode-specific overrides.
+  confirm_scans_required: 2
+  min_minutes_to_expiry: 90
+  min_depth_multiple: 8.0
+  allow_add_to_existing: false
 
 output:
   candidates_json: state/latest_candidates.json
   metrics_json: state/scan_metrics.json
   dashboard_html: state/dashboard.html
+  paper_state_json: state/paper_state.json
+  daily_stats_json: state/daily_stats.json

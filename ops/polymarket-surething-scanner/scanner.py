@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import re
@@ -12,23 +13,14 @@ import yaml
 
 from dashboard import render_dashboard
 from models import CandidateMarket
+from trading import run_trading_cycle
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
-CST = timezone(timedelta(hours=8))
 
 
 def load_config(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
-
-
-def load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
 
 
 def parse_json_field(value: Any, default: list[Any] | None = None) -> list[Any]:
@@ -54,49 +46,123 @@ def parse_iso(ts: str | None) -> datetime | None:
         return None
 
 
-def is_restricted_market(m: dict[str, Any]) -> bool:
-    if bool(m.get("restricted", False)):
+def is_restricted_market(market: dict[str, Any]) -> bool:
+    if bool(market.get("restricted", False)):
         return True
-    events = m.get("events")
+    events = market.get("events")
     if isinstance(events, list):
-        for e in events:
-            if isinstance(e, dict) and bool(e.get("restricted", False)):
+        for event in events:
+            if isinstance(event, dict) and bool(event.get("restricted", False)):
                 return True
     return False
 
 
-def is_crypto_market(m: dict[str, Any]) -> bool:
+def build_market_haystack(market: dict[str, Any]) -> str:
     hay = " ".join(
         [
-            str(m.get("category", "")),
-            str(m.get("slug", "")),
-            str(m.get("question", "")),
-            str(m.get("description", "")),
-            str(m.get("seriesSlug", "")),
+            str(market.get("category", "")),
+            str(market.get("slug", "")),
+            str(market.get("question", "")),
+            str(market.get("description", "")),
+            str(market.get("seriesSlug", "")),
         ]
     ).lower()
 
-    events = m.get("events")
+    events = market.get("events")
     if isinstance(events, list):
-        for e in events:
-            if not isinstance(e, dict):
+        for event in events:
+            if not isinstance(event, dict):
                 continue
             hay += " " + " ".join(
                 [
-                    str(e.get("slug", "")),
-                    str(e.get("title", "")),
-                    str(e.get("seriesSlug", "")),
-                    str(e.get("ticker", "")),
+                    str(event.get("slug", "")),
+                    str(event.get("title", "")),
+                    str(event.get("seriesSlug", "")),
+                    str(event.get("ticker", "")),
                 ]
             ).lower()
+    return hay
 
-    # Use token-level matching for short tickers (btc/eth/sol/xrp/ada/bnb)
-    # to avoid substring false positives (e.g. "whether" contains "eth").
+
+def is_crypto_market(market: dict[str, Any]) -> bool:
+    hay = build_market_haystack(market)
     tokens = set(re.findall(r"[a-z0-9]+", hay))
     crypto_words = ["crypto", "bitcoin", "ethereum", "solana", "doge", "cardano", "ripple"]
     crypto_tickers = {"btc", "eth", "sol", "xrp", "ada", "bnb"}
+    return any(word in hay for word in crypto_words) or any(token in tokens for token in crypto_tickers)
 
-    return any(w in hay for w in crypto_words) or any(t in tokens for t in crypto_tickers)
+
+def is_stock_related_market(market: dict[str, Any]) -> bool:
+    hay = build_market_haystack(market)
+    tokens = set(re.findall(r"[a-z0-9]+", hay))
+    stock_words = {
+        "stock",
+        "stocks",
+        "share",
+        "shares",
+        "equity",
+        "equities",
+        "nasdaq",
+        "nyse",
+        "s&p",
+        "sp500",
+        "dow",
+        "dowjones",
+        "earnings",
+        "ipo",
+        "etf",
+        "tesla",
+        "nvidia",
+        "apple",
+        "microsoft",
+        "amazon",
+        "meta",
+        "google",
+        "alphabet",
+        "amd",
+        "netflix",
+    }
+    stock_phrases = ["stock market", "share price", "earnings report", "earnings call"]
+    return any(phrase in hay for phrase in stock_phrases) or any(token in tokens for token in stock_words)
+
+
+def is_sports_related_market(market: dict[str, Any]) -> bool:
+    hay = build_market_haystack(market)
+    tokens = set(re.findall(r"[a-z0-9]+", hay))
+    sports_words = {
+        "sport",
+        "sports",
+        "nba",
+        "nfl",
+        "mlb",
+        "nhl",
+        "ufc",
+        "fifa",
+        "uefa",
+        "champions",
+        "premier",
+        "league",
+        "laliga",
+        "bundesliga",
+        "serie",
+        "tennis",
+        "golf",
+        "soccer",
+        "football",
+        "baseball",
+        "basketball",
+        "hockey",
+        "cricket",
+        "rugby",
+        "match",
+        "tournament",
+        "playoff",
+        "finals",
+        "worldcup",
+        "olympics",
+    }
+    sports_phrases = ["super bowl", "world cup", "grand slam", "stanley cup"]
+    return any(phrase in hay for phrase in sports_phrases) or any(token in tokens for token in sports_words)
 
 
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
@@ -104,13 +170,13 @@ async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[
     offset = 0
     while True:
         try:
-            r = await client.get(
+            response = await client.get(
                 f"{GAMMA_BASE}/markets",
                 params={"closed": "false", "active": "true", "limit": page_size, "offset": offset},
                 timeout=20,
             )
-            r.raise_for_status()
-            batch = r.json()
+            response.raise_for_status()
+            batch = response.json()
             if not isinstance(batch, list) or not batch:
                 break
             all_markets.extend(batch)
@@ -120,43 +186,43 @@ async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[
     return all_markets
 
 
-async def fetch_books(client: httpx.AsyncClient, token_ids: list[str]) -> dict[str, dict[str, Any]]:
+async def fetch_books(client: httpx.AsyncClient, token_ids: list[str], pause_sec: float) -> dict[str, dict[str, Any]]:
     books: dict[str, dict[str, Any]] = {}
     if not token_ids:
         return books
 
-    chunk = 60
-    for i in range(0, len(token_ids), chunk):
-        sub = token_ids[i : i + chunk]
+    chunk_size = 60
+    for start in range(0, len(token_ids), chunk_size):
+        batch = token_ids[start : start + chunk_size]
         try:
-            r = await client.post(
+            response = await client.post(
                 f"{CLOB_BASE}/books",
-                json=[{"token_id": t} for t in sub],
+                json=[{"token_id": token_id} for token_id in batch],
                 timeout=30,
             )
-            r.raise_for_status()
-            payload = r.json()
+            response.raise_for_status()
+            payload = response.json()
             if isinstance(payload, list):
                 for item in payload:
                     token = item.get("asset_id") or item.get("token_id")
                     if token:
                         books[str(token)] = item
             elif isinstance(payload, dict):
-                for k, v in payload.items():
-                    books[str(k)] = v
+                for key, value in payload.items():
+                    books[str(key)] = value
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(max(0.0, pause_sec))
     return books
 
 
 async def fetch_price(client: httpx.AsyncClient, token_id: str) -> float | None:
     try:
-        r = await client.get(f"{CLOB_BASE}/price", params={"token_id": token_id, "side": "BUY"}, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        p = data.get("price") if isinstance(data, dict) else None
-        return float(p) if p is not None else None
+        response = await client.get(f"{CLOB_BASE}/price", params={"token_id": token_id, "side": "BUY"}, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+        price = payload.get("price") if isinstance(payload, dict) else None
+        return float(price) if price is not None else None
     except Exception:
         return None
 
@@ -166,9 +232,9 @@ def get_best_ask(book: dict[str, Any]) -> float | None:
     if not isinstance(asks, list) or not asks:
         return None
     prices = []
-    for a in asks:
+    for ask in asks:
         try:
-            prices.append(float(a.get("price")))
+            prices.append(float(ask.get("price")))
         except Exception:
             continue
     return min(prices) if prices else None
@@ -179,28 +245,32 @@ def depth_usd_upto(book: dict[str, Any], max_price: float) -> float:
     if not isinstance(asks, list):
         return 0.0
     total_notional = 0.0
-    for a in asks:
+    for ask in asks:
         try:
-            p = float(a.get("price"))
-            s = float(a.get("size"))
-            if p <= max_price:
-                total_notional += p * s
+            price = float(ask.get("price"))
+            size = float(ask.get("size"))
+            if price <= max_price:
+                total_notional += price * size
         except Exception:
             continue
     return total_notional
 
 
 async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, Any]]:
-    cfg = load_config(config_path)
-    sc = cfg["scanner"]
+    config = load_config(config_path)
+    scanner_cfg = config["scanner"]
 
-    horizon = datetime.now(timezone.utc) + timedelta(hours=float(sc["hours_ahead"]))
-    price_min = float(sc["price_min"])
-    price_max = float(sc["price_max"])
-    min_depth = float(sc["min_depth_usd"])
-    page_size = int(sc["gamma_page_size"])
-    stale_threshold = float(sc.get("stale_disagree_threshold", 0.05))
-    filter_restricted = bool(sc.get("filter_restricted", False))
+    horizon = datetime.now(timezone.utc) + timedelta(hours=float(scanner_cfg["hours_ahead"]))
+    price_min = float(scanner_cfg["price_min"])
+    price_max = float(scanner_cfg["price_max"])
+    min_depth = float(scanner_cfg["min_depth_usd"])
+    page_size = int(scanner_cfg["gamma_page_size"])
+    pause_sec = float(scanner_cfg.get("clob_pause_sec", 0.5))
+    stale_threshold = float(scanner_cfg.get("stale_disagree_threshold", 0.05))
+    filter_restricted = bool(scanner_cfg.get("filter_restricted", False))
+    exclude_crypto = bool(scanner_cfg.get("exclude_crypto", True))
+    exclude_stock_related = bool(scanner_cfg.get("exclude_stock_related", True))
+    exclude_sports_related = bool(scanner_cfg.get("exclude_sports_related", True))
 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
@@ -208,30 +278,40 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     restricted_skips = 0
     restricted_seen = 0
     crypto_skips = 0
+    stock_skips = 0
+    sports_skips = 0
 
     async with httpx.AsyncClient() as client:
         markets = await fetch_markets(client, page_size)
 
-        for m in markets:
-            if m.get("closed") or not m.get("active") or not m.get("enableOrderBook"):
+        for market in markets:
+            if market.get("closed") or not market.get("active") or not market.get("enableOrderBook"):
                 continue
-            if is_restricted_market(m):
+            restricted = is_restricted_market(market)
+            if restricted:
                 restricted_seen += 1
                 if filter_restricted:
                     restricted_skips += 1
                     continue
-            if is_crypto_market(m):
+            if exclude_crypto and is_crypto_market(market):
                 crypto_skips += 1
                 continue
-            end_date = parse_iso(m.get("endDate"))
+            if exclude_stock_related and is_stock_related_market(market):
+                stock_skips += 1
+                continue
+            if exclude_sports_related and is_sports_related_market(market):
+                sports_skips += 1
+                continue
+
+            end_date = parse_iso(market.get("endDate"))
             if not end_date:
                 continue
             now = datetime.now(timezone.utc)
             if end_date <= now or end_date > horizon:
                 continue
 
-            prices = parse_json_field(m.get("outcomePrices"))
-            token_ids = parse_json_field(m.get("clobTokenIds"))
+            prices = parse_json_field(market.get("outcomePrices"))
+            token_ids = parse_json_field(market.get("clobTokenIds"))
             if len(prices) < 1 or len(token_ids) < 1:
                 continue
 
@@ -243,234 +323,133 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
             if yes_price < 0.90 or yes_price > 0.98:
                 continue
 
-            quick_pass.append({"market": m, "yes_token": str(token_ids[0])})
+            quick_pass.append({"market": market, "yes_token": str(token_ids[0]), "restricted": restricted})
 
-        books = await fetch_books(client, [x["yes_token"] for x in quick_pass])
+        books = await fetch_books(client, [item["yes_token"] for item in quick_pass], pause_sec=pause_sec)
 
         for item in quick_pass:
-            m = item["market"]
+            market = item["market"]
             token_id = item["yes_token"]
-            b = books.get(token_id)
-            if not b:
+            book = books.get(token_id)
+            if not book:
                 continue
-            best_ask = get_best_ask(b)
+            best_ask = get_best_ask(book)
             if best_ask is None:
                 continue
 
-            px = await fetch_price(client, token_id)
-            if px is not None and abs(px - best_ask) > stale_threshold:
+            price = await fetch_price(client, token_id)
+            if price is not None and abs(price - best_ask) > stale_threshold:
                 stale_skips += 1
                 continue
 
-            depth_usd = depth_usd_upto(b, 0.97)
+            depth_usd = depth_usd_upto(book, 0.97)
             if best_ask < price_min or best_ask > price_max or depth_usd < min_depth:
                 continue
 
-            end_date = parse_iso(m.get("endDate"))
+            end_date = parse_iso(market.get("endDate"))
             if not end_date:
                 continue
 
-            events = m.get("events") if isinstance(m.get("events"), list) else []
+            events = market.get("events") if isinstance(market.get("events"), list) else []
             event_slug = ""
             if events and isinstance(events[0], dict):
                 event_slug = str(events[0].get("slug") or "")
             if not event_slug:
-                event_slug = str(m.get("eventSlug") or "")
+                event_slug = str(market.get("eventSlug") or "")
             if not event_slug:
-                # Fallback for single-market events where market slug == event slug.
-                event_slug = str(m.get("slug") or "")
+                event_slug = str(market.get("slug") or "")
 
             candidates.append(
                 CandidateMarket(
-                    market_id=str(m.get("id", "")),
-                    condition_id=str(m.get("conditionId", "")),
+                    market_id=str(market.get("id", "")),
+                    condition_id=str(market.get("conditionId", "")),
                     token_id=token_id,
-                    question=str(m.get("question", "")),
-                    description=str(m.get("description", "")),
+                    question=str(market.get("question", "")),
+                    description=str(market.get("description", "")),
                     end_date=end_date,
                     best_ask=round(best_ask, 4),
                     depth_usd=round(depth_usd, 2),
-                    resolution_source=str(m.get("resolutionSource", "")),
-                    category_tag=str(m.get("category", "")),
-                    volume=float(m.get("volume", 0) or 0),
-                    slug=str(m.get("slug", "")),
+                    resolution_source=str(market.get("resolutionSource", "")),
+                    category_tag=str(market.get("category", "")),
+                    volume=float(market.get("volume", 0) or 0),
+                    slug=str(market.get("slug", "")),
                     event_slug=event_slug,
+                    restricted=bool(item.get("restricted", False)),
                 )
             )
 
     metrics = {
         "scanned_at": datetime.now(timezone.utc).isoformat(),
-        "total_scanned": len(markets) if 'markets' in locals() else 0,
+        "total_scanned": len(markets) if "markets" in locals() else 0,
         "quick_pass_count": len(quick_pass),
         "candidates_count": len(candidates),
         "stale_skips": stale_skips,
         "restricted_seen": restricted_seen,
         "restricted_skips": restricted_skips,
         "crypto_skips": crypto_skips,
+        "stock_skips": stock_skips,
+        "sports_skips": sports_skips,
         "filter_restricted": filter_restricted,
+        "exclude_crypto": exclude_crypto,
+        "exclude_stock_related": exclude_stock_related,
+        "exclude_sports_related": exclude_sports_related,
     }
     return candidates, metrics
 
 
-def update_daily_stats(daily_stats_path: Path, candidates: list[CandidateMarket]) -> dict[str, Any]:
-    now_cst = datetime.now(CST)
-    day_key = now_cst.strftime("%Y-%m-%d")
-
-    state = load_json(daily_stats_path, {"by_day": {}})
-    by_day = state.setdefault("by_day", {})
-    day = by_day.setdefault(
-        day_key,
-        {
-            "scans": 0,
-            "total_candidates_seen": 0,
-            "latest_candidates_count": 0,
-            "unique_market_ids": [],
-            "orders_placed": 0,
-        },
-    )
-
-    day["scans"] = int(day.get("scans", 0)) + 1
-    day["latest_candidates_count"] = len(candidates)
-    day["total_candidates_seen"] = int(day.get("total_candidates_seen", 0)) + len(candidates)
-
-    unique_ids = set(day.get("unique_market_ids", []))
-    unique_ids.update(c.market_id for c in candidates if c.market_id)
-    day["unique_market_ids"] = sorted(unique_ids)
-    day["unique_candidates_count"] = len(day["unique_market_ids"])
-
-    daily_stats_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    return state
-
-
-def update_paper_state(paper_state_path: Path, candidates: list[CandidateMarket], daily_stats_state: dict[str, Any]) -> dict[str, Any]:
-    now_cst = datetime.now(CST)
-    now_iso = now_cst.isoformat()
-    day_key = now_cst.strftime("%Y-%m-%d")
-
-    state = load_json(
-        paper_state_path,
-        {
-            "positions": [],
-            "totals": {},
-            "last_run": None,
-            "daily_orders": {},
-            "order_size_usd": 1.0,
-        },
-    )
-    positions = state.setdefault("positions", [])
-    existing = {str(p.get("market_id", "")): p for p in positions}
-
-    candidates_by_market = {c.market_id: c for c in candidates if c.market_id}
-    opened_new = 0
-    added_existing = 0
-
-    for mid, c in candidates_by_market.items():
-        entry = float(c.best_ask)
-        if entry <= 0:
-            continue
-        size_usd = 1.0
-        add_shares = size_usd / entry
-
-        if mid in existing:
-            p = existing[mid]
-            old_shares = float(p.get("shares", 0) or 0)
-            old_size = float(p.get("size_usd", 0) or 0)
-            new_shares = old_shares + add_shares
-            new_size = old_size + size_usd
-            avg_entry = (old_size + size_usd) / new_shares if new_shares > 0 else entry
-
-            p["shares"] = round(new_shares, 8)
-            p["size_usd"] = round(new_size, 2)
-            p["entry_price"] = round(avg_entry, 4)
-            p["last_added_at"] = now_iso
-            added_existing += 1
-            continue
-
-        positions.append(
-            {
-                "market_id": c.market_id,
-                "token_id": c.token_id,
-                "question": c.question,
-                "slug": c.slug,
-                "opened_at": now_iso,
-                "entry_price": round(entry, 4),
-                "size_usd": round(size_usd, 2),
-                "shares": round(add_shares, 8),
-                "last_mark": round(entry, 4),
-                "unrealized_pnl": 0.0,
-            }
-        )
-        opened_new += 1
-    # update marks + pnl using latest candidate best ask if available
-    total_invested = 0.0
-    total_unrealized = 0.0
-    for p in positions:
-        mid = str(p.get("market_id", ""))
-        c = candidates_by_market.get(mid)
-        if c is not None:
-            p["last_mark"] = round(float(c.best_ask), 4)
-        entry = float(p.get("entry_price", 0) or 0)
-        mark = float(p.get("last_mark", entry) or entry)
-        shares = float(p.get("shares", 0) or 0)
-        size_usd = float(p.get("size_usd", 0) or 0)
-        pnl = (mark - entry) * shares
-        p["unrealized_pnl"] = round(pnl, 4)
-        total_invested += size_usd
-        total_unrealized += pnl
-
-    orders_this_run = opened_new + added_existing
-
-    state["positions"] = positions
-    state["last_run"] = now_iso
-    daily_orders = state.setdefault("daily_orders", {})
-    daily_orders[day_key] = int(daily_orders.get(day_key, 0)) + orders_this_run
-    state["totals"] = {
-        "positions": len(positions),
-        "invested_usd": round(total_invested, 2),
-        "unrealized_pnl_usd": round(total_unrealized, 4),
-        "equity_usd": round(total_invested + total_unrealized, 4),
-        "opened_new_this_run": opened_new,
-        "added_existing_this_run": added_existing,
-        "orders_this_run": orders_this_run,
-        "opened_today": int(daily_orders.get(day_key, 0)),
-    }
-
-    # sync daily order count into daily stats view
-    by_day = daily_stats_state.setdefault("by_day", {})
-    day = by_day.setdefault(day_key, {})
-    day["orders_placed"] = int(daily_orders.get(day_key, 0))
-
-    paper_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    return state
-
-
-def persist_outputs(base_dir: Path, config: dict[str, Any], candidates: list[CandidateMarket], metrics: dict[str, Any]) -> None:
-    out = config["output"]
-    candidates_path = (base_dir / out["candidates_json"]).resolve()
-    metrics_path = (base_dir / out["metrics_json"]).resolve()
-    dashboard_path = (base_dir / out["dashboard_html"]).resolve()
-    paper_state_path = (base_dir / out.get("paper_state_json", "state/paper_state.json")).resolve()
-    daily_stats_path = (base_dir / out.get("daily_stats_json", "state/daily_stats.json")).resolve()
+def persist_outputs(
+    base_dir: Path,
+    config: dict[str, Any],
+    candidates: list[CandidateMarket],
+    metrics: dict[str, Any],
+    trading_result: dict[str, Any],
+) -> None:
+    output_cfg = config["output"]
+    candidates_path = (base_dir / output_cfg["candidates_json"]).resolve()
+    metrics_path = (base_dir / output_cfg["metrics_json"]).resolve()
+    dashboard_path = (base_dir / output_cfg["dashboard_html"]).resolve()
 
     candidates_path.parent.mkdir(parents=True, exist_ok=True)
-    candidates_path.write_text(json.dumps([c.to_dict() for c in candidates], ensure_ascii=False, indent=2), encoding="utf-8")
+    candidates_path.write_text(json.dumps([candidate.to_dict() for candidate in candidates], ensure_ascii=False, indent=2), encoding="utf-8")
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    daily_stats_state = update_daily_stats(daily_stats_path, candidates)
-    update_paper_state(paper_state_path, candidates, daily_stats_state)
-    daily_stats_path.write_text(json.dumps(daily_stats_state, ensure_ascii=False, indent=2), encoding="utf-8")
+    render_dashboard(
+        candidates_path,
+        metrics_path,
+        dashboard_path,
+        trading_state_path=Path(trading_result["paths"]["trading_state"]),
+        daily_stats_path=Path(trading_result["paths"]["daily_stats"]),
+        runtime_summary_path=Path(trading_result["paths"]["summary"]),
+    )
 
-    render_dashboard(candidates_path, metrics_path, dashboard_path, paper_state_path, daily_stats_path)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Polymarket Sure-Thing scanner / trader")
+    parser.add_argument("--mode", choices=["paper", "shadow", "live"], default=None, help="execution mode override")
+    return parser.parse_args()
 
 
 def main() -> None:
-    base = Path(__file__).resolve().parent
-    cfg_path = base / "config.yaml"
-    config = load_config(cfg_path)
+    args = parse_args()
+    base_dir = Path(__file__).resolve().parent
+    config_path = base_dir / "config.yaml"
+    config = load_config(config_path)
 
-    candidates, metrics = asyncio.run(run_scan(cfg_path))
-    persist_outputs(base, config, candidates, metrics)
-    print(json.dumps({"metrics": metrics, "candidates": [c.to_dict() for c in candidates]}, ensure_ascii=False, indent=2))
+    candidates, metrics = asyncio.run(run_scan(config_path))
+    trading_result = run_trading_cycle(base_dir, config, candidates, cli_mode=args.mode)
+    persist_outputs(base_dir, config, candidates, metrics, trading_result)
+
+    print(
+        json.dumps(
+            {
+                "metrics": metrics,
+                "trading": trading_result["summary"],
+                "candidates": [candidate.to_dict() for candidate in candidates],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
