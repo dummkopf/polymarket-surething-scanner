@@ -25,6 +25,7 @@ scanner:
   exclude_crypto: true
   exclude_stock_related: true
   exclude_sports_related: true
+  exclude_high_randomness_narrative: true
 
 paper:
   order_size_usd: 1.0

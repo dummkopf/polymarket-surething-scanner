@@ -6,6 +6,8 @@ Surething now supports three execution modes with isolated runtime state:
 - `shadow` — live-style gating and state isolation, but no external orders
 - `live` — authenticated Polymarket execution with preflight checks, remote reconciliation, settlement tracking, and status snapshots
 
+The scanner also applies category/risk filters before execution. By default it now excludes high-randomness narrative/show/podcast wording markets such as “What will be said on the next ... podcast?” because they behave more like long-tail, high-noise event contracts than mass-signal contracts.
+
 ## Run
 
 ```bash

@@ -165,6 +165,53 @@ def is_sports_related_market(market: dict[str, Any]) -> bool:
     return any(phrase in hay for phrase in sports_phrases) or any(token in tokens for token in sports_words)
 
 
+def is_high_randomness_narrative_market(market: dict[str, Any]) -> bool:
+    hay = build_market_haystack(market)
+    question = str(market.get("question", "")).lower()
+    event_title = ""
+    events = market.get("events")
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        event_title = str(events[0].get("title", "")).lower()
+
+    conversational_context = any(
+        phrase in hay
+        for phrase in [
+            "podcast",
+            "episode",
+            "livestream",
+            "stream",
+            "interview",
+            "debate show",
+            "town hall",
+            "press conference",
+            "earnings call",
+            "spaces",
+            "ama",
+        ]
+    )
+    subjective_prompt = any(
+        phrase in hay
+        for phrase in [
+            "what will be said",
+            "will be said",
+            "say the word",
+            "mention the word",
+            "be mentioned",
+            "mention",
+            "talk about",
+            "discuss",
+            "bring up",
+            "reference",
+        ]
+    )
+    next_show_pattern = question.startswith("what will be said on the next ") or (
+        question.startswith("will ") and " on the next " in question
+    )
+    all_in_like = "all-in podcast" in hay or "all in podcast" in hay or event_title.endswith("podcast")
+
+    return (conversational_context and subjective_prompt) or next_show_pattern or all_in_like
+
+
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
     all_markets: list[dict[str, Any]] = []
     offset = 0
@@ -271,6 +318,7 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     exclude_crypto = bool(scanner_cfg.get("exclude_crypto", True))
     exclude_stock_related = bool(scanner_cfg.get("exclude_stock_related", True))
     exclude_sports_related = bool(scanner_cfg.get("exclude_sports_related", True))
+    exclude_high_randomness_narrative = bool(scanner_cfg.get("exclude_high_randomness_narrative", True))
 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
@@ -280,6 +328,7 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     crypto_skips = 0
     stock_skips = 0
     sports_skips = 0
+    high_randomness_narrative_skips = 0
 
     async with httpx.AsyncClient() as client:
         markets = await fetch_markets(client, page_size)
@@ -301,6 +350,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                 continue
             if exclude_sports_related and is_sports_related_market(market):
                 sports_skips += 1
+                continue
+            if exclude_high_randomness_narrative and is_high_randomness_narrative_market(market):
+                high_randomness_narrative_skips += 1
                 continue
 
             end_date = parse_iso(market.get("endDate"))
@@ -389,10 +441,12 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
         "crypto_skips": crypto_skips,
         "stock_skips": stock_skips,
         "sports_skips": sports_skips,
+        "high_randomness_narrative_skips": high_randomness_narrative_skips,
         "filter_restricted": filter_restricted,
         "exclude_crypto": exclude_crypto,
         "exclude_stock_related": exclude_stock_related,
         "exclude_sports_related": exclude_sports_related,
+        "exclude_high_randomness_narrative": exclude_high_randomness_narrative,
     }
     return candidates, metrics
 
