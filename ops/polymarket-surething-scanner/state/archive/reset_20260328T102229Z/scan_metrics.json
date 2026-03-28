@@ -1,0 +1,18 @@
+{
+  "scanned_at": "2026-03-28T10:20:06.570721+00:00",
+  "total_scanned": 0,
+  "quick_pass_count": 0,
+  "candidates_count": 0,
+  "stale_skips": 0,
+  "restricted_seen": 0,
+  "restricted_skips": 0,
+  "crypto_skips": 0,
+  "stock_skips": 0,
+  "sports_skips": 0,
+  "high_randomness_narrative_skips": 0,
+  "filter_restricted": false,
+  "exclude_crypto": true,
+  "exclude_stock_related": true,
+  "exclude_sports_related": true,
+  "exclude_high_randomness_narrative": true
+}

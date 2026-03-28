@@ -1,0 +1,95 @@
+{
+  "positions": [
+    {
+      "market_id": "1555598",
+      "token_id": "63860801774746004575380401099583214798853283045998363196490587664941775342449",
+      "question": "Will Cintas (CTAS) beat quarterly earnings?",
+      "slug": "ctas-quarterly-earnings-gaap-eps-03-25-2026-1pt23",
+      "opened_at": "2026-03-24T13:07:17.851522+08:00",
+      "entry_price": 0.94,
+      "size_usd": 2.0,
+      "shares": 2.12765958,
+      "last_mark": 0.94,
+      "unrealized_pnl": 0.0,
+      "last_added_at": "2026-03-24T13:13:32.412599+08:00"
+    },
+    {
+      "market_id": "1655002",
+      "token_id": "111186074273782050365515035919529908518017202182554873790746389242662808541308",
+      "question": "Will Beinir Johannesen be the next Løgmaður of the Faroe Islands following the 2026 Faroese general election?",
+      "slug": "will-beinir-johannesen-be-the-next-lgmaur-of-the-faroe-islands-following-the-2026-faroese-general-election",
+      "opened_at": "2026-03-24T13:07:17.851522+08:00",
+      "entry_price": 0.95,
+      "size_usd": 2.0,
+      "shares": 2.10526316,
+      "last_mark": 0.95,
+      "unrealized_pnl": 0.0,
+      "last_added_at": "2026-03-24T13:13:32.412599+08:00"
+    },
+    {
+      "market_id": "1655367",
+      "token_id": "48781908272121287751907970171299899279765315925385879747583287381053929591533",
+      "question": "Will People's Party win the most seats in the Løgting in the 2026 Faroese general election?",
+      "slug": "will-peoples-party-win-the-most-seats-in-the-lgting-in-the-2026-faroese-general-election",
+      "opened_at": "2026-03-24T13:07:17.851522+08:00",
+      "entry_price": 0.96,
+      "size_usd": 2.0,
+      "shares": 2.08333334,
+      "last_mark": 0.96,
+      "unrealized_pnl": 0.0,
+      "last_added_at": "2026-03-24T13:13:32.412599+08:00"
+    },
+    {
+      "market_id": "1660904",
+      "token_id": "10893274321291871049296090155891066031652502000554214554958417093202928362982",
+      "question": "Will the highest temperature in Shanghai be 14°C on March 24?",
+      "slug": "highest-temperature-in-shanghai-on-march-24-2026-14c",
+      "opened_at": "2026-03-24T13:07:17.851522+08:00",
+      "entry_price": 0.95,
+      "size_usd": 1.0,
+      "shares": 1.05263158,
+      "last_mark": 0.95,
+      "unrealized_pnl": 0.0
+    },
+    {
+      "market_id": "1663769",
+      "token_id": "73656670451029450709476486838528793402481551471345709812042662647255101212567",
+      "question": "Will the U.S. flu hospitalization rate per 100,000 in Week 11 be between 80 and 90?",
+      "slug": "will-the-us-flu-hospitalization-rate-per-100000-in-week-11-be-between-80-and-90",
+      "opened_at": "2026-03-24T13:07:17.851522+08:00",
+      "entry_price": 0.9675,
+      "size_usd": 2.0,
+      "shares": 2.06718401,
+      "last_mark": 0.967,
+      "unrealized_pnl": -0.001,
+      "last_added_at": "2026-03-24T13:13:32.412599+08:00"
+    },
+    {
+      "market_id": "1555597",
+      "token_id": "3095599512611965009374472681789215736472048932565653021599126958136112965561",
+      "question": "Will Chewy (CHWY) beat quarterly earnings?",
+      "slug": "chwy-quarterly-earnings-nongaap-eps-03-25-2026-0pt28",
+      "opened_at": "2026-03-24T13:13:32.412599+08:00",
+      "entry_price": 0.93,
+      "size_usd": 1.0,
+      "shares": 1.07526882,
+      "last_mark": 0.93,
+      "unrealized_pnl": 0.0
+    }
+  ],
+  "totals": {
+    "positions": 6,
+    "invested_usd": 10.0,
+    "unrealized_pnl_usd": -0.001,
+    "equity_usd": 9.999,
+    "opened_new_this_run": 1,
+    "added_existing_this_run": 4,
+    "orders_this_run": 5,
+    "opened_today": 10
+  },
+  "last_run": "2026-03-24T13:13:32.412599+08:00",
+  "daily_orders": {
+    "2026-03-24": 10
+  },
+  "order_size_usd": 1.0
+}

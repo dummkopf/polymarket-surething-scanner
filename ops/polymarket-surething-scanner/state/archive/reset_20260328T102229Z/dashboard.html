@@ -1,0 +1,124 @@
+<!doctype html>
+<html><head><meta charset='utf-8'><title>Polymarket Scanner Dashboard</title>
+<style>
+body { font-family: Inter, Arial, sans-serif; padding: 20px; background: #0b1020; color: #dbe4ff; }
+.card { background: #121a33; border: 1px solid #1f2a4f; border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+a { color: #8ec5ff; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { border-bottom: 1px solid #26345f; padding: 8px; text-align: left; vertical-align: top; }
+small { color: #9fb0db; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.kpi { background: #0d1530; border-radius: 8px; padding: 10px; }
+.kpi .label { color: #9fb0db; font-size: 12px; }
+.kpi .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+.note { color: #b9c7ee; margin-top: 8px; font-size: 12px; }
+.badge { display: inline-block; border-radius: 999px; padding: 2px 8px; background: #1d4ed8; color: white; font-size: 12px; }
+</style></head><body>
+<h2>Polymarket Sure-Thing Scanner</h2>
+<div class='card'>
+<div><strong>Generated (UTC):</strong> 2026-03-28T10:20:06.579414+00:00</div>
+<div><strong>Execution mode:</strong> <span class='badge'>paper</span></div>
+<div><strong>Total scanned:</strong> 0</div>
+<div><strong>Quick-pass markets:</strong> 0</div>
+<div><strong>Candidates:</strong> 0</div>
+<div><strong>Confirmed candidates:</strong> 0</div>
+<div><strong>Planned orders this run:</strong> 0</div>
+<div><strong>Executed orders this run:</strong> 0</div>
+<div><strong>Book/price stale skips:</strong> 0</div>
+<div><strong>Restricted seen:</strong> 0</div>
+<div><strong>Restricted skips:</strong> 0</div>
+<div><strong>Blocked reasons:</strong> NA</div>
+</div>
+<div class='card'>
+<div><strong>Execution readiness:</strong></div>
+<div>Preflight status: skipped</div>
+<div>Message: OK</div>
+<div>Live env enabled: NA</div>
+<div>Collateral balance: NA</div>
+<div>Remote open orders: NA</div>
+<div>Reconciliation status: NA</div>
+<div>Remote/live drift (local-only): none</div>
+<div>Remote/live drift (remote-only): none</div>
+<div>Pending settlements: 0</div>
+<div>Live halted: False</div>
+<div>Live halt reason: None</div>
+</div>
+<div class='card'>
+<div><strong>Capital / PnL view (2026-03-28):</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>$0.06</div></div>
+  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Historical accumulated gain</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>$24.06</div></div>
+  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>$24.00</div></div>
+  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>$0.06</div></div>
+</div>
+<div class='note'>Current execution mode is isolated under state/runtime/&lt;mode&gt;. Paper mode still mirrors the old legacy state files for compatibility.</div>
+</div>
+<div class='card'>
+<div><strong>Execution / reuse view:</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Available for redeploy</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Blocked by cap today</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Open positions</div><div class='value'>24</div></div>
+  <div class='kpi'><div class='label'>Closed positions</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Pending settlements</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Recent fills synced</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Per-market cap</div><div class='value'>$20.00</div></div>
+  <div class='kpi'><div class='label'>Order size</div><div class='value'>$1.00</div></div>
+</div>
+</div>
+<div class='card'>
+<div><strong>Daily stats (2026-03-28):</strong></div>
+<div>Scans today: 24</div>
+<div>Latest available bets: 0</div>
+<div>Total available bets seen today (sum): 349</div>
+<div>Unique available bets today: 34</div>
+<div>Planned orders today: 24</div>
+<div>Orders placed today: 24</div>
+<div>Blocked reasons today: already_open: 270, await_confirm_2_runs: 48, max_orders_per_run: 7</div>
+</div>
+<div class='card'>
+<div><strong>Current mode status:</strong></div>
+<div>Open positions: 24</div>
+<div>Unrealized PnL: $0.0640</div>
+<div>Equity: $24.0640</div>
+<div>Orders this run: 0</div>
+<div>New markets this run: 0</div>
+<div>Adds to existing this run: 0</div>
+<div>Closed this run: 0</div>
+<div>Per-bet max cap: $20.00</div>
+<div>Cumulative buy notional (historical): $24.00</div>
+</div>
+<div class='card'>
+<div><strong>Top current exposure:</strong></div>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Size USD</th><th>Entry</th><th>Mark</th><th>Unrealized PnL</th></tr></thead>
+<tbody><tr><td><a href='https://polymarket.com/event/event-x' target='_blank'>open</a></td><td>Will X happen?</td><td>$1.00</td><td>0.9500</td><td>0.9500</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/crude-oil-cl-above-end-of-march' target='_blank'>open</a></td><td>Will Crude Oil (CL) settle over $68 on the final trading day of March 2026?</td><td>$1.00</td><td>0.9700</td><td>0.9700</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/2nd-richest-person-on-march-31' target='_blank'>open</a></td><td>Will Larry Page be 2nd richest person on March 31?</td><td>$1.00</td><td>0.9690</td><td>0.9690</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/which-company-will-have-the-best-ai-model-for-coding-on-march-31' target='_blank'>open</a></td><td>Will OpenAI have the best AI model for coding on March 31?</td><td>$1.00</td><td>0.9690</td><td>0.9690</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/us-tariff-rate-on-china-on-march-31' target='_blank'>open</a></td><td>Will the U.S. tariff rate on China be between 5% and 15% on March 31?</td><td>$1.00</td><td>0.9680</td><td>0.9700</td><td>$0.0021</td></tr>
+<tr><td><a href='https://polymarket.com/event/of-views-of-next-mrbeast-video-on-week-1-465' target='_blank'>open</a></td><td>Will MrBeast&#x27;s next video get between 80 and 90 million views on week 1?</td><td>$1.00</td><td>0.9650</td><td>0.9650</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/canada-new-democratic-party-leadership-election-winner' target='_blank'>open</a></td><td>Will Avi Lewis win the Canadian NDP Leadership election?</td><td>$1.00</td><td>0.9650</td><td>0.9600</td><td>$-0.0052</td></tr>
+<tr><td><a href='https://polymarket.com/event/israel-military-action-against-lebanon-on' target='_blank'>open</a></td><td>Will Israel take military action in Lebanon on March 30, 2026?</td><td>$1.00</td><td>0.9600</td><td>0.9690</td><td>$0.0094</td></tr>
+<tr><td><a href='https://polymarket.com/event/how-many-ships-will-iran-successfully-target-by-march-31' target='_blank'>open</a></td><td>Will fewer than 5 ships be successfully targeted by Iran by March 31?</td><td>$1.00</td><td>0.9600</td><td>0.9600</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/iran-military-action-against-israel-on' target='_blank'>open</a></td><td>Will Iran conduct a military action against Israel on March 28, 2026?</td><td>$1.00</td><td>0.9600</td><td>0.9300</td><td>$-0.0313</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<div><strong>Latest execution plan:</strong></div>
+<table>
+<thead><tr><th>Action</th><th>Question</th><th>Best Ask</th><th>Order Size</th><th>Reason</th></tr></thead>
+<tbody><tr><td colspan='5'>No execution plan yet</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Best Ask</th><th>Depth USD</th><th>End Date</th><th>Resolution Source</th></tr></thead>
+<tbody><tr><td colspan='6'>No candidates</td></tr></tbody>
+</table>
+</div>
+<small>Refresh this page after each scan run.</small>
+</body></html>

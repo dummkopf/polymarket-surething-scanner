@@ -1,18 +1,36 @@
 {
   "positions": [],
+  "closed_positions": [],
   "totals": {
     "positions": 0,
+    "open_cost_usd": 0.0,
+    "deployed_now_usd": 0.0,
     "invested_usd": 0.0,
     "unrealized_pnl_usd": 0.0,
+    "realized_pnl_today_usd": 0.0,
+    "realized_pnl_total_usd": 0.0,
+    "net_pnl_today_usd": 0.0,
+    "historical_net_pnl_usd": 0.0,
     "equity_usd": 0.0,
     "opened_new_this_run": 0,
     "added_existing_this_run": 0,
+    "closed_this_run": 0,
+    "blocked_by_cap_this_run": 0,
     "orders_this_run": 0,
-    "opened_today": 0
+    "opened_today": 0,
+    "cumulative_buy_usd": 0.0,
+    "max_position_usd_per_market": 20.0,
+    "order_size_usd": 1.0,
+    "available_for_redeploy_usd": 0.0,
+    "settled_cash_released_usd": 0.0,
+    "pending_settlements": 0,
+    "recent_fills": 0
   },
-  "last_run": "2026-03-24T08:35:20.820700+08:00",
-  "daily_orders": {
-    "2026-03-24": 0
-  },
-  "order_size_usd": 1.0
+  "last_run": null,
+  "daily_orders": {},
+  "recent_fills": [],
+  "seen_trade_ids": [],
+  "available_for_redeploy_usd": 0.0,
+  "settled_cash_released_usd": 0.0,
+  "pending_settlements": []
 }

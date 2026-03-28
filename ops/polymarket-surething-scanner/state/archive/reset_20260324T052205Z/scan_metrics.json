@@ -1,0 +1,11 @@
+{
+  "scanned_at": "2026-03-24T05:13:32.347407+00:00",
+  "total_scanned": 35767,
+  "quick_pass_count": 23,
+  "candidates_count": 5,
+  "stale_skips": 13,
+  "restricted_seen": 35713,
+  "restricted_skips": 0,
+  "crypto_skips": 3825,
+  "filter_restricted": false
+}
