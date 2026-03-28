@@ -29,7 +29,7 @@ scanner:
 
 paper:
   order_size_usd: 1.0
-  max_position_usd_per_market: 20.0
+  max_position_usd_per_market: 999.0
   max_total_exposure_usd: 50.0
   max_open_positions: 50
   max_orders_per_run: 999
