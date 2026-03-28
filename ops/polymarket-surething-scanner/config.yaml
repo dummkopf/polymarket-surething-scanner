@@ -29,11 +29,11 @@ scanner:
 
 paper:
   order_size_usd: 1.0
-  max_position_usd_per_market: 999.0
-  max_total_exposure_usd: 50.0
-  max_open_positions: 50
-  max_orders_per_run: 999
-  max_daily_orders: 999
+  max_position_usd_per_market: 20.0
+  max_total_exposure_usd: 999999.0
+  max_open_positions: 999999
+  max_orders_per_run: 999999
+  max_daily_orders: 999999
   allow_add_to_existing: true
 
 shadow:
