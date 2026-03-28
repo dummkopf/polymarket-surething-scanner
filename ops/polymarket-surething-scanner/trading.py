@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
+from eth_account import Account
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
@@ -16,6 +20,7 @@ from py_clob_client.order_builder.constants import BUY
 from models import CandidateMarket
 
 CLOB_BASE = "https://clob.polymarket.com"
+DATA_API_BASE = "https://data-api.polymarket.com"
 CST = timezone(timedelta(hours=8))
 VALID_MODES = {"paper", "shadow", "live"}
 
@@ -27,6 +32,23 @@ def load_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
 
 
 def save_json(path: Path, payload: Any) -> None:
@@ -54,6 +76,15 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    try:
+        return str(value)
+    except Exception:
+        return default
+
+
 def parse_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -66,21 +97,66 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def first_non_empty(payload: dict[str, Any], keys: list[str], default: Any = None) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return default
+
+
+def truncate_list(items: list[Any], limit: int) -> list[Any]:
+    if limit <= 0:
+        return []
+    return items[-limit:]
+
+
 def now_cst() -> datetime:
     return datetime.now(CST)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def now_iso_cst() -> str:
     return now_cst().isoformat()
 
 
+def now_iso_utc() -> str:
+    return now_utc().isoformat()
+
+
 def iso_to_dt(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def dt_to_cst_string(value: str | None) -> str:
+    dt = iso_to_dt(value)
+    if dt is None:
+        return "NA"
+    return dt.astimezone(CST).strftime("%Y-%m-%d %H:%M")
+
+
+def duration_to_human(delta_seconds: float | None) -> str:
+    if delta_seconds is None:
+        return "NA"
+    total = int(max(0, delta_seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return "".join(parts)
 
 
 def resolve_mode(config: dict[str, Any], cli_mode: str | None = None) -> str:
@@ -103,6 +179,11 @@ def get_mode_paths(base_dir: Path, config: dict[str, Any], mode: str) -> dict[st
         "trading_state": runtime_dir / "trading_state.json",
         "daily_stats": runtime_dir / "daily_stats.json",
         "journal": runtime_dir / "execution_journal.jsonl",
+        "fills_journal": runtime_dir / "fills_journal.jsonl",
+        "reconciliation": runtime_dir / "reconciliation_report.json",
+        "settlement": runtime_dir / "settlement_report.json",
+        "status_snapshot": runtime_dir / "status_snapshot.json",
+        "notifications": runtime_dir / "notification_feed.jsonl",
         "summary": shared_dir / "summary.json",
     }
 
@@ -142,6 +223,12 @@ DEFAULT_LIVE = {
     "min_collateral_balance_usd": 5.0,
     "require_empty_open_orders": True,
     "max_consecutive_errors": 3,
+    "data_api_base": DATA_API_BASE,
+    "sync_recent_trades_limit": 1000,
+    "settlement_grace_minutes": 180,
+    "claim_shell_command": "",
+    "claim_shell_timeout_sec": 120,
+    "profile_address": "",
 }
 
 
@@ -223,6 +310,9 @@ def default_trading_state(mode: str, settings: dict[str, Any]) -> dict[str, Any]
         "mode": mode,
         "positions": [],
         "closed_positions": [],
+        "pending_settlements": [],
+        "recent_fills": [],
+        "seen_trade_ids": [],
         "totals": {},
         "last_run": None,
         "daily_orders": {},
@@ -234,6 +324,10 @@ def default_trading_state(mode: str, settings: dict[str, Any]) -> dict[str, Any]
         "live_halted": False,
         "live_halt_reason": None,
         "consecutive_live_errors": 0,
+        "available_for_redeploy_usd": 0.0,
+        "settled_cash_released_usd": 0.0,
+        "last_reconciliation": {},
+        "last_settlement": {},
     }
 
 
@@ -243,6 +337,9 @@ def load_trading_state(path: Path, mode: str, settings: dict[str, Any]) -> dict[
         state = default_trading_state(mode, settings)
     state.setdefault("positions", [])
     state.setdefault("closed_positions", [])
+    state.setdefault("pending_settlements", [])
+    state.setdefault("recent_fills", [])
+    state.setdefault("seen_trade_ids", [])
     state.setdefault("daily_orders", {})
     state.setdefault("blocked_reasons", {})
     state.setdefault("last_plan", [])
@@ -250,6 +347,10 @@ def load_trading_state(path: Path, mode: str, settings: dict[str, Any]) -> dict[
     state.setdefault("live_halted", False)
     state.setdefault("live_halt_reason", None)
     state.setdefault("consecutive_live_errors", 0)
+    state.setdefault("available_for_redeploy_usd", 0.0)
+    state.setdefault("settled_cash_released_usd", 0.0)
+    state.setdefault("last_reconciliation", {})
+    state.setdefault("last_settlement", {})
     state["mode"] = mode
     return state
 
@@ -312,6 +413,8 @@ def update_daily_stats(
     day["historical_realized_pnl_usd"] = totals.get("realized_pnl_total_usd", 0.0)
     day["net_pnl_today_usd"] = totals.get("net_pnl_today_usd", 0.0)
     day["historical_net_pnl_usd"] = totals.get("historical_net_pnl_usd", 0.0)
+    day["available_for_redeploy_usd"] = totals.get("available_for_redeploy_usd", 0.0)
+    day["settled_cash_released_usd"] = totals.get("settled_cash_released_usd", 0.0)
 
     save_json(path, state)
     return state
@@ -326,14 +429,17 @@ def summarize_positions(positions: list[dict[str, Any]], candidates_by_market: d
         candidate = candidates_by_market.get(market_id)
         if candidate is not None:
             position["last_mark"] = round(candidate.best_ask, 4)
+            position.setdefault("event_slug", candidate.event_slug)
+            position.setdefault("slug", candidate.slug)
         entry = safe_float(position.get("entry_price"), 0.0)
         mark = safe_float(position.get("last_mark"), entry)
         shares = safe_float(position.get("shares"), 0.0)
         size_usd = safe_float(position.get("size_usd"), 0.0)
-        pnl = (mark - entry) * shares
+        remote_unrealized = position.get("remote_unrealized_pnl")
+        pnl = safe_float(remote_unrealized, (mark - entry) * shares)
         position["unrealized_pnl"] = round(pnl, 4)
         total_open_cost += size_usd
-        total_deployed_now += mark * shares
+        total_deployed_now += mark * shares if shares > 0 else size_usd + pnl
         total_unrealized += pnl
     return total_open_cost, total_deployed_now, total_unrealized
 
@@ -362,7 +468,7 @@ def build_execution_plan(
     allow_add = parse_bool(execution.get("allow_add_to_existing"), False)
     confirm_runs_required = safe_int(execution.get("confirm_scans_required"), 2)
 
-    now = datetime.now(timezone.utc)
+    now = now_utc()
     day_key = now_cst().strftime("%Y-%m-%d")
     daily_orders = safe_int(state.get("daily_orders", {}).get(day_key, 0))
     current_exposure = sum(safe_float(position.get("size_usd"), 0.0) for position in positions)
@@ -418,6 +524,7 @@ def build_execution_plan(
         plan.append(
             {
                 "market_id": market_id,
+                "condition_id": candidate.condition_id,
                 "token_id": candidate.token_id,
                 "question": candidate.question,
                 "slug": candidate.slug,
@@ -430,6 +537,7 @@ def build_execution_plan(
                 "restricted": candidate.restricted,
                 "action": action,
                 "reason": reason or "approved",
+                "expected_resolve_at": candidate.end_date.isoformat(),
             }
         )
     return plan
@@ -462,6 +570,7 @@ def _append_position(positions: list[dict[str, Any]], candidate: CandidateMarket
     positions.append(
         {
             "market_id": market_id,
+            "condition_id": candidate.condition_id,
             "token_id": candidate.token_id,
             "question": candidate.question,
             "slug": candidate.slug,
@@ -474,6 +583,7 @@ def _append_position(positions: list[dict[str, Any]], candidate: CandidateMarket
             "unrealized_pnl": 0.0,
             "restricted": candidate.restricted,
             "last_order": plan_item,
+            "expected_resolve_at": candidate.end_date.isoformat(),
         }
     )
     return 1, 0
@@ -500,7 +610,7 @@ def finalize_state(
     for closed in closed_positions:
         realized = safe_float(closed.get("realized_pnl"), 0.0)
         realized_total += realized
-        closed_at = str(closed.get("closed_at") or "")
+        closed_at = safe_str(closed.get("closed_at"))
         if closed_at.startswith(day_key):
             realized_today += realized
 
@@ -519,6 +629,8 @@ def finalize_state(
     state["last_run"] = now_iso_cst()
     state["blocked_reasons"] = dict(blocked)
     state["last_plan"] = plan[-50:]
+    state["recent_fills"] = truncate_list(state.get("recent_fills", []), 50)
+    state["seen_trade_ids"] = truncate_list(state.get("seen_trade_ids", []), 2000)
     state["totals"] = {
         "positions": len(positions),
         "open_cost_usd": round(total_open_cost, 2),
@@ -541,6 +653,10 @@ def finalize_state(
         "cumulative_buy_usd": round(cumulative_buys, 2),
         "max_position_usd_per_market": round(safe_float(execution.get("max_position_usd_per_market"), 5.0), 2),
         "order_size_usd": round(safe_float(execution.get("order_size_usd"), 1.0), 2),
+        "available_for_redeploy_usd": round(safe_float(state.get("available_for_redeploy_usd"), 0.0), 2),
+        "settled_cash_released_usd": round(safe_float(state.get("settled_cash_released_usd"), 0.0), 2),
+        "pending_settlements": len(state.get("pending_settlements", [])),
+        "recent_fills": len(state.get("recent_fills", [])),
     }
     return state
 
@@ -560,7 +676,6 @@ def execute_simulated(
 
     opened_new = 0
     added_existing = 0
-    executed_plan_items: list[dict[str, Any]] = []
     for item in plan:
         if item.get("action") != "open":
             continue
@@ -570,7 +685,6 @@ def execute_simulated(
         opened, added = _append_position(positions, candidate, item, allow_add)
         opened_new += opened
         added_existing += added
-        executed_plan_items.append(item)
 
     if preflight:
         state["last_preflight"] = preflight
@@ -590,14 +704,21 @@ class LiveTrader:
             load_dotenv(env_file, override=False)
 
         self.host = os.getenv("POLYMARKET_HOST", CLOB_BASE)
+        self.data_api_base = os.getenv("POLYMARKET_DATA_API_BASE", safe_str(live_cfg.get("data_api_base"), DATA_API_BASE))
         self.chain_id = safe_int(os.getenv("POLYMARKET_CHAIN_ID", 137), 137)
         self.private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
         self.signature_type = safe_int(os.getenv("POLYMARKET_SIGNATURE_TYPE", live_cfg.get("signature_type", 0)), 0)
-        self.funder = (os.getenv("POLYMARKET_FUNDER") or str(live_cfg.get("funder") or "")).strip() or None
+        self.funder = (os.getenv("POLYMARKET_FUNDER") or safe_str(live_cfg.get("funder"))).strip() or None
         self.api_key = os.getenv("POLYMARKET_API_KEY", "").strip()
         self.api_secret = os.getenv("POLYMARKET_API_SECRET", "").strip()
         self.api_passphrase = os.getenv("POLYMARKET_API_PASSPHRASE", "").strip()
         self.live_enabled_env = parse_bool(os.getenv("POLYMARKET_LIVE_ENABLED"), False)
+        self.profile_address = (
+            os.getenv("POLYMARKET_PROFILE_ADDRESS", "").strip()
+            or safe_str(live_cfg.get("profile_address")).strip()
+            or self.funder
+            or (Account.from_key(self.private_key).address if self.private_key else "")
+        )
         self.live_cfg = live_cfg
         self.client: ClobClient | None = None
 
@@ -634,6 +755,13 @@ class LiveTrader:
                     return balance
         return 0.0
 
+    def data_api_get(self, path: str, params: dict[str, Any]) -> Any:
+        url = f"{self.data_api_base.rstrip('/')}/{path.lstrip('/')}"
+        with httpx.Client(timeout=20) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+
     def preflight(self) -> dict[str, Any]:
         if not parse_bool(self.live_cfg.get("enabled"), False):
             raise LiveExecutionError("live.enabled is false in config")
@@ -659,10 +787,12 @@ class LiveTrader:
         return {
             "status": "ok",
             "host": self.host,
+            "data_api_base": self.data_api_base,
             "chain_id": self.chain_id,
             "signature_type": self.signature_type,
             "funder_present": bool(self.funder),
             "api_key_present": bool(self.api_key),
+            "profile_address": self.profile_address,
             "env_file": str(self.env_file),
             "env_live_enabled": self.live_enabled_env,
             "collateral_balance_usd": round(collateral_balance, 4),
@@ -673,19 +803,59 @@ class LiveTrader:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
         order = self.client.create_order(OrderArgs(token_id=token_id, price=price, size=shares, side=BUY))
-        order_type_name = str(self.live_cfg.get("order_type", "FOK")).upper()
+        order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
         order_type = getattr(OrderType, order_type_name, OrderType.FOK)
         post_only = parse_bool(self.live_cfg.get("post_only"), False)
         if post_only and order_type_name not in {"GTC", "GTD"}:
             post_only = False
         return self.client.post_order(order, order_type, post_only=post_only)
 
+    def fetch_open_orders(self) -> list[dict[str, Any]]:
+        if self.client is None:
+            raise LiveExecutionError("client not initialized")
+        payload = self.client.get_orders(OpenOrderParams())
+        return payload if isinstance(payload, list) else []
+
+    def fetch_trades(self) -> list[dict[str, Any]]:
+        if self.client is None:
+            raise LiveExecutionError("client not initialized")
+        payload = self.client.get_trades()
+        rows = payload if isinstance(payload, list) else []
+        limit = safe_int(self.live_cfg.get("sync_recent_trades_limit"), 1000)
+        return rows[-limit:]
+
+    def fetch_positions(self) -> list[dict[str, Any]]:
+        if not self.profile_address:
+            return []
+        payload = self.data_api_get("positions", {"user": self.profile_address, "sizeThreshold": 0})
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return payload["data"]
+        return []
+
+    def fetch_closed_positions(self) -> list[dict[str, Any]]:
+        if not self.profile_address:
+            return []
+        payload = self.data_api_get("closed-positions", {"user": self.profile_address, "sizeThreshold": 0})
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return payload["data"]
+        return []
+
+    def fetch_total_value(self) -> dict[str, Any]:
+        if not self.profile_address:
+            return {}
+        payload = self.data_api_get("value", {"user": self.profile_address})
+        return payload if isinstance(payload, dict) else {}
+
 
 def response_success(response: Any) -> bool:
     if isinstance(response, dict):
         if response.get("success") is False:
             return False
-        status = str(response.get("status") or response.get("state") or "").lower()
+        status = safe_str(response.get("status") or response.get("state")).lower()
         if status in {"rejected", "cancelled", "canceled", "failed", "error"}:
             return False
         if response.get("error") or response.get("errorMsg") or response.get("message") == "error":
@@ -693,37 +863,463 @@ def response_success(response: Any) -> bool:
     return True
 
 
+def append_notification(path: Path, category: str, level: str, text: str, payload: dict[str, Any] | None = None) -> None:
+    event = {
+        "ts": now_iso_cst(),
+        "category": category,
+        "level": level,
+        "text": text,
+        "payload": payload or {},
+    }
+    append_jsonl(path, event)
+
+
+def normalize_trade(raw: dict[str, Any], meta_by_token: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    token_id = safe_str(first_non_empty(raw, ["asset_id", "asset", "token_id", "tokenId"]))
+    trade_id = safe_str(first_non_empty(raw, ["id", "tradeID", "trade_id", "match_id", "transactionHash", "tx_hash"]))
+    if not token_id and not trade_id:
+        return None
+    price = safe_float(first_non_empty(raw, ["price", "matched_price", "avgPrice", "avg_price"]), 0.0)
+    shares = safe_float(first_non_empty(raw, ["size", "amount", "matched_amount", "shares", "qty"]), 0.0)
+    spent = safe_float(first_non_empty(raw, ["usdc_size", "notional", "value", "amount_usd"]), 0.0)
+    if spent <= 0 and price > 0 and shares > 0:
+        spent = price * shares
+    side = safe_str(first_non_empty(raw, ["side", "taker_side", "maker_side"])).upper() or "BUY"
+    meta = meta_by_token.get(token_id, {})
+    timestamp = safe_str(first_non_empty(raw, ["timestamp", "created_at", "createdAt", "matched_at", "time"])) or now_iso_utc()
+    return {
+        "trade_id": trade_id or f"{token_id}:{timestamp}:{shares}:{price}",
+        "token_id": token_id,
+        "market_id": safe_str(first_non_empty(raw, ["market", "condition_id", "conditionId"])) or safe_str(meta.get("market_id")),
+        "condition_id": safe_str(first_non_empty(raw, ["condition_id", "conditionId"])) or safe_str(meta.get("condition_id")),
+        "question": safe_str(meta.get("question") or first_non_empty(raw, ["title", "question"])),
+        "event_slug": safe_str(meta.get("event_slug")),
+        "slug": safe_str(meta.get("slug")),
+        "side": side,
+        "price": round(price, 6),
+        "shares": round(shares, 8),
+        "spent_usd": round(spent, 6),
+        "timestamp": timestamp,
+        "raw": raw,
+    }
+
+
+def normalize_remote_position(raw: dict[str, Any], meta_by_token: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    token_id = safe_str(first_non_empty(raw, ["asset", "asset_id", "assetId", "token_id", "tokenId"]))
+    market_id = safe_str(first_non_empty(raw, ["market", "condition_id", "conditionId", "market_id"]))
+    meta = meta_by_token.get(token_id, {})
+    shares = safe_float(first_non_empty(raw, ["size", "amount", "shares", "position"]), 0.0)
+    if shares <= 0:
+        return None
+    avg_entry = safe_float(first_non_empty(raw, ["avgPrice", "avg_price", "averagePrice", "price"]), 0.0)
+    current_value = safe_float(first_non_empty(raw, ["currentValue", "current_value", "value", "usdValue"]), 0.0)
+    initial_value = safe_float(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
+    mark = safe_float(first_non_empty(raw, ["curPrice", "current_price", "mark", "price"]), 0.0)
+    if mark <= 0 and current_value > 0 and shares > 0:
+        mark = current_value / shares
+    if initial_value <= 0 and avg_entry > 0 and shares > 0:
+        initial_value = avg_entry * shares
+    unrealized = safe_float(first_non_empty(raw, ["cashPnl", "cash_pnl", "unrealizedPnl", "unrealized_pnl"]), current_value - initial_value)
+    return {
+        "market_id": market_id or safe_str(meta.get("market_id")),
+        "condition_id": safe_str(first_non_empty(raw, ["conditionId", "condition_id"])) or safe_str(meta.get("condition_id")),
+        "token_id": token_id,
+        "question": safe_str(first_non_empty(raw, ["title", "question", "name"])) or safe_str(meta.get("question")),
+        "event_slug": safe_str(meta.get("event_slug")),
+        "slug": safe_str(meta.get("slug")),
+        "outcome": safe_str(first_non_empty(raw, ["outcome", "label"])),
+        "shares": round(shares, 8),
+        "entry_price": round(avg_entry, 6),
+        "size_usd": round(initial_value, 6),
+        "last_mark": round(mark, 6),
+        "remote_unrealized_pnl": round(unrealized, 6),
+        "current_value_usd": round(current_value, 6),
+        "expected_resolve_at": safe_str(meta.get("expected_resolve_at")),
+        "raw": raw,
+    }
+
+
+def normalize_remote_closed_position(raw: dict[str, Any], meta_by_token: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    token_id = safe_str(first_non_empty(raw, ["asset", "asset_id", "assetId", "token_id", "tokenId"]))
+    market_id = safe_str(first_non_empty(raw, ["market", "condition_id", "conditionId", "market_id"]))
+    meta = meta_by_token.get(token_id, {})
+    initial_value = safe_float(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
+    payout = safe_float(first_non_empty(raw, ["currentValue", "current_value", "redeemed", "value", "amountSold", "amountReceived"]), 0.0)
+    realized = safe_float(first_non_empty(raw, ["cashPnl", "cash_pnl", "realizedPnl", "realized_pnl"]), payout - initial_value)
+    if not token_id and not market_id:
+        return None
+    return {
+        "market_id": market_id or safe_str(meta.get("market_id")),
+        "condition_id": safe_str(first_non_empty(raw, ["conditionId", "condition_id"])) or safe_str(meta.get("condition_id")),
+        "token_id": token_id,
+        "question": safe_str(first_non_empty(raw, ["title", "question", "name"])) or safe_str(meta.get("question")),
+        "event_slug": safe_str(meta.get("event_slug")),
+        "slug": safe_str(meta.get("slug")),
+        "outcome": safe_str(first_non_empty(raw, ["outcome", "label"])),
+        "size_usd": round(initial_value, 6),
+        "payout_usd": round(payout, 6),
+        "realized_pnl": round(realized, 6),
+        "closed_at": safe_str(first_non_empty(raw, ["updatedAt", "closedAt", "closed_at", "timestamp"])) or now_iso_cst(),
+        "raw": raw,
+    }
+
+
+def build_meta_maps(state: dict[str, Any], candidates: list[CandidateMarket]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    meta_by_token: dict[str, dict[str, Any]] = {}
+    meta_by_market: dict[str, dict[str, Any]] = {}
+
+    for candidate in candidates:
+        meta = {
+            "market_id": candidate.market_id,
+            "condition_id": candidate.condition_id,
+            "token_id": candidate.token_id,
+            "question": candidate.question,
+            "event_slug": candidate.event_slug,
+            "slug": candidate.slug,
+            "expected_resolve_at": candidate.end_date.isoformat(),
+        }
+        meta_by_token[candidate.token_id] = meta
+        meta_by_market[candidate.market_id] = meta
+
+    for bucket in [state.get("positions", []), state.get("closed_positions", []), state.get("recent_fills", [])]:
+        if not isinstance(bucket, list):
+            continue
+        for item in bucket:
+            if not isinstance(item, dict):
+                continue
+            meta = {
+                "market_id": safe_str(item.get("market_id")),
+                "condition_id": safe_str(item.get("condition_id")),
+                "token_id": safe_str(item.get("token_id")),
+                "question": safe_str(item.get("question")),
+                "event_slug": safe_str(item.get("event_slug")),
+                "slug": safe_str(item.get("slug")),
+                "expected_resolve_at": safe_str(item.get("expected_resolve_at")),
+            }
+            if meta["token_id"]:
+                meta_by_token[meta["token_id"]] = {**meta_by_token.get(meta["token_id"], {}), **meta}
+            if meta["market_id"]:
+                meta_by_market[meta["market_id"]] = {**meta_by_market.get(meta["market_id"], {}), **meta}
+    return meta_by_token, meta_by_market
+
+
+def append_new_fills(state: dict[str, Any], fills_path: Path, raw_trades: list[dict[str, Any]], meta_by_token: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set(safe_str(item) for item in state.get("seen_trade_ids", []))
+    new_rows: list[dict[str, Any]] = []
+    for raw in raw_trades:
+        normalized = normalize_trade(raw, meta_by_token)
+        if normalized is None:
+            continue
+        trade_id = safe_str(normalized.get("trade_id"))
+        if trade_id in seen:
+            continue
+        seen.add(trade_id)
+        append_jsonl(fills_path, normalized)
+        new_rows.append(normalized)
+
+    if new_rows:
+        state["recent_fills"] = truncate_list((state.get("recent_fills", []) or []) + new_rows, 50)
+        state["seen_trade_ids"] = truncate_list(list(seen), 2000)
+    return new_rows
+
+
+def reconcile_positions_from_remote(
+    state: dict[str, Any],
+    remote_positions_raw: list[dict[str, Any]],
+    candidates: list[CandidateMarket],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    meta_by_token, _ = build_meta_maps(state, candidates)
+    old_positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+    old_by_token = {safe_str(item.get("token_id")): item for item in old_positions if safe_str(item.get("token_id"))}
+
+    new_positions: list[dict[str, Any]] = []
+    remote_tokens: set[str] = set()
+    for raw in remote_positions_raw:
+        normalized = normalize_remote_position(raw, meta_by_token)
+        if normalized is None:
+            continue
+        token_id = safe_str(normalized.get("token_id"))
+        remote_tokens.add(token_id)
+        existing = old_by_token.get(token_id, {})
+        merged = {
+            **existing,
+            **normalized,
+            "opened_at": safe_str(existing.get("opened_at")) or safe_str(existing.get("first_fill_at")) or now_iso_cst(),
+            "first_fill_at": safe_str(existing.get("first_fill_at")) or safe_str(existing.get("opened_at")) or now_iso_cst(),
+            "reconciled_at": now_iso_cst(),
+        }
+        if safe_float(merged.get("entry_price"), 0.0) <= 0 and safe_float(merged.get("size_usd"), 0.0) > 0 and safe_float(merged.get("shares"), 0.0) > 0:
+            merged["entry_price"] = round(safe_float(merged.get("size_usd")) / safe_float(merged.get("shares")), 6)
+        new_positions.append(merged)
+
+    local_tokens = {safe_str(item.get("token_id")) for item in old_positions if safe_str(item.get("token_id"))}
+    report = {
+        "local_position_count_before": len(old_positions),
+        "remote_position_count": len(new_positions),
+        "remote_only_tokens": sorted(token for token in remote_tokens - local_tokens if token),
+        "local_only_tokens": sorted(token for token in local_tokens - remote_tokens if token),
+    }
+    return new_positions, report
+
+
+def archive_closed_positions(
+    state: dict[str, Any],
+    remote_closed_raw: list[dict[str, Any]],
+    candidates: list[CandidateMarket],
+) -> tuple[int, float, list[dict[str, Any]]]:
+    meta_by_token, _ = build_meta_maps(state, candidates)
+    open_positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+    open_by_token = {safe_str(item.get("token_id")): item for item in open_positions if safe_str(item.get("token_id"))}
+    existing_closed = {
+        f"{safe_str(item.get('token_id'))}:{safe_str(item.get('closed_at'))}:{safe_float(item.get('payout_usd'), 0.0)}"
+        for item in state.get("closed_positions", [])
+        if isinstance(item, dict)
+    }
+    archived: list[dict[str, Any]] = []
+    released = 0.0
+
+    for raw in remote_closed_raw:
+        normalized = normalize_remote_closed_position(raw, meta_by_token)
+        if normalized is None:
+            continue
+        token_id = safe_str(normalized.get("token_id"))
+        key = f"{token_id}:{safe_str(normalized.get('closed_at'))}:{safe_float(normalized.get('payout_usd'), 0.0)}"
+        if key in existing_closed:
+            continue
+        local = open_by_token.get(token_id)
+        if local is None and token_id not in {safe_str(fill.get("token_id")) for fill in state.get("recent_fills", []) if isinstance(fill, dict)}:
+            continue
+        closed = {
+            **(local or {}),
+            **normalized,
+            "close_reason": "remote_settled_archive",
+        }
+        archived.append(closed)
+        existing_closed.add(key)
+        released += max(0.0, safe_float(closed.get("payout_usd"), 0.0))
+
+    if archived:
+        archived_token_ids = {safe_str(item.get("token_id")) for item in archived}
+        state["positions"] = [item for item in open_positions if safe_str(item.get("token_id")) not in archived_token_ids]
+        state["closed_positions"] = truncate_list((state.get("closed_positions", []) or []) + archived, 500)
+        state["settled_cash_released_usd"] = round(safe_float(state.get("settled_cash_released_usd"), 0.0) + released, 6)
+    return len(archived), released, archived
+
+
+def build_pending_settlements(state: dict[str, Any], settings: dict[str, Any]) -> list[dict[str, Any]]:
+    grace_minutes = safe_int(settings["live"].get("settlement_grace_minutes"), 180)
+    pending: list[dict[str, Any]] = []
+    now = now_utc()
+    for position in state.get("positions", []):
+        if not isinstance(position, dict):
+            continue
+        expected = iso_to_dt(safe_str(position.get("expected_resolve_at")))
+        if expected is None:
+            continue
+        if expected + timedelta(minutes=grace_minutes) > now:
+            continue
+        pending.append(
+            {
+                "market_id": safe_str(position.get("market_id")),
+                "condition_id": safe_str(position.get("condition_id")),
+                "token_id": safe_str(position.get("token_id")),
+                "question": safe_str(position.get("question")),
+                "expected_resolve_at": expected.isoformat(),
+                "age_past_expected": duration_to_human((now - expected).total_seconds()),
+                "status": "await_settlement_or_claim",
+            }
+        )
+    return pending
+
+
+def maybe_run_claim_hook(
+    pending_settlements: list[dict[str, Any]],
+    settings: dict[str, Any],
+    notifications_path: Path,
+) -> dict[str, Any]:
+    command = safe_str(settings["live"].get("claim_shell_command")).strip()
+    if not command or not pending_settlements:
+        return {"attempted": False, "count": 0}
+    payload = json.dumps(pending_settlements, ensure_ascii=False)
+    env = os.environ.copy()
+    env["SURETHING_PENDING_SETTLEMENTS_JSON"] = payload
+    env["SURETHING_PENDING_SETTLEMENTS_COUNT"] = str(len(pending_settlements))
+    timeout = safe_int(settings["live"].get("claim_shell_timeout_sec"), 120)
+    try:
+        proc = subprocess.run(command, shell=True, env=env, capture_output=True, text=True, timeout=timeout)
+        result = {
+            "attempted": True,
+            "count": len(pending_settlements),
+            "returncode": proc.returncode,
+            "stdout": proc.stdout[-2000:],
+            "stderr": proc.stderr[-2000:],
+            "command": command,
+        }
+        level = "info" if proc.returncode == 0 else "error"
+        append_notification(
+            notifications_path,
+            "claim_hook",
+            level,
+            f"claim hook executed for {len(pending_settlements)} settlement(s)",
+            result,
+        )
+        return result
+    except Exception as exc:
+        result = {"attempted": True, "count": len(pending_settlements), "command": command, "error": str(exc)}
+        append_notification(notifications_path, "claim_hook", "error", "claim hook execution failed", result)
+        return result
+
+
+def parse_total_value(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "total_value_usd": round(safe_float(first_non_empty(payload, ["value", "totalValue", "total_value"]), 0.0), 6),
+        "cash_balance_usd": round(
+            safe_float(first_non_empty(payload, ["cash", "cashBalance", "cash_balance", "available", "availableBalance"]), 0.0),
+            6,
+        ),
+    }
+
+
+def write_status_snapshot(path: Path, state: dict[str, Any], summary: dict[str, Any], preflight: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {
+        "generated_at": now_iso_cst(),
+        "mode": state.get("mode"),
+        "preflight": preflight,
+        "totals": state.get("totals", {}),
+        "reconciliation": state.get("last_reconciliation", {}),
+        "settlement": state.get("last_settlement", {}),
+        "positions": truncate_list(state.get("positions", []), 25),
+        "pending_settlements": truncate_list(state.get("pending_settlements", []), 25),
+        "recent_fills": truncate_list(state.get("recent_fills", []), 20),
+        "summary": summary,
+    }
+    save_json(path, snapshot)
+    return snapshot
+
+
+def sync_live_state(
+    state: dict[str, Any],
+    trader: LiveTrader,
+    candidates: list[CandidateMarket],
+    settings: dict[str, Any],
+    paths: dict[str, Path],
+    preflight: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    report: dict[str, Any] = {"status": "ok", "synced_at": now_iso_cst()}
+    settlement_report: dict[str, Any] = {"status": "ok", "synced_at": now_iso_cst()}
+    new_fills: list[dict[str, Any]] = []
+
+    try:
+        open_orders = trader.fetch_open_orders()
+        trades = trader.fetch_trades()
+        remote_positions_raw = trader.fetch_positions()
+        remote_closed_raw = trader.fetch_closed_positions()
+        total_value = parse_total_value(trader.fetch_total_value())
+    except Exception as exc:
+        report = {"status": "error", "synced_at": now_iso_cst(), "message": str(exc)}
+        state["last_reconciliation"] = report
+        state["last_settlement"] = settlement_report
+        save_json(paths["reconciliation"], report)
+        save_json(paths["settlement"], settlement_report)
+        append_notification(paths["notifications"], "reconciliation", "error", "live reconciliation failed", report)
+        return state, report, settlement_report, new_fills
+
+    meta_by_token, _ = build_meta_maps(state, candidates)
+    new_fills = append_new_fills(state, paths["fills_journal"], trades, meta_by_token)
+    if new_fills:
+        for fill in new_fills:
+            append_notification(
+                paths["notifications"],
+                "fill",
+                "info",
+                f"new remote fill synced: {fill.get('question') or fill.get('token_id')}",
+                fill,
+            )
+
+    reconciled_positions, drift_report = reconcile_positions_from_remote(state, remote_positions_raw, candidates)
+    archived_count, released, archived_rows = archive_closed_positions(state, remote_closed_raw, candidates)
+    state["positions"] = reconciled_positions
+    state["pending_settlements"] = build_pending_settlements(state, settings)
+
+    if total_value.get("cash_balance_usd", 0.0) > 0:
+        state["available_for_redeploy_usd"] = round(total_value["cash_balance_usd"], 6)
+    else:
+        state["available_for_redeploy_usd"] = round(
+            max(
+                safe_float(state.get("available_for_redeploy_usd"), 0.0),
+                safe_float(preflight.get("collateral_balance_usd"), 0.0),
+                safe_float(state.get("settled_cash_released_usd"), 0.0),
+            ),
+            6,
+        )
+
+    claim_result = maybe_run_claim_hook(state["pending_settlements"], settings, paths["notifications"])
+
+    report = {
+        "status": "ok",
+        "synced_at": now_iso_cst(),
+        "profile_address": trader.profile_address,
+        "remote_open_orders": len(open_orders),
+        "remote_trades_considered": len(trades),
+        "remote_positions": len(reconciled_positions),
+        "new_fills": len(new_fills),
+        **drift_report,
+    }
+    settlement_report = {
+        "status": "ok",
+        "synced_at": now_iso_cst(),
+        "archived_count": archived_count,
+        "released_cash_usd": round(released, 6),
+        "pending_count": len(state.get("pending_settlements", [])),
+        "claim_hook": claim_result,
+    }
+
+    if report.get("remote_only_tokens") or report.get("local_only_tokens"):
+        report["status"] = "warn"
+        append_notification(paths["notifications"], "reconciliation", "warn", "live drift detected", report)
+
+    if archived_count:
+        append_notification(
+            paths["notifications"],
+            "settlement",
+            "info",
+            f"archived {archived_count} settled position(s)",
+            {"released_cash_usd": round(released, 6), "positions": archived_rows},
+        )
+
+    state["last_reconciliation"] = report
+    state["last_settlement"] = settlement_report
+    save_json(paths["reconciliation"], report)
+    save_json(paths["settlement"], settlement_report)
+    return state, report, settlement_report, new_fills
+
+
 def execute_live(
     path: Path,
     journal_path: Path,
+    notifications_path: Path,
     candidates: list[CandidateMarket],
     plan: list[dict[str, Any]],
     settings: dict[str, Any],
     preflight: dict[str, Any],
     trader: LiveTrader,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int]:
     mode = settings["mode"]
     state = load_trading_state(path, mode, settings)
-    positions = state.setdefault("positions", [])
-    allow_add = parse_bool(settings["execution"].get("allow_add_to_existing"), False)
-    candidates_by_market = {candidate.market_id: candidate for candidate in candidates if candidate.market_id}
-
-    opened_new = 0
-    added_existing = 0
     errors = safe_int(state.get("consecutive_live_errors", 0))
     state["last_preflight"] = preflight
+    accepted_orders = 0
 
     for item in plan:
         if item.get("action") != "open":
             continue
-        market_id = str(item.get("market_id", ""))
-        candidate = candidates_by_market.get(market_id)
-        if candidate is None:
-            continue
         journal_event = {
             "ts": now_iso_cst(),
             "mode": mode,
-            "market_id": market_id,
+            "market_id": item.get("market_id"),
+            "condition_id": item.get("condition_id"),
             "token_id": item.get("token_id"),
             "question": item.get("question"),
             "price": item.get("best_ask"),
@@ -732,22 +1328,34 @@ def execute_live(
         }
         try:
             response = trader.place_buy(
-                token_id=str(item.get("token_id")),
+                token_id=safe_str(item.get("token_id")),
                 price=safe_float(item.get("best_ask"), 0.0),
                 shares=safe_float(item.get("shares"), 0.0),
             )
             journal_event["response"] = response
             if not response_success(response):
                 raise LiveExecutionError(f"order rejected: {response}")
-            opened, added = _append_position(positions, candidate, item, allow_add)
-            opened_new += opened
-            added_existing += added
+            accepted_orders += 1
             errors = 0
-            journal_event["status"] = "filled_assumed"
+            journal_event["status"] = "submitted"
+            append_notification(
+                notifications_path,
+                "order_submission",
+                "info",
+                f"live order submitted: {safe_str(item.get('question'))}",
+                journal_event,
+            )
         except Exception as exc:
             errors += 1
             journal_event["status"] = "error"
             journal_event["error"] = str(exc)
+            append_notification(
+                notifications_path,
+                "order_submission",
+                "error",
+                f"live order submission failed: {safe_str(item.get('question'))}",
+                journal_event,
+            )
             append_jsonl(journal_path, journal_event)
             max_errors = safe_int(settings["live"].get("max_consecutive_errors"), 3)
             if errors >= max_errors:
@@ -758,9 +1366,8 @@ def execute_live(
         append_jsonl(journal_path, journal_event)
 
     state["consecutive_live_errors"] = errors
-    state = finalize_state(state, settings, candidates, plan, opened_new, added_existing)
     save_json(path, state)
-    return state
+    return state, accepted_orders
 
 
 def mirror_legacy_outputs(base_dir: Path, config: dict[str, Any], trading_state_path: Path, daily_stats_path: Path) -> None:
@@ -795,9 +1402,11 @@ def run_trading_cycle(
     state = load_trading_state(paths["trading_state"], mode, settings)
     preflight: dict[str, Any] = {"status": "skipped", "mode": mode}
     live_trader = None
+    reconciliation_report: dict[str, Any] = {}
+    settlement_report: dict[str, Any] = {}
 
     if mode == "live":
-        env_file = (base_dir / str(settings["live"].get("env_file", ".env.live"))).resolve()
+        env_file = (base_dir / safe_str(settings["live"].get("env_file"), ".env.live")).resolve()
         live_trader = LiveTrader(env_file, settings["live"])
         try:
             preflight = live_trader.preflight()
@@ -808,18 +1417,50 @@ def run_trading_cycle(
     elif mode == "shadow":
         preflight = {"status": "shadow", "message": "shadow mode: no external orders submitted"}
 
+    if mode == "live" and live_trader is not None and preflight.get("status") == "ok":
+        state, reconciliation_report, settlement_report, _ = sync_live_state(
+            state,
+            live_trader,
+            candidates,
+            settings,
+            paths,
+            preflight,
+        )
+        save_json(paths["trading_state"], state)
+
     plan = build_execution_plan(candidates, state, settings, confirmed_ids, preflight)
 
+    executed_orders = 0
     if mode == "live" and live_trader is not None and preflight.get("status") == "ok":
-        state = execute_live(paths["trading_state"], paths["journal"], candidates, plan, settings, preflight, live_trader)
+        state, executed_orders = execute_live(
+            paths["trading_state"],
+            paths["journal"],
+            paths["notifications"],
+            candidates,
+            plan,
+            settings,
+            preflight,
+            live_trader,
+        )
+        state, reconciliation_report, settlement_report, _ = sync_live_state(
+            state,
+            live_trader,
+            candidates,
+            settings,
+            paths,
+            preflight,
+        )
+        state = finalize_state(state, settings, candidates, plan, executed_orders, 0, settlement_report.get("archived_count", 0))
+        save_json(paths["trading_state"], state)
     else:
         state = execute_simulated(paths["trading_state"], candidates, plan, settings, preflight)
+        executed_orders = safe_int(state.get("totals", {}).get("orders_this_run", 0))
 
     daily_stats = update_daily_stats(
         paths["daily_stats"],
         candidates,
         plan,
-        safe_int(state.get("totals", {}).get("orders_this_run", 0)),
+        executed_orders,
         state.get("totals", {}) if isinstance(state.get("totals"), dict) else {},
     )
 
@@ -833,14 +1474,21 @@ def run_trading_cycle(
         "signal_state_path": str(paths["signal_state"]),
         "trading_state_path": str(paths["trading_state"]),
         "daily_stats_path": str(paths["daily_stats"]),
+        "reconciliation_path": str(paths["reconciliation"]),
+        "settlement_path": str(paths["settlement"]),
+        "status_snapshot_path": str(paths["status_snapshot"]),
         "preflight": preflight,
         "planned_orders": sum(1 for item in plan if item.get("action") == "open"),
-        "executed_orders": safe_int(state.get("totals", {}).get("orders_this_run", 0)),
+        "executed_orders": executed_orders,
         "blocked_reasons": state.get("blocked_reasons", {}),
         "live_halted": bool(state.get("live_halted")),
         "live_halt_reason": state.get("live_halt_reason"),
+        "reconciliation": reconciliation_report or state.get("last_reconciliation", {}),
+        "settlement": settlement_report or state.get("last_settlement", {}),
+        "available_for_redeploy_usd": round(safe_float(state.get("available_for_redeploy_usd"), 0.0), 2),
     }
     save_json(paths["summary"], summary)
+    status_snapshot = write_status_snapshot(paths["status_snapshot"], state, summary, preflight)
 
     return {
         "mode": mode,
@@ -852,4 +1500,5 @@ def run_trading_cycle(
         "state": state,
         "daily_stats": daily_stats,
         "summary": summary,
+        "status_snapshot": status_snapshot,
     }

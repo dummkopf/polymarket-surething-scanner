@@ -101,8 +101,12 @@ def render_dashboard(
     plan_body = "\n".join(plan_rows) if plan_rows else "<tr><td colspan='5'>No execution plan yet</td></tr>"
 
     preflight = runtime_summary.get("preflight", {}) if isinstance(runtime_summary, dict) else {}
+    reconciliation = runtime_summary.get("reconciliation", {}) if isinstance(runtime_summary, dict) else {}
+    settlement = runtime_summary.get("settlement", {}) if isinstance(runtime_summary, dict) else {}
+    pending_settlements = trading_state.get("pending_settlements", []) if isinstance(trading_state, dict) else []
+    recent_fills = trading_state.get("recent_fills", []) if isinstance(trading_state, dict) else []
     now = datetime.now(timezone.utc).isoformat()
-    reusable_freed_capital = max(0.0, float(totals.get("realized_pnl_total_usd", 0) or 0))
+    reusable_freed_capital = float(totals.get("available_for_redeploy_usd", 0) or 0)
     blocked_today = totals.get("blocked_by_cap_this_run", 0)
 
     content = f"""<!doctype html>
@@ -142,7 +146,11 @@ small {{ color: #9fb0db; }}
 <div>Message: {html.escape(str(preflight.get('message', 'OK')))}</div>
 <div>Live env enabled: {html.escape(str(preflight.get('env_live_enabled', 'NA')))}</div>
 <div>Collateral balance: {_fmt_money(preflight.get('collateral_balance_usd', 'NA'))}</div>
-<div>Remote open orders: {html.escape(str(preflight.get('open_orders_count', 'NA')))}</div>
+<div>Remote open orders: {html.escape(str(reconciliation.get('remote_open_orders', preflight.get('open_orders_count', 'NA'))))}</div>
+<div>Reconciliation status: {html.escape(str(reconciliation.get('status', 'NA')))}</div>
+<div>Remote/live drift (local-only): {html.escape(', '.join(reconciliation.get('local_only_tokens', [])[:4]) or 'none')}</div>
+<div>Remote/live drift (remote-only): {html.escape(', '.join(reconciliation.get('remote_only_tokens', [])[:4]) or 'none')}</div>
+<div>Pending settlements: {html.escape(str(settlement.get('pending_count', len(pending_settlements))))}</div>
 <div>Live halted: {html.escape(str(runtime_summary.get('live_halted', False)))}</div>
 <div>Live halt reason: {html.escape(str(runtime_summary.get('live_halt_reason', 'NA')))}</div>
 </div>
@@ -161,10 +169,13 @@ small {{ color: #9fb0db; }}
 <div class='card'>
 <div><strong>Execution / reuse view:</strong></div>
 <div class='kpi-grid'>
-  <div class='kpi'><div class='label'>Reusable freed capital</div><div class='value'>{_fmt_money(reusable_freed_capital)}</div></div>
+  <div class='kpi'><div class='label'>Available for redeploy</div><div class='value'>{_fmt_money(reusable_freed_capital)}</div></div>
+  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>{_fmt_money(totals.get('settled_cash_released_usd', 0))}</div></div>
   <div class='kpi'><div class='label'>Blocked by cap today</div><div class='value'>{blocked_today}</div></div>
   <div class='kpi'><div class='label'>Open positions</div><div class='value'>{len(positions)}</div></div>
   <div class='kpi'><div class='label'>Closed positions</div><div class='value'>{len(closed_positions)}</div></div>
+  <div class='kpi'><div class='label'>Pending settlements</div><div class='value'>{len(pending_settlements)}</div></div>
+  <div class='kpi'><div class='label'>Recent fills synced</div><div class='value'>{len(recent_fills)}</div></div>
   <div class='kpi'><div class='label'>Per-market cap</div><div class='value'>{_fmt_money(totals.get('max_position_usd_per_market', 0))}</div></div>
   <div class='kpi'><div class='label'>Order size</div><div class='value'>{_fmt_money(totals.get('order_size_usd', 0))}</div></div>
 </div>

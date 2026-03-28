@@ -61,6 +61,12 @@ live:
   min_collateral_balance_usd: 5.0
   require_empty_open_orders: true
   max_consecutive_errors: 3
+  data_api_base: https://data-api.polymarket.com
+  sync_recent_trades_limit: 1000
+  settlement_grace_minutes: 180
+  profile_address: ""
+  claim_shell_command: ""
+  claim_shell_timeout_sec: 120
 
 risk:
   # Global guardrails applied before any execution mode-specific overrides.
