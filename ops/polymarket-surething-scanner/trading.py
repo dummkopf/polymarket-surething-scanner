@@ -23,6 +23,8 @@ CLOB_BASE = "https://clob.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 CST = timezone(timedelta(hours=8))
 VALID_MODES = {"paper", "shadow", "live"}
+LIVE_PRICE_DECIMALS = 2
+LIVE_SIZE_DECIMALS = 5
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -491,7 +493,7 @@ def build_execution_plan(
         current = existing.get(market_id)
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
-        shares = round(order_size_usd / candidate.best_ask, 8) if candidate.best_ask > 0 else 0.0
+        shares = round(order_size_usd / candidate.best_ask, LIVE_SIZE_DECIMALS) if candidate.best_ask > 0 else 0.0
 
         reason = None
         if parse_bool(state.get("live_halted"), False) and mode == "live":
@@ -583,7 +585,7 @@ def _append_position(positions: list[dict[str, Any]], candidate: CandidateMarket
             "opened_at": now_iso,
             "entry_price": round(entry, 4),
             "size_usd": round(size_usd, 2),
-            "shares": round(shares, 8),
+            "shares": round(shares, LIVE_SIZE_DECIMALS),
             "last_mark": round(entry, 4),
             "unrealized_pnl": 0.0,
             "restricted": candidate.restricted,
@@ -807,7 +809,11 @@ class LiveTrader:
     def place_buy(self, token_id: str, price: float, shares: float) -> dict[str, Any]:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
-        order = self.client.create_order(OrderArgs(token_id=token_id, price=price, size=shares, side=BUY))
+        normalized_price = round(price, LIVE_PRICE_DECIMALS)
+        normalized_shares = round(shares, LIVE_SIZE_DECIMALS)
+        order = self.client.create_order(
+            OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
+        )
         order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
         order_type = getattr(OrderType, order_type_name, OrderType.FOK)
         post_only = parse_bool(self.live_cfg.get("post_only"), False)
@@ -902,7 +908,7 @@ def normalize_trade(raw: dict[str, Any], meta_by_token: dict[str, dict[str, Any]
         "slug": safe_str(meta.get("slug")),
         "side": side,
         "price": round(price, 6),
-        "shares": round(shares, 8),
+        "shares": round(shares, LIVE_SIZE_DECIMALS),
         "spent_usd": round(spent, 6),
         "timestamp": timestamp,
         "raw": raw,
