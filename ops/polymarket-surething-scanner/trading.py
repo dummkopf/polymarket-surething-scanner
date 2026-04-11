@@ -85,6 +85,13 @@ def safe_str(value: Any, default: str = "") -> str:
         return default
 
 
+def normalize_usd_amount(value: Any, default: float = 0.0) -> float:
+    amount = safe_float(value, default)
+    if abs(amount) >= 100000 and abs(amount - round(amount)) < 1e-9:
+        return amount / 1_000_000.0
+    return amount
+
+
 def parse_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -493,8 +500,6 @@ def build_execution_plan(
             reason = "preflight_failed"
         elif market_id not in confirmed_ids:
             reason = f"await_confirm_{confirm_runs_required}_runs"
-        elif candidate.restricted and mode in {"shadow", "live"}:
-            reason = "restricted_market"
         elif candidate.best_ask <= 0 or shares <= 0:
             reason = "invalid_price"
         elif minutes_to_expiry < min_minutes_to_expiry:
@@ -748,7 +753,7 @@ class LiveTrader:
         if isinstance(allowance_payload, dict):
             for key in ["balance", "balance_available", "available", "balanceTotal", "balance_total"]:
                 if key in allowance_payload:
-                    return safe_float(allowance_payload.get(key), 0.0)
+                    return normalize_usd_amount(allowance_payload.get(key), 0.0)
             for value in allowance_payload.values():
                 balance = self._extract_balance(value)
                 if balance > 0:
@@ -881,7 +886,7 @@ def normalize_trade(raw: dict[str, Any], meta_by_token: dict[str, dict[str, Any]
         return None
     price = safe_float(first_non_empty(raw, ["price", "matched_price", "avgPrice", "avg_price"]), 0.0)
     shares = safe_float(first_non_empty(raw, ["size", "amount", "matched_amount", "shares", "qty"]), 0.0)
-    spent = safe_float(first_non_empty(raw, ["usdc_size", "notional", "value", "amount_usd"]), 0.0)
+    spent = normalize_usd_amount(first_non_empty(raw, ["usdc_size", "notional", "value", "amount_usd"]), 0.0)
     if spent <= 0 and price > 0 and shares > 0:
         spent = price * shares
     side = safe_str(first_non_empty(raw, ["side", "taker_side", "maker_side"])).upper() or "BUY"
@@ -912,14 +917,14 @@ def normalize_remote_position(raw: dict[str, Any], meta_by_token: dict[str, dict
     if shares <= 0:
         return None
     avg_entry = safe_float(first_non_empty(raw, ["avgPrice", "avg_price", "averagePrice", "price"]), 0.0)
-    current_value = safe_float(first_non_empty(raw, ["currentValue", "current_value", "value", "usdValue"]), 0.0)
-    initial_value = safe_float(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
+    current_value = normalize_usd_amount(first_non_empty(raw, ["currentValue", "current_value", "value", "usdValue"]), 0.0)
+    initial_value = normalize_usd_amount(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
     mark = safe_float(first_non_empty(raw, ["curPrice", "current_price", "mark", "price"]), 0.0)
     if mark <= 0 and current_value > 0 and shares > 0:
         mark = current_value / shares
     if initial_value <= 0 and avg_entry > 0 and shares > 0:
         initial_value = avg_entry * shares
-    unrealized = safe_float(first_non_empty(raw, ["cashPnl", "cash_pnl", "unrealizedPnl", "unrealized_pnl"]), current_value - initial_value)
+    unrealized = normalize_usd_amount(first_non_empty(raw, ["cashPnl", "cash_pnl", "unrealizedPnl", "unrealized_pnl"]), current_value - initial_value)
     return {
         "market_id": market_id or safe_str(meta.get("market_id")),
         "condition_id": safe_str(first_non_empty(raw, ["conditionId", "condition_id"])) or safe_str(meta.get("condition_id")),
@@ -943,9 +948,9 @@ def normalize_remote_closed_position(raw: dict[str, Any], meta_by_token: dict[st
     token_id = safe_str(first_non_empty(raw, ["asset", "asset_id", "assetId", "token_id", "tokenId"]))
     market_id = safe_str(first_non_empty(raw, ["market", "condition_id", "conditionId", "market_id"]))
     meta = meta_by_token.get(token_id, {})
-    initial_value = safe_float(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
-    payout = safe_float(first_non_empty(raw, ["currentValue", "current_value", "redeemed", "value", "amountSold", "amountReceived"]), 0.0)
-    realized = safe_float(first_non_empty(raw, ["cashPnl", "cash_pnl", "realizedPnl", "realized_pnl"]), payout - initial_value)
+    initial_value = normalize_usd_amount(first_non_empty(raw, ["initialValue", "initial_value", "cost_basis", "amountBought"]), 0.0)
+    payout = normalize_usd_amount(first_non_empty(raw, ["currentValue", "current_value", "redeemed", "value", "amountSold", "amountReceived"]), 0.0)
+    realized = normalize_usd_amount(first_non_empty(raw, ["cashPnl", "cash_pnl", "realizedPnl", "realized_pnl"]), payout - initial_value)
     if not token_id and not market_id:
         return None
     return {
@@ -1174,9 +1179,9 @@ def parse_total_value(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return {
-        "total_value_usd": round(safe_float(first_non_empty(payload, ["value", "totalValue", "total_value"]), 0.0), 6),
+        "total_value_usd": round(normalize_usd_amount(first_non_empty(payload, ["value", "totalValue", "total_value"]), 0.0), 6),
         "cash_balance_usd": round(
-            safe_float(first_non_empty(payload, ["cash", "cashBalance", "cash_balance", "available", "availableBalance"]), 0.0),
+            normalize_usd_amount(first_non_empty(payload, ["cash", "cashBalance", "cash_balance", "available", "availableBalance"]), 0.0),
             6,
         ),
     }
