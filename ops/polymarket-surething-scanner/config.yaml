@@ -45,10 +45,10 @@ shadow:
   max_daily_orders: 10
 
 live:
-  enabled: false
+  enabled: true
   env_file: .env.live
   require_env_live_enabled: true
-  order_size_usd: 2.0
+  order_size_usd: 1.0
   max_position_usd_per_market: 10.0
   max_total_exposure_usd: 25.0
   max_open_positions: 10
