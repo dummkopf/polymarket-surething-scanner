@@ -15,7 +15,7 @@ import httpx
 from dotenv import load_dotenv
 from eth_account import Account
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 from models import CandidateMarket
@@ -548,25 +548,41 @@ def build_execution_plan(
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
 
-        # Live-accurate price and size computation. In live mode the CLOB rejects:
-        #   * prices that are not valid ticks for this market, and
-        #   * BUY orders where `size` (in outcome tokens) is below the market's
-        #     per-market `min_order_size` (typically 5 shares for binary markets).
-        # Paper/shadow keep the simpler simulation so historical test-sizing stays
-        # meaningful; live mode floors shares to the market minimum.
+        # Per-market CLOB metadata from the /books response.
         tick_size = safe_float(getattr(candidate, "tick_size", DEFAULT_TICK_SIZE), DEFAULT_TICK_SIZE)
         min_order_size = safe_float(getattr(candidate, "min_order_size", DEFAULT_MIN_ORDER_SIZE), DEFAULT_MIN_ORDER_SIZE)
+
         if mode == "live":
+            # Clamp price to a valid tick for this market.
             limit_price = clamp_live_price(candidate.best_ask, tick_size) if candidate.best_ask > 0 else 0.0
+
+            # Polymarket has two distinct order flows:
+            # * FOK/FAK ("market orders"): create_market_order, amount in USDC,
+            #   NO per-share minimum — the user's configured order_size_usd is
+            #   sent directly as the dollar amount to fill.
+            # * GTC/GTD ("limit orders"): create_order, size in SHARES, subject
+            #   to a per-market min_order_size (typically 5 shares).
+            live_order_type = safe_str(settings.get("live", {}).get("order_type"), "FOK").upper()
+            is_market_order = live_order_type in {"FOK", "FAK"}
+
             if limit_price > 0:
                 desired_shares = order_size_usd / limit_price
-                shares = clamp_live_shares(desired_shares, min_order_size)
+                if is_market_order:
+                    # Market-order path: amount is in USDC, no share-count floor.
+                    shares = round(desired_shares, LIVE_SIZE_DECIMALS)
+                else:
+                    # Limit-order path: bump shares to the market's share minimum.
+                    shares = clamp_live_shares(desired_shares, min_order_size)
             else:
                 shares = 0.0
+            # For FOK the actual USD spent is order_size_usd; for limit orders
+            # it's the potentially-bumped shares * price.
+            effective_order_usd = round(order_size_usd, 4) if is_market_order else round(shares * limit_price, 4)
         else:
+            # Paper / shadow: simple simulation, no CLOB constraints enforced.
             limit_price = round(candidate.best_ask, 4) if candidate.best_ask > 0 else 0.0
             shares = round(order_size_usd / candidate.best_ask, LIVE_SIZE_DECIMALS) if candidate.best_ask > 0 else 0.0
-        effective_order_usd = round(shares * limit_price, 4) if shares > 0 else round(order_size_usd, 4)
+            effective_order_usd = round(order_size_usd, 4)
 
         reason = None
         if parse_bool(state.get("live_halted"), False) and mode == "live":
@@ -888,16 +904,35 @@ class LiveTrader:
         self,
         token_id: str,
         price: float,
-        shares: float,
+        order_size_usd: float,
+        shares: float = 0.0,
         tick_size: float | None = None,
         min_order_size: float | None = None,
     ) -> dict[str, Any]:
+        """Place a BUY order using the correct CLOB flow for the configured order type.
+
+        Polymarket exposes two distinct signing paths:
+
+        * **Limit orders** (GTC / GTD) — ``create_order`` with ``OrderArgs(size=shares)``.
+          The CLOB enforces a per-market minimum **in shares** (typically 5).
+        * **Market orders** (FOK / FAK) — ``create_market_order`` with
+          ``MarketOrderArgs(amount=usd)``.  The ``amount`` is in **USDC** for BUY
+          orders and has no 5-share floor, matching what the Polymarket web frontend
+          does for instant fills.
+
+        Previous code always used the limit-order path, hitting the 5-share minimum
+        even for FOK orders destined for immediate fill.
+        """
         if self.client is None:
             raise LiveExecutionError("client not initialized")
 
-        # Defensive: if the caller did not pass tick_size or min_order_size from
-        # the scanner's book response, look them up via the CLOB client so we
-        # never submit at the wrong precision or below the market minimum.
+        order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
+        order_type = getattr(OrderType, order_type_name, OrderType.FOK)
+        post_only = parse_bool(self.live_cfg.get("post_only"), False)
+        if post_only and order_type_name not in {"GTC", "GTD"}:
+            post_only = False
+
+        # Resolve tick_size defensively (needed for both paths).
         resolved_tick = safe_float(tick_size, 0.0)
         if resolved_tick <= 0:
             try:
@@ -905,25 +940,34 @@ class LiveTrader:
             except Exception:
                 resolved_tick = DEFAULT_TICK_SIZE
 
-        resolved_min = safe_float(min_order_size, 0.0)
-        if resolved_min <= 0:
-            resolved_min = DEFAULT_MIN_ORDER_SIZE
-
         normalized_price = clamp_live_price(price, resolved_tick)
-        normalized_shares = clamp_live_shares(shares, resolved_min)
-        if normalized_price <= 0 or normalized_shares <= 0:
-            raise LiveExecutionError(
-                f"invalid order params after normalization: price={normalized_price}, size={normalized_shares}"
+        if normalized_price <= 0:
+            raise LiveExecutionError(f"invalid price after normalization: {normalized_price}")
+
+        if order_type_name in {"FOK", "FAK"}:
+            # ── Market-order path (amount in USDC, no 5-share floor) ──
+            amount_usd = round(max(order_size_usd, 0.01), 2)
+            order = self.client.create_market_order(
+                MarketOrderArgs(
+                    token_id=token_id,
+                    amount=amount_usd,
+                    price=normalized_price,
+                    side=BUY,
+                    order_type=order_type,
+                )
+            )
+        else:
+            # ── Limit-order path (size in shares, 5-share minimum applies) ──
+            resolved_min = safe_float(min_order_size, 0.0)
+            if resolved_min <= 0:
+                resolved_min = DEFAULT_MIN_ORDER_SIZE
+            normalized_shares = clamp_live_shares(shares, resolved_min)
+            if normalized_shares <= 0:
+                raise LiveExecutionError(f"invalid share size after normalization: {normalized_shares}")
+            order = self.client.create_order(
+                OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
             )
 
-        order = self.client.create_order(
-            OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
-        )
-        order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
-        order_type = getattr(OrderType, order_type_name, OrderType.FOK)
-        post_only = parse_bool(self.live_cfg.get("post_only"), False)
-        if post_only and order_type_name not in {"GTC", "GTD"}:
-            post_only = False
         return self.client.post_order(order, order_type, post_only=post_only)
 
     def fetch_open_orders(self) -> list[dict[str, Any]]:
@@ -1451,6 +1495,7 @@ def execute_live(
             response = trader.place_buy(
                 token_id=safe_str(item.get("token_id")),
                 price=limit_price,
+                order_size_usd=safe_float(item.get("order_size_usd"), 0.0),
                 shares=safe_float(item.get("shares"), 0.0),
                 tick_size=safe_float(item.get("tick_size"), 0.0) or None,
                 min_order_size=safe_float(item.get("min_order_size"), 0.0) or None,
