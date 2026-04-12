@@ -21,6 +21,9 @@ class CandidateMarket:
     slug: str
     event_slug: str
     restricted: bool = False
+    tick_size: float = 0.01
+    min_order_size: float = 5.0
+    neg_risk: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

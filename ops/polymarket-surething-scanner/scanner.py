@@ -287,6 +287,34 @@ def get_best_ask(book: dict[str, Any]) -> float | None:
     return min(prices) if prices else None
 
 
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_book_tick_size(book: dict[str, Any]) -> float:
+    # /books returns tick_size as a string like "0.01" or "0.001".
+    return _coerce_float(book.get("tick_size") if isinstance(book, dict) else None, 0.01)
+
+
+def get_book_min_order_size(book: dict[str, Any]) -> float:
+    # /books returns min_order_size in outcome-token units (shares).
+    return _coerce_float(book.get("min_order_size") if isinstance(book, dict) else None, 5.0)
+
+
+def get_book_neg_risk(book: dict[str, Any]) -> bool:
+    value = book.get("neg_risk") if isinstance(book, dict) else None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
 def depth_usd_upto(book: dict[str, Any], max_price: float) -> float:
     asks = book.get("asks") if isinstance(book, dict) else None
     if not isinstance(asks, list):
@@ -427,6 +455,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                     slug=str(market.get("slug", "")),
                     event_slug=event_slug,
                     restricted=bool(item.get("restricted", False)),
+                    tick_size=get_book_tick_size(book),
+                    min_order_size=get_book_min_order_size(book),
+                    neg_risk=get_book_neg_risk(book),
                 )
             )
 

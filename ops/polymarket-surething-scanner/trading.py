@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -23,8 +24,61 @@ CLOB_BASE = "https://clob.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
 CST = timezone(timedelta(hours=8))
 VALID_MODES = {"paper", "shadow", "live"}
-LIVE_PRICE_DECIMALS = 2
+# Paper/shadow simulation records shares at this precision for display. Live
+# submissions go through the Polymarket OrderBuilder which rounds BUY `size`
+# DOWN to LIVE_CLOB_SIZE_DECIMALS (2), so the live clamp uses that instead.
 LIVE_SIZE_DECIMALS = 5
+LIVE_CLOB_SIZE_DECIMALS = 2
+DEFAULT_TICK_SIZE = 0.01
+DEFAULT_MIN_ORDER_SIZE = 5.0
+
+
+def _tick_decimals(tick_size: float) -> int:
+    tick = max(float(tick_size or DEFAULT_TICK_SIZE), 1e-6)
+    return max(0, int(round(-math.log10(tick))))
+
+
+def _ceil_to_tick(price: float, tick_size: float) -> float:
+    tick = float(tick_size or DEFAULT_TICK_SIZE)
+    if tick <= 0:
+        return round(price, 2)
+    # Ceil so that a BUY at best_ask actually crosses the posted ask level.
+    steps = math.ceil((price - 1e-12) / tick)
+    return round(steps * tick, _tick_decimals(tick) + 4)
+
+
+def _floor_to_tick(price: float, tick_size: float) -> float:
+    tick = float(tick_size or DEFAULT_TICK_SIZE)
+    if tick <= 0:
+        return round(price, 2)
+    steps = math.floor((price + 1e-12) / tick)
+    return round(steps * tick, _tick_decimals(tick) + 4)
+
+
+def clamp_live_price(price: float, tick_size: float) -> float:
+    tick = float(tick_size or DEFAULT_TICK_SIZE)
+    decimals = _tick_decimals(tick)
+    # BUY order: round up to next valid tick so we cross the spread.
+    normalized = _ceil_to_tick(price, tick)
+    upper = round(1.0 - tick, decimals + 4)
+    lower = round(tick, decimals + 4)
+    if normalized > upper:
+        normalized = upper
+    if normalized < lower:
+        normalized = lower
+    return round(normalized, decimals)
+
+
+def clamp_live_shares(shares: float, min_order_size: float) -> float:
+    floor_size = max(float(min_order_size or DEFAULT_MIN_ORDER_SIZE), 0.0)
+    scale = 10 ** LIVE_CLOB_SIZE_DECIMALS
+    # OrderBuilder rounds BUY size DOWN to LIVE_CLOB_SIZE_DECIMALS. Match that
+    # here so the plan's "shares" matches what the on-chain order encodes.
+    rounded_down = math.floor(max(shares, 0.0) * scale) / scale
+    if rounded_down < floor_size:
+        # Round UP to the next valid step that clears the market minimum.
+        rounded_down = math.ceil(floor_size * scale) / scale
+    return round(rounded_down, LIVE_CLOB_SIZE_DECIMALS)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -493,7 +547,26 @@ def build_execution_plan(
         current = existing.get(market_id)
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
-        shares = round(order_size_usd / candidate.best_ask, LIVE_SIZE_DECIMALS) if candidate.best_ask > 0 else 0.0
+
+        # Live-accurate price and size computation. In live mode the CLOB rejects:
+        #   * prices that are not valid ticks for this market, and
+        #   * BUY orders where `size` (in outcome tokens) is below the market's
+        #     per-market `min_order_size` (typically 5 shares for binary markets).
+        # Paper/shadow keep the simpler simulation so historical test-sizing stays
+        # meaningful; live mode floors shares to the market minimum.
+        tick_size = safe_float(getattr(candidate, "tick_size", DEFAULT_TICK_SIZE), DEFAULT_TICK_SIZE)
+        min_order_size = safe_float(getattr(candidate, "min_order_size", DEFAULT_MIN_ORDER_SIZE), DEFAULT_MIN_ORDER_SIZE)
+        if mode == "live":
+            limit_price = clamp_live_price(candidate.best_ask, tick_size) if candidate.best_ask > 0 else 0.0
+            if limit_price > 0:
+                desired_shares = order_size_usd / limit_price
+                shares = clamp_live_shares(desired_shares, min_order_size)
+            else:
+                shares = 0.0
+        else:
+            limit_price = round(candidate.best_ask, 4) if candidate.best_ask > 0 else 0.0
+            shares = round(order_size_usd / candidate.best_ask, LIVE_SIZE_DECIMALS) if candidate.best_ask > 0 else 0.0
+        effective_order_usd = round(shares * limit_price, 4) if shares > 0 else round(order_size_usd, 4)
 
         reason = None
         if parse_bool(state.get("live_halted"), False) and mode == "live":
@@ -502,19 +575,21 @@ def build_execution_plan(
             reason = "preflight_failed"
         elif market_id not in confirmed_ids:
             reason = f"await_confirm_{confirm_runs_required}_runs"
-        elif candidate.best_ask <= 0 or shares <= 0:
+        elif candidate.restricted and mode in {"shadow", "live"}:
+            reason = "restricted_market"
+        elif candidate.best_ask <= 0 or shares <= 0 or limit_price <= 0:
             reason = "invalid_price"
         elif minutes_to_expiry < min_minutes_to_expiry:
             reason = "too_close_to_expiry"
-        elif candidate.depth_usd < order_size_usd * min_depth_multiple:
+        elif candidate.depth_usd < effective_order_usd * min_depth_multiple:
             reason = "insufficient_depth"
         elif current and not allow_add:
             reason = "already_open"
-        elif current_size + order_size_usd > max_position_usd + 1e-9:
+        elif current_size + effective_order_usd > max_position_usd + 1e-9:
             reason = "per_market_cap"
         elif daily_orders + planned_orders >= max_daily_orders:
             reason = "daily_order_cap"
-        elif current_exposure + planned_exposure + order_size_usd > max_total_exposure + 1e-9:
+        elif current_exposure + planned_exposure + effective_order_usd > max_total_exposure + 1e-9:
             reason = "total_exposure_cap"
         elif (len(positions) + planned_new_positions) >= max_open_positions and not current:
             reason = "max_open_positions"
@@ -524,7 +599,7 @@ def build_execution_plan(
         action = "skip" if reason else "open"
         if action == "open":
             planned_orders += 1
-            planned_exposure += order_size_usd
+            planned_exposure += effective_order_usd
             if not current:
                 planned_new_positions += 1
 
@@ -537,9 +612,12 @@ def build_execution_plan(
                 "slug": candidate.slug,
                 "event_slug": candidate.event_slug,
                 "best_ask": round(candidate.best_ask, 4),
+                "limit_price": limit_price,
                 "depth_usd": round(candidate.depth_usd, 2),
-                "order_size_usd": round(order_size_usd, 2),
+                "order_size_usd": round(effective_order_usd or order_size_usd, 2),
                 "shares": shares,
+                "tick_size": tick_size,
+                "min_order_size": min_order_size,
                 "minutes_to_expiry": minutes_to_expiry,
                 "restricted": candidate.restricted,
                 "action": action,
@@ -554,7 +632,7 @@ def _append_position(positions: list[dict[str, Any]], candidate: CandidateMarket
     market_id = candidate.market_id
     existing = next((position for position in positions if str(position.get("market_id", "")) == market_id), None)
     now_iso = now_iso_cst()
-    entry = safe_float(plan_item.get("best_ask"), candidate.best_ask)
+    entry = safe_float(plan_item.get("limit_price"), 0.0) or safe_float(plan_item.get("best_ask"), candidate.best_ask)
     size_usd = safe_float(plan_item.get("order_size_usd"), 0.0)
     shares = safe_float(plan_item.get("shares"), 0.0)
 
@@ -806,11 +884,38 @@ class LiveTrader:
             "open_orders_count": open_orders_count,
         }
 
-    def place_buy(self, token_id: str, price: float, shares: float) -> dict[str, Any]:
+    def place_buy(
+        self,
+        token_id: str,
+        price: float,
+        shares: float,
+        tick_size: float | None = None,
+        min_order_size: float | None = None,
+    ) -> dict[str, Any]:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
-        normalized_price = round(price, LIVE_PRICE_DECIMALS)
-        normalized_shares = round(shares, LIVE_SIZE_DECIMALS)
+
+        # Defensive: if the caller did not pass tick_size or min_order_size from
+        # the scanner's book response, look them up via the CLOB client so we
+        # never submit at the wrong precision or below the market minimum.
+        resolved_tick = safe_float(tick_size, 0.0)
+        if resolved_tick <= 0:
+            try:
+                resolved_tick = float(self.client.get_tick_size(token_id))
+            except Exception:
+                resolved_tick = DEFAULT_TICK_SIZE
+
+        resolved_min = safe_float(min_order_size, 0.0)
+        if resolved_min <= 0:
+            resolved_min = DEFAULT_MIN_ORDER_SIZE
+
+        normalized_price = clamp_live_price(price, resolved_tick)
+        normalized_shares = clamp_live_shares(shares, resolved_min)
+        if normalized_price <= 0 or normalized_shares <= 0:
+            raise LiveExecutionError(
+                f"invalid order params after normalization: price={normalized_price}, size={normalized_shares}"
+            )
+
         order = self.client.create_order(
             OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
         )
@@ -1326,6 +1431,9 @@ def execute_live(
     for item in plan:
         if item.get("action") != "open":
             continue
+        # Prefer the plan's already-clamped limit_price (valid tick) over the raw
+        # best_ask the scanner observed; fall back for older plan formats.
+        limit_price = safe_float(item.get("limit_price"), 0.0) or safe_float(item.get("best_ask"), 0.0)
         journal_event = {
             "ts": now_iso_cst(),
             "mode": mode,
@@ -1333,15 +1441,19 @@ def execute_live(
             "condition_id": item.get("condition_id"),
             "token_id": item.get("token_id"),
             "question": item.get("question"),
-            "price": item.get("best_ask"),
+            "price": limit_price,
             "shares": item.get("shares"),
             "order_size_usd": item.get("order_size_usd"),
+            "tick_size": item.get("tick_size"),
+            "min_order_size": item.get("min_order_size"),
         }
         try:
             response = trader.place_buy(
                 token_id=safe_str(item.get("token_id")),
-                price=safe_float(item.get("best_ask"), 0.0),
+                price=limit_price,
                 shares=safe_float(item.get("shares"), 0.0),
+                tick_size=safe_float(item.get("tick_size"), 0.0) or None,
+                min_order_size=safe_float(item.get("min_order_size"), 0.0) or None,
             )
             journal_event["response"] = response
             if not response_success(response):
