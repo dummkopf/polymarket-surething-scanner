@@ -427,6 +427,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                     slug=str(market.get("slug", "")),
                     event_slug=event_slug,
                     restricted=bool(item.get("restricted", False)),
+                    tick_size=float(book.get("tick_size") or 0.01),
+                    min_order_size=float(book.get("min_order_size") or 0.0),
+                    neg_risk=bool(book.get("neg_risk", False)),
                 )
             )
 

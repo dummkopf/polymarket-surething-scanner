@@ -14,7 +14,7 @@ import httpx
 from dotenv import load_dotenv
 from eth_account import Account
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OpenOrderParams, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 from models import CandidateMarket
@@ -25,6 +25,20 @@ CST = timezone(timedelta(hours=8))
 VALID_MODES = {"paper", "shadow", "live"}
 LIVE_PRICE_DECIMALS = 2
 LIVE_SIZE_DECIMALS = 5
+
+
+def clamp_live_price(price: float, tick_size: float = 0.01) -> float:
+    tick = tick_size if tick_size and tick_size > 0 else 0.01
+    steps = round(price / tick)
+    return round(steps * tick, 8)
+
+
+def clamp_live_shares(shares: float, min_order_size: float = 0.0, decimals: int = LIVE_SIZE_DECIMALS) -> float:
+    value = round(shares, decimals)
+    floor = round(min_order_size, decimals) if min_order_size and min_order_size > 0 else 0.0
+    if floor > 0 and value < floor:
+        return floor
+    return value
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -806,16 +820,32 @@ class LiveTrader:
             "open_orders_count": open_orders_count,
         }
 
-    def place_buy(self, token_id: str, price: float, shares: float) -> dict[str, Any]:
+    def place_buy(
+        self,
+        token_id: str,
+        price: float,
+        shares: float,
+        order_size_usd: float | None = None,
+        tick_size: float = 0.01,
+        min_order_size: float = 0.0,
+    ) -> dict[str, Any]:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
-        normalized_price = round(price, LIVE_PRICE_DECIMALS)
-        normalized_shares = round(shares, LIVE_SIZE_DECIMALS)
+        order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
+        order_type = getattr(OrderType, order_type_name, OrderType.FOK)
+        normalized_price = clamp_live_price(price, tick_size)
+        normalized_shares = clamp_live_shares(shares, min_order_size=min_order_size, decimals=LIVE_SIZE_DECIMALS)
+
+        if order_type_name in {"FOK", "FAK"}:
+            usd_amount = round(order_size_usd if order_size_usd is not None else normalized_price * normalized_shares, LIVE_PRICE_DECIMALS)
+            order = self.client.create_market_order(
+                MarketOrderArgs(token_id=token_id, amount=usd_amount, side=BUY, price=normalized_price, order_type=order_type)
+            )
+            return self.client.post_order(order, order_type, post_only=False)
+
         order = self.client.create_order(
             OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
         )
-        order_type_name = safe_str(self.live_cfg.get("order_type"), "FOK").upper()
-        order_type = getattr(OrderType, order_type_name, OrderType.FOK)
         post_only = parse_bool(self.live_cfg.get("post_only"), False)
         if post_only and order_type_name not in {"GTC", "GTD"}:
             post_only = False
@@ -1322,6 +1352,7 @@ def execute_live(
     errors = safe_int(state.get("consecutive_live_errors", 0))
     state["last_preflight"] = preflight
     accepted_orders = 0
+    candidates_by_market = {candidate.market_id: candidate for candidate in candidates if candidate.market_id}
 
     for item in plan:
         if item.get("action") != "open":
@@ -1338,10 +1369,14 @@ def execute_live(
             "order_size_usd": item.get("order_size_usd"),
         }
         try:
+            candidate = candidates_by_market.get(safe_str(item.get("market_id")))
             response = trader.place_buy(
                 token_id=safe_str(item.get("token_id")),
                 price=safe_float(item.get("best_ask"), 0.0),
                 shares=safe_float(item.get("shares"), 0.0),
+                order_size_usd=safe_float(item.get("order_size_usd"), 0.0),
+                tick_size=safe_float(candidate.tick_size, 0.01) if candidate is not None else 0.01,
+                min_order_size=safe_float(candidate.min_order_size, 0.0) if candidate is not None else 0.0,
             )
             journal_event["response"] = response
             if not response_success(response):
