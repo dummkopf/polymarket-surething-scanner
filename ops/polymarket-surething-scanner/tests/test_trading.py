@@ -26,7 +26,7 @@ from trading import (
 )
 
 
-def make_candidate(market_id: str = "m1", restricted: bool = False, hours_ahead: int = 8) -> CandidateMarket:
+def make_candidate(market_id: str = "m1", hours_ahead: int = 8) -> CandidateMarket:
     return CandidateMarket(
         market_id=market_id,
         condition_id=f"cond-{market_id}",
@@ -41,7 +41,6 @@ def make_candidate(market_id: str = "m1", restricted: bool = False, hours_ahead:
         volume=1000.0,
         slug=f"slug-{market_id}",
         event_slug=f"event-{market_id}",
-        restricted=restricted,
     )
 
 
@@ -58,17 +57,17 @@ class TradingTests(unittest.TestCase):
             _, confirmed = update_signal_state(path, [candidate], confirm_runs_required=2)
             self.assertEqual(confirmed, {"m1"})
 
-    def test_live_plan_blocks_restricted_market(self) -> None:
+    def test_live_plan_waits_for_confirmation(self) -> None:
         config = {
             "runtime": {"mode": "live"},
             "live": {"enabled": True},
         }
         settings = build_mode_settings(config, "live")
         state = load_trading_state(Path("/tmp/does-not-exist.json"), "live", settings)
-        candidate = make_candidate(restricted=True)
-        plan = build_execution_plan([candidate], state, settings, confirmed_ids={candidate.market_id}, preflight={"status": "ok"})
+        candidate = make_candidate()
+        plan = build_execution_plan([candidate], state, settings, confirmed_ids=set(), preflight={"status": "ok"})
         self.assertEqual(plan[0]["action"], "skip")
-        self.assertEqual(plan[0]["reason"], "restricted_market")
+        self.assertEqual(plan[0]["reason"], "await_confirm_2_runs")
 
     def test_append_new_fills_dedupes_trade_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

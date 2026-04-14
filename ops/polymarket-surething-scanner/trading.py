@@ -315,7 +315,6 @@ def update_signal_state(path: Path, candidates: list[CandidateMarket], confirm_r
             "last_seen_at": now_iso_cst(),
             "last_best_ask": candidate.best_ask,
             "last_depth_usd": candidate.depth_usd,
-            "restricted": candidate.restricted,
         }
 
     state["updated_at"] = now_iso_cst()
@@ -555,7 +554,6 @@ def build_execution_plan(
                 "order_size_usd": round(order_size_usd, 2),
                 "shares": shares,
                 "minutes_to_expiry": minutes_to_expiry,
-                "restricted": candidate.restricted,
                 "action": action,
                 "reason": reason or "approved",
                 "expected_resolve_at": candidate.end_date.isoformat(),
@@ -602,7 +600,6 @@ def _append_position(positions: list[dict[str, Any]], candidate: CandidateMarket
             "shares": round(shares, LIVE_SIZE_DECIMALS),
             "last_mark": round(entry, 4),
             "unrealized_pnl": 0.0,
-            "restricted": candidate.restricted,
             "last_order": plan_item,
             "expected_resolve_at": candidate.end_date.isoformat(),
         }

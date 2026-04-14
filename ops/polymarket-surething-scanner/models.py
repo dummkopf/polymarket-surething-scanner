@@ -20,7 +20,6 @@ class CandidateMarket:
     volume: float
     slug: str
     event_slug: str
-    restricted: bool = False
     tick_size: float = 0.01
     min_order_size: float = 0.0
     neg_risk: bool = False

@@ -15,16 +15,20 @@ runtime:
 
 scanner:
   hours_ahead: 72
+  quick_yes_price_min: 0.90
+  quick_yes_price_max: 0.98
   price_min: 0.92
   price_max: 0.99
   min_depth_usd: 10.0
+  depth_price_cap: 0.97
   gamma_page_size: 100
+  books_chunk_size: 60
   clob_pause_sec: 0.5
   stale_disagree_threshold: 0.07
-  filter_restricted: false
   exclude_crypto: true
   exclude_stock_related: true
   exclude_sports_related: true
+  exclude_commodity_related: true
   exclude_high_randomness_narrative: true
 
 paper:

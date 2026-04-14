@@ -23,11 +23,41 @@ def _fmt_money(value: Any, digits: int = 2) -> str:
         return "NA"
 
 
+def _fmt_number(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):,.{digits}f}"
+    except Exception:
+        return "NA"
+
+
 def _fmt_pairs(payload: dict[str, Any], limit: int = 6) -> str:
     if not isinstance(payload, dict) or not payload:
         return "NA"
     items = sorted(payload.items(), key=lambda item: (-float(item[1]), item[0]))[:limit]
     return ", ".join(f"{html.escape(str(key))}: {value}" for key, value in items)
+
+
+def _fmt_thresholds(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict) or not payload:
+        return "NA"
+    ordered_keys = [
+        "hours_ahead",
+        "quick_yes_price_min",
+        "quick_yes_price_max",
+        "price_min",
+        "price_max",
+        "min_depth_usd",
+        "depth_price_cap",
+        "stale_disagree_threshold",
+        "gamma_page_size",
+        "books_chunk_size",
+        "clob_pause_sec",
+    ]
+    pairs = []
+    for key in ordered_keys:
+        if key in payload:
+            pairs.append(f"{html.escape(key)}={html.escape(str(payload[key]))}")
+    return ", ".join(pairs) if pairs else "NA"
 
 
 def render_dashboard(
@@ -52,23 +82,35 @@ def render_dashboard(
     latest_day = sorted(by_day.keys())[-1] if by_day else None
     day_data = by_day.get(latest_day, {}) if latest_day else {}
     mode = runtime_summary.get("mode") or trading_state.get("mode") or "paper"
+    thresholds = metrics.get("thresholds", {}) if isinstance(metrics, dict) else {}
 
     candidate_rows = []
     for candidate in candidates:
         event_slug = candidate.get("event_slug") or candidate.get("slug") or ""
         market_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
-        restricted_badge = " <small>restricted</small>" if candidate.get("restricted") else ""
+        try:
+            end_dt = datetime.fromisoformat(str(candidate.get("end_date", "")).replace("Z", "+00:00"))
+            hours_left = max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0)
+            hours_left_text = f"{hours_left:.1f}h"
+        except Exception:
+            hours_left_text = "NA"
         candidate_rows.append(
             "<tr>"
             f"<td><a href='{html.escape(market_url)}' target='_blank'>open</a></td>"
-            f"<td>{html.escape(candidate.get('question', ''))}{restricted_badge}</td>"
+            f"<td>{html.escape(candidate.get('question', ''))}</td>"
+            f"<td>{html.escape(str(candidate.get('category_tag', 'NA')))}</td>"
             f"<td>{candidate.get('best_ask', 'NA')}</td>"
+            f"<td>{_fmt_number(candidate.get('volume', 'NA'))}</td>"
             f"<td>{candidate.get('depth_usd', 'NA')}</td>"
+            f"<td>{hours_left_text}</td>"
             f"<td>{html.escape(candidate.get('end_date', ''))}</td>"
+            f"<td>{_fmt_number(candidate.get('tick_size', 'NA'), 4)}</td>"
+            f"<td>{_fmt_number(candidate.get('min_order_size', 'NA'), 5)}</td>"
+            f"<td>{html.escape(str(candidate.get('neg_risk', 'NA')))}</td>"
             f"<td>{html.escape(candidate.get('resolution_source', 'NA'))}</td>"
             "</tr>"
         )
-    candidate_body = "\n".join(candidate_rows) if candidate_rows else "<tr><td colspan='6'>No candidates</td></tr>"
+    candidate_body = "\n".join(candidate_rows) if candidate_rows else "<tr><td colspan='12'>No candidates</td></tr>"
 
     exposure_rows = []
     for position in sorted(positions, key=lambda item: float(item.get("size_usd", 0) or 0), reverse=True)[:10]:
@@ -136,9 +178,10 @@ small {{ color: #9fb0db; }}
 <div><strong>Planned orders this run:</strong> {runtime_summary.get('planned_orders', 'NA')}</div>
 <div><strong>Executed orders this run:</strong> {runtime_summary.get('executed_orders', 'NA')}</div>
 <div><strong>Book/price stale skips:</strong> {metrics.get('stale_skips', 'NA')}</div>
-<div><strong>Restricted seen:</strong> {metrics.get('restricted_seen', 'NA')}</div>
-<div><strong>Restricted skips:</strong> {metrics.get('restricted_skips', 'NA')}</div>
+<div><strong>Scanner rules:</strong> shared across paper / shadow / live</div>
+<div><strong>Scanner thresholds:</strong> {_fmt_thresholds(thresholds)}</div>
 <div><strong>Blocked reasons:</strong> {_fmt_pairs(runtime_summary.get('blocked_reasons', {}))}</div>
+<div><strong>Filter skips:</strong> crypto={metrics.get('crypto_skips', 'NA')}, stock={metrics.get('stock_skips', 'NA')}, sports={metrics.get('sports_skips', 'NA')}, commodity={metrics.get('commodity_skips', 'NA')}, narrative={metrics.get('high_randomness_narrative_skips', 'NA')}</div>
 </div>
 <div class='card'>
 <div><strong>Execution readiness:</strong></div>
@@ -218,7 +261,7 @@ small {{ color: #9fb0db; }}
 </div>
 <div class='card'>
 <table>
-<thead><tr><th>Link</th><th>Question</th><th>Best Ask</th><th>Depth USD</th><th>End Date</th><th>Resolution Source</th></tr></thead>
+<thead><tr><th>Link</th><th>Question</th><th>Category</th><th>Best Ask</th><th>Volume</th><th>Depth USD</th><th>ETA</th><th>End Date</th><th>Tick</th><th>Min Size</th><th>Neg Risk</th><th>Resolution Source</th></tr></thead>
 <tbody>{candidate_body}</tbody>
 </table>
 </div>
