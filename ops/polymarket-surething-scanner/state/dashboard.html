@@ -1,1 +1,153 @@
-<html><body><h1>Reset</h1><p>State cleared.</p></body></html>
+<!doctype html>
+<html><head><meta charset='utf-8'><title>Polymarket Scanner Dashboard</title>
+<style>
+body { font-family: Inter, Arial, sans-serif; padding: 20px; background: #0b1020; color: #dbe4ff; }
+.card { background: #121a33; border: 1px solid #1f2a4f; border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+a { color: #8ec5ff; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { border-bottom: 1px solid #26345f; padding: 8px; text-align: left; vertical-align: top; }
+small { color: #9fb0db; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.kpi { background: #0d1530; border-radius: 8px; padding: 10px; }
+.kpi .label { color: #9fb0db; font-size: 12px; }
+.kpi .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+.kpi .sub { color: #9fb0db; font-size: 11px; margin-top: 4px; }
+.note { color: #b9c7ee; margin-top: 8px; font-size: 12px; }
+.badge { display: inline-block; border-radius: 999px; padding: 2px 8px; background: #1d4ed8; color: white; font-size: 12px; }
+</style></head><body>
+<h2>Polymarket Sure-Thing Scanner</h2>
+<div class='card'>
+<div><strong>Generated (UTC):</strong> 2026-04-15T00:17:23.548595+00:00</div>
+<div><strong>Execution mode:</strong> <span class='badge'>paper</span></div>
+<div><strong>Total scanned:</strong> 49753</div>
+<div><strong>Quick-pass markets:</strong> 8</div>
+<div><strong>Candidates:</strong> 3</div>
+<div><strong>Confirmed candidates:</strong> 3</div>
+<div><strong>Planned orders this run:</strong> 3</div>
+<div><strong>Executed orders this run:</strong> 3</div>
+<div><strong>Book/price stale skips:</strong> 1</div>
+<div><strong>Scanner rules:</strong> shared across paper / shadow / live</div>
+<div><strong>Scanner thresholds:</strong> hours_ahead=72.0, quick_yes_price_min=0.9, quick_yes_price_max=0.98, price_min=0.92, price_max=0.99, min_depth_usd=10.0, depth_price_cap=0.97, stale_disagree_threshold=0.07, gamma_page_size=100, books_chunk_size=60, clob_pause_sec=0.5</div>
+<div><strong>Blocked reasons:</strong> NA</div>
+<div><strong>Filter skips:</strong> crypto=3805, stock=1853, sports=32992, commodity=830, narrative=124</div>
+</div>
+<div class='card'>
+<div><strong>Execution readiness:</strong></div>
+<div>Preflight status: skipped</div>
+<div>Message: OK</div>
+<div>Live env enabled: NA</div>
+<div>Collateral balance: NA</div>
+<div>Remote open orders: NA</div>
+<div>Reconciliation status: NA</div>
+<div>Remote/live drift (local-only): none</div>
+<div>Remote/live drift (remote-only): none</div>
+<div>Pending settlements: 0</div>
+<div>Live halted: False</div>
+<div>Live halt reason: None</div>
+</div>
+<div class='card'>
+<div><strong>Recent performance (2026-04-14):</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>$0.00</div><div class='sub'>realized + open mark-to-market</div></div>
+  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>$0.00</div><div class='sub'>closed and settled today</div></div>
+  <div class='kpi'><div class='label'>Open unrealized PnL</div><div class='value'>$0.0000</div><div class='sub'>current open-book mark</div></div>
+  <div class='kpi'><div class='label'>Equity now</div><div class='value'>$3.0000</div><div class='sub'>open cost + realized + unrealized</div></div>
+  <div class='kpi'><div class='label'>Orders placed today</div><div class='value'>3</div><div class='sub'>executed orders in day bucket</div></div>
+  <div class='kpi'><div class='label'>Scans today</div><div class='value'>2</div><div class='sub'>candidate refresh cycles</div></div>
+  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>$3.00</div><div class='sub'>mark value of open positions</div></div>
+  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>$3.00</div><div class='sub'>capital paid into open positions</div></div>
+</div>
+<div class='note'>Daily figures are anchored to the latest trading day with available state data, not just the latest scanner snapshot.</div>
+</div>
+<div class='card'>
+<div><strong>Historical performance:</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>$0.00</div><div class='sub'>realized history + current unrealized</div></div>
+  <div class='kpi'><div class='label'>Historical realized gain</div><div class='value'>$0.00</div><div class='sub'>closed-position accumulated PnL</div></div>
+  <div class='kpi'><div class='label'>Closed positions</div><div class='value'>0</div><div class='sub'>historical settled positions</div></div>
+  <div class='kpi'><div class='label'>Win rate</div><div class='value'>NA</div><div class='sub'>wins / (wins + losses)</div></div>
+  <div class='kpi'><div class='label'>Average closed PnL</div><div class='value'>$0.0000</div><div class='sub'>per closed position</div></div>
+  <div class='kpi'><div class='label'>Best / worst close</div><div class='value'>NA / NA</div><div class='sub'>largest realized outcomes</div></div>
+  <div class='kpi'><div class='label'>Cumulative buy notional</div><div class='value'>$3.00</div><div class='sub'>historical capital deployed</div></div>
+  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>$0.00</div><div class='sub'>cash returned from settlements</div></div>
+</div>
+</div>
+<div class='card'>
+<div><strong>Daily performance trend (last 2 days):</strong></div>
+<table>
+<thead><tr><th>Day</th><th>Net PnL</th><th>Realized</th><th>Deployed</th><th>Orders</th><th>Scans</th></tr></thead>
+<tbody><tr><td>2026-04-14</td><td>$0.00</td><td>$0.00</td><td>$3.00</td><td>3</td><td>2</td></tr>
+<tr><td>2026-04-13</td><td>$0.00</td><td>$0.00</td><td>$0.00</td><td>0</td><td>1</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<div><strong>Execution / reuse view:</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Available for redeploy</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>$0.00</div></div>
+  <div class='kpi'><div class='label'>Blocked by cap today</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Open positions</div><div class='value'>3</div></div>
+  <div class='kpi'><div class='label'>Closed positions</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Pending settlements</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Recent fills synced</div><div class='value'>0</div></div>
+  <div class='kpi'><div class='label'>Per-market cap</div><div class='value'>$20.00</div></div>
+  <div class='kpi'><div class='label'>Order size</div><div class='value'>$1.00</div></div>
+</div>
+</div>
+<div class='card'>
+<div><strong>Daily scanner activity (2026-04-14):</strong></div>
+<div>Scans today: 2</div>
+<div>Latest available bets: 3</div>
+<div>Total available bets seen today (sum): 7</div>
+<div>Unique available bets today: 4</div>
+<div>Planned orders today: 3</div>
+<div>Orders placed today: 3</div>
+<div>Blocked reasons today: await_confirm_2_runs: 4</div>
+</div>
+<div class='card'>
+<div><strong>Recent closed positions:</strong></div>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Closed at</th><th>Payout</th><th>Realized PnL</th><th>Reason</th></tr></thead>
+<tbody><tr><td colspan='6'>No closed positions yet</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<div><strong>Current mode status:</strong></div>
+<div>Open positions: 3</div>
+<div>Unrealized PnL: $0.0000</div>
+<div>Equity: $3.0000</div>
+<div>Orders this run: 3</div>
+<div>New markets this run: 3</div>
+<div>Adds to existing this run: 0</div>
+<div>Closed this run: 0</div>
+<div>Per-bet max cap: $20.00</div>
+<div>Cumulative buy notional (historical): $3.00</div>
+</div>
+<div class='card'>
+<div><strong>Top current exposure:</strong></div>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Size USD</th><th>Entry</th><th>Mark</th><th>Unrealized PnL</th></tr></thead>
+<tbody><tr><td><a href='https://polymarket.com/event/best-ai-model-on-april-17-style-control-off' target='_blank'>open</a></td><td>Will claude-opus-4-6-thinking be the best AI model on April 17, 2026?</td><td>$1.00</td><td>0.9560</td><td>0.9560</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/flu-hospitalization-rate-week-14-2026' target='_blank'>open</a></td><td>Will the U.S. flu hospitalization rate per 100,000 in Week 14 be between 80 and 85?</td><td>$1.00</td><td>0.9400</td><td>0.9400</td><td>$0.0000</td></tr>
+<tr><td><a href='https://polymarket.com/event/highest-temperature-in-austin-on-april-15-2026' target='_blank'>open</a></td><td>Will the highest temperature in Austin be 80°F or higher on April 15?</td><td>$1.00</td><td>0.9200</td><td>0.9200</td><td>$0.0000</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<div><strong>Latest execution plan:</strong></div>
+<table>
+<thead><tr><th>Action</th><th>Question</th><th>Best Ask</th><th>Order Size</th><th>Reason</th></tr></thead>
+<tbody><tr><td style='color:#6ee7b7'>open</td><td>Will claude-opus-4-6-thinking be the best AI model on April 17, 2026?</td><td>0.956</td><td>$1.00</td><td>approved</td></tr>
+<tr><td style='color:#6ee7b7'>open</td><td>Will the U.S. flu hospitalization rate per 100,000 in Week 14 be between 80 and 85?</td><td>0.94</td><td>$1.00</td><td>approved</td></tr>
+<tr><td style='color:#6ee7b7'>open</td><td>Will the highest temperature in Austin be 80°F or higher on April 15?</td><td>0.92</td><td>$1.00</td><td>approved</td></tr></tbody>
+</table>
+</div>
+<div class='card'>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Category</th><th>Best Ask</th><th>Volume</th><th>Depth USD</th><th>ETA</th><th>End Date</th><th>Tick</th><th>Min Size</th><th>Neg Risk</th><th>Resolution Source</th></tr></thead>
+<tbody><tr><td><a href='https://polymarket.com/event/best-ai-model-on-april-17-style-control-off' target='_blank'>open</a></td><td>Will claude-opus-4-6-thinking be the best AI model on April 17, 2026?</td><td></td><td>0.956</td><td>707.21</td><td>726.3</td><td>47.7h</td><td>2026-04-17T00:00:00+00:00</td><td>0.0010</td><td>5.00000</td><td>True</td><td></td></tr>
+<tr><td><a href='https://polymarket.com/event/flu-hospitalization-rate-week-14-2026' target='_blank'>open</a></td><td>Will the U.S. flu hospitalization rate per 100,000 in Week 14 be between 80 and 85?</td><td></td><td>0.94</td><td>437.79</td><td>150.95</td><td>47.7h</td><td>2026-04-17T00:00:00+00:00</td><td>0.0100</td><td>5.00000</td><td>True</td><td></td></tr>
+<tr><td><a href='https://polymarket.com/event/highest-temperature-in-austin-on-april-15-2026' target='_blank'>open</a></td><td>Will the highest temperature in Austin be 80°F or higher on April 15?</td><td></td><td>0.92</td><td>2,480.49</td><td>813.22</td><td>11.7h</td><td>2026-04-15T12:00:00+00:00</td><td>0.0100</td><td>5.00000</td><td>True</td><td>https://www.wunderground.com/history/daily/us/tx/austin/KAUS</td></tr></tbody>
+</table>
+</div>
+<small>Refresh this page after each scan run.</small>
+</body></html>

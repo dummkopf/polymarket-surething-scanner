@@ -1,4 +1,47 @@
 {
-  "version": 1,
-  "by_day": {}
+  "by_day": {
+    "2026-04-13": {
+      "scans": 1,
+      "total_candidates_seen": 0,
+      "latest_candidates_count": 0,
+      "unique_market_ids": [],
+      "orders_placed": 0,
+      "planned_orders": 0,
+      "blocked_reasons": {},
+      "unique_candidates_count": 0,
+      "open_cost_usd": 0.0,
+      "deployed_now_usd": 0.0,
+      "realized_pnl_today_usd": 0.0,
+      "historical_realized_pnl_usd": 0.0,
+      "net_pnl_today_usd": 0.0,
+      "historical_net_pnl_usd": 0.0,
+      "available_for_redeploy_usd": 0.0,
+      "settled_cash_released_usd": 0.0
+    },
+    "2026-04-14": {
+      "scans": 2,
+      "total_candidates_seen": 7,
+      "latest_candidates_count": 3,
+      "unique_market_ids": [
+        "1854103",
+        "1930971",
+        "1931704",
+        "1965591"
+      ],
+      "orders_placed": 3,
+      "planned_orders": 3,
+      "blocked_reasons": {
+        "await_confirm_2_runs": 4
+      },
+      "unique_candidates_count": 4,
+      "open_cost_usd": 3.0,
+      "deployed_now_usd": 3.0,
+      "realized_pnl_today_usd": 0.0,
+      "historical_realized_pnl_usd": 0.0,
+      "net_pnl_today_usd": 0.0,
+      "historical_net_pnl_usd": 0.0,
+      "available_for_redeploy_usd": 0.0,
+      "settled_cash_released_usd": 0.0
+    }
+  }
 }

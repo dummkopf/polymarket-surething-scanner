@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+CST = timezone(timedelta(hours=8))
 
 
 def _load_json(path: Path | None) -> Any:
@@ -26,6 +28,13 @@ def _fmt_money(value: Any, digits: int = 2) -> str:
 def _fmt_number(value: Any, digits: int = 2) -> str:
     try:
         return f"{float(value):,.{digits}f}"
+    except Exception:
+        return "NA"
+
+
+def _fmt_percent(value: Any, digits: int = 1) -> str:
+    try:
+        return f"{float(value):.{digits}f}%"
     except Exception:
         return "NA"
 
@@ -60,6 +69,149 @@ def _fmt_thresholds(payload: dict[str, Any]) -> str:
     return ", ".join(pairs) if pairs else "NA"
 
 
+def _parse_iso_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _select_dashboard_day(
+    trading_state: dict[str, Any],
+    daily_stats: dict[str, Any],
+    runtime_summary: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    by_day = daily_stats.get("by_day", {}) if isinstance(daily_stats, dict) else {}
+    totals = trading_state.get("totals", {}) if isinstance(trading_state, dict) else {}
+    day_candidates: list[str] = []
+
+    for raw_value in (
+        trading_state.get("last_run"),
+        runtime_summary.get("last_run"),
+        runtime_summary.get("generated_at"),
+    ):
+        dt = _parse_iso_dt(raw_value)
+        if dt is not None:
+            day_candidates.append(dt.astimezone(CST).strftime("%Y-%m-%d"))
+
+    for bucket in ("positions", "closed_positions", "recent_fills"):
+        rows = trading_state.get(bucket, []) if isinstance(trading_state, dict) else []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in ("closed_at", "timestamp", "opened_at", "first_fill_at"):
+                dt = _parse_iso_dt(row.get(key))
+                if dt is not None:
+                    day_candidates.append(dt.astimezone(CST).strftime("%Y-%m-%d"))
+                    break
+
+    latest_day = max(day_candidates) if day_candidates else (sorted(by_day.keys())[-1] if by_day else None)
+    if latest_day is None:
+        return None, {}
+
+    merged_day = dict(by_day.get(latest_day, {})) if isinstance(by_day.get(latest_day, {}), dict) else {}
+    merged_day.setdefault("orders_placed", trading_state.get("daily_orders", {}).get(latest_day, 0))
+    merged_day.setdefault("planned_orders", 0)
+    merged_day.setdefault("blocked_reasons", {})
+    merged_day["open_cost_usd"] = totals.get("open_cost_usd", merged_day.get("open_cost_usd", 0.0))
+    merged_day["deployed_now_usd"] = totals.get("deployed_now_usd", merged_day.get("deployed_now_usd", 0.0))
+    merged_day["realized_pnl_today_usd"] = totals.get("realized_pnl_today_usd", merged_day.get("realized_pnl_today_usd", 0.0))
+    merged_day["historical_realized_pnl_usd"] = totals.get(
+        "realized_pnl_total_usd",
+        merged_day.get("historical_realized_pnl_usd", 0.0),
+    )
+    merged_day["net_pnl_today_usd"] = totals.get("net_pnl_today_usd", merged_day.get("net_pnl_today_usd", 0.0))
+    merged_day["historical_net_pnl_usd"] = totals.get(
+        "historical_net_pnl_usd",
+        merged_day.get("historical_net_pnl_usd", 0.0),
+    )
+    merged_day["available_for_redeploy_usd"] = totals.get(
+        "available_for_redeploy_usd",
+        merged_day.get("available_for_redeploy_usd", 0.0),
+    )
+    merged_day["settled_cash_released_usd"] = totals.get(
+        "settled_cash_released_usd",
+        merged_day.get("settled_cash_released_usd", 0.0),
+    )
+    return latest_day, merged_day
+
+
+def _build_closed_performance(closed_positions: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = [item for item in closed_positions if isinstance(item, dict)]
+    realized_values = [float(item.get("realized_pnl", 0) or 0) for item in closed]
+    wins = sum(1 for value in realized_values if value > 0)
+    losses = sum(1 for value in realized_values if value < 0)
+    breakeven = len(realized_values) - wins - losses
+    total_realized = sum(realized_values)
+    avg_realized = total_realized / len(realized_values) if realized_values else 0.0
+    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) else None
+
+    return {
+        "closed_count": len(realized_values),
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate_pct": win_rate,
+        "avg_realized_pnl_usd": avg_realized,
+        "best_close_usd": max(realized_values) if realized_values else None,
+        "worst_close_usd": min(realized_values) if realized_values else None,
+    }
+
+
+def _build_daily_trend(by_day: dict[str, Any], limit: int = 7) -> list[tuple[str, dict[str, Any]]]:
+    if not isinstance(by_day, dict):
+        return []
+    trend: list[tuple[str, dict[str, Any]]] = []
+    for day in sorted(by_day.keys())[-limit:]:
+        payload = by_day.get(day, {})
+        if isinstance(payload, dict):
+            trend.append((day, payload))
+    return trend
+
+
+def _build_recent_closed_rows(closed_positions: list[dict[str, Any]], limit: int = 5) -> str:
+    rows: list[str] = []
+    ordered = sorted(
+        [item for item in closed_positions if isinstance(item, dict)],
+        key=lambda item: str(item.get("closed_at", "")),
+        reverse=True,
+    )[:limit]
+    for item in ordered:
+        slug = item.get("event_slug") or item.get("slug") or ""
+        market_url = f"https://polymarket.com/event/{slug}" if slug else ""
+        rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(market_url)}' target='_blank'>open</a></td>"
+            f"<td>{html.escape(item.get('question', ''))}</td>"
+            f"<td>{html.escape(str(item.get('closed_at', 'NA')))}</td>"
+            f"<td>{_fmt_money(item.get('payout_usd', 'NA'))}</td>"
+            f"<td>{_fmt_money(item.get('realized_pnl', 'NA'), 4)}</td>"
+            f"<td>{html.escape(str(item.get('close_reason', 'NA')))}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows) if rows else "<tr><td colspan='6'>No closed positions yet</td></tr>"
+
+
+def _build_daily_trend_rows(trend: list[tuple[str, dict[str, Any]]]) -> str:
+    rows: list[str] = []
+    for day, payload in reversed(trend):
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(day)}</td>"
+            f"<td>{_fmt_money(payload.get('net_pnl_today_usd', 'NA'))}</td>"
+            f"<td>{_fmt_money(payload.get('realized_pnl_today_usd', 'NA'))}</td>"
+            f"<td>{_fmt_money(payload.get('deployed_now_usd', 'NA'))}</td>"
+            f"<td>{html.escape(str(payload.get('orders_placed', 'NA')))}</td>"
+            f"<td>{html.escape(str(payload.get('scans', 'NA')))}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows) if rows else "<tr><td colspan='6'>No daily history yet</td></tr>"
+
+
 def render_dashboard(
     candidates_path: Path,
     metrics_path: Path,
@@ -78,11 +230,14 @@ def render_dashboard(
     closed_positions = trading_state.get("closed_positions", []) if isinstance(trading_state, dict) else []
     totals = trading_state.get("totals", {}) if isinstance(trading_state, dict) else {}
     last_plan = trading_state.get("last_plan", []) if isinstance(trading_state, dict) else []
+    latest_day, day_data = _select_dashboard_day(trading_state, daily_stats, runtime_summary)
     by_day = daily_stats.get("by_day", {}) if isinstance(daily_stats, dict) else {}
-    latest_day = sorted(by_day.keys())[-1] if by_day else None
-    day_data = by_day.get(latest_day, {}) if latest_day else {}
     mode = runtime_summary.get("mode") or trading_state.get("mode") or "paper"
     thresholds = metrics.get("thresholds", {}) if isinstance(metrics, dict) else {}
+    closed_perf = _build_closed_performance(closed_positions)
+    daily_trend = _build_daily_trend(by_day, limit=7)
+    daily_trend_body = _build_daily_trend_rows(daily_trend)
+    recent_closed_body = _build_recent_closed_rows(closed_positions)
 
     candidate_rows = []
     for candidate in candidates:
@@ -164,6 +319,7 @@ small {{ color: #9fb0db; }}
 .kpi {{ background: #0d1530; border-radius: 8px; padding: 10px; }}
 .kpi .label {{ color: #9fb0db; font-size: 12px; }}
 .kpi .value {{ font-size: 20px; font-weight: 700; margin-top: 4px; }}
+.kpi .sub {{ color: #9fb0db; font-size: 11px; margin-top: 4px; }}
 .note {{ color: #b9c7ee; margin-top: 8px; font-size: 12px; }}
 .badge {{ display: inline-block; border-radius: 999px; padding: 2px 8px; background: #1d4ed8; color: white; font-size: 12px; }}
 </style></head><body>
@@ -198,16 +354,38 @@ small {{ color: #9fb0db; }}
 <div>Live halt reason: {html.escape(str(runtime_summary.get('live_halt_reason', 'NA')))}</div>
 </div>
 <div class='card'>
-<div><strong>Capital / PnL view ({latest_day or 'NA'}):</strong></div>
+<div><strong>Recent performance ({latest_day or 'NA'}):</strong></div>
 <div class='kpi-grid'>
-  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>{_fmt_money(day_data.get('net_pnl_today_usd', totals.get('net_pnl_today_usd', 'NA')))}</div></div>
-  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>{_fmt_money(day_data.get('realized_pnl_today_usd', totals.get('realized_pnl_today_usd', 'NA')))}</div></div>
-  <div class='kpi'><div class='label'>Historical accumulated gain</div><div class='value'>{_fmt_money(day_data.get('historical_realized_pnl_usd', totals.get('realized_pnl_total_usd', 'NA')))}</div></div>
-  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>{_fmt_money(day_data.get('deployed_now_usd', totals.get('deployed_now_usd', 'NA')))}</div></div>
-  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>{_fmt_money(day_data.get('open_cost_usd', totals.get('open_cost_usd', 'NA')))}</div></div>
-  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>{_fmt_money(day_data.get('historical_net_pnl_usd', totals.get('historical_net_pnl_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>{_fmt_money(day_data.get('net_pnl_today_usd', totals.get('net_pnl_today_usd', 'NA')))}</div><div class='sub'>realized + open mark-to-market</div></div>
+  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>{_fmt_money(day_data.get('realized_pnl_today_usd', totals.get('realized_pnl_today_usd', 'NA')))}</div><div class='sub'>closed and settled today</div></div>
+  <div class='kpi'><div class='label'>Open unrealized PnL</div><div class='value'>{_fmt_money(totals.get('unrealized_pnl_usd', 'NA'), 4)}</div><div class='sub'>current open-book mark</div></div>
+  <div class='kpi'><div class='label'>Equity now</div><div class='value'>{_fmt_money(totals.get('equity_usd', 'NA'), 4)}</div><div class='sub'>open cost + realized + unrealized</div></div>
+  <div class='kpi'><div class='label'>Orders placed today</div><div class='value'>{day_data.get('orders_placed', trading_state.get('daily_orders', {}).get(latest_day, 'NA') if latest_day else 'NA')}</div><div class='sub'>executed orders in day bucket</div></div>
+  <div class='kpi'><div class='label'>Scans today</div><div class='value'>{day_data.get('scans', 'NA')}</div><div class='sub'>candidate refresh cycles</div></div>
+  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>{_fmt_money(day_data.get('deployed_now_usd', totals.get('deployed_now_usd', 'NA')))}</div><div class='sub'>mark value of open positions</div></div>
+  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>{_fmt_money(day_data.get('open_cost_usd', totals.get('open_cost_usd', 'NA')))}</div><div class='sub'>capital paid into open positions</div></div>
 </div>
-<div class='note'>Current execution mode is isolated under state/runtime/&lt;mode&gt;. Paper mode still mirrors the old legacy state files for compatibility.</div>
+<div class='note'>Daily figures are anchored to the latest trading day with available state data, not just the latest scanner snapshot.</div>
+</div>
+<div class='card'>
+<div><strong>Historical performance:</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>{_fmt_money(day_data.get('historical_net_pnl_usd', totals.get('historical_net_pnl_usd', 'NA')))}</div><div class='sub'>realized history + current unrealized</div></div>
+  <div class='kpi'><div class='label'>Historical realized gain</div><div class='value'>{_fmt_money(day_data.get('historical_realized_pnl_usd', totals.get('realized_pnl_total_usd', 'NA')))}</div><div class='sub'>closed-position accumulated PnL</div></div>
+  <div class='kpi'><div class='label'>Closed positions</div><div class='value'>{closed_perf.get('closed_count', 0)}</div><div class='sub'>historical settled positions</div></div>
+  <div class='kpi'><div class='label'>Win rate</div><div class='value'>{_fmt_percent(closed_perf.get('win_rate_pct', 'NA'))}</div><div class='sub'>wins / (wins + losses)</div></div>
+  <div class='kpi'><div class='label'>Average closed PnL</div><div class='value'>{_fmt_money(closed_perf.get('avg_realized_pnl_usd', 'NA'), 4)}</div><div class='sub'>per closed position</div></div>
+  <div class='kpi'><div class='label'>Best / worst close</div><div class='value'>{_fmt_money(closed_perf.get('best_close_usd', 'NA'), 4)} / {_fmt_money(closed_perf.get('worst_close_usd', 'NA'), 4)}</div><div class='sub'>largest realized outcomes</div></div>
+  <div class='kpi'><div class='label'>Cumulative buy notional</div><div class='value'>{_fmt_money(totals.get('cumulative_buy_usd', 'NA'))}</div><div class='sub'>historical capital deployed</div></div>
+  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>{_fmt_money(totals.get('settled_cash_released_usd', 0))}</div><div class='sub'>cash returned from settlements</div></div>
+</div>
+</div>
+<div class='card'>
+<div><strong>Daily performance trend (last {len(daily_trend)} days):</strong></div>
+<table>
+<thead><tr><th>Day</th><th>Net PnL</th><th>Realized</th><th>Deployed</th><th>Orders</th><th>Scans</th></tr></thead>
+<tbody>{daily_trend_body}</tbody>
+</table>
 </div>
 <div class='card'>
 <div><strong>Execution / reuse view:</strong></div>
@@ -224,7 +402,7 @@ small {{ color: #9fb0db; }}
 </div>
 </div>
 <div class='card'>
-<div><strong>Daily stats ({latest_day or 'NA'}):</strong></div>
+<div><strong>Daily scanner activity ({latest_day or 'NA'}):</strong></div>
 <div>Scans today: {day_data.get('scans', 'NA')}</div>
 <div>Latest available bets: {day_data.get('latest_candidates_count', 'NA')}</div>
 <div>Total available bets seen today (sum): {day_data.get('total_candidates_seen', 'NA')}</div>
@@ -232,6 +410,13 @@ small {{ color: #9fb0db; }}
 <div>Planned orders today: {day_data.get('planned_orders', 'NA')}</div>
 <div>Orders placed today: {day_data.get('orders_placed', 'NA')}</div>
 <div>Blocked reasons today: {_fmt_pairs(day_data.get('blocked_reasons', {}))}</div>
+</div>
+<div class='card'>
+<div><strong>Recent closed positions:</strong></div>
+<table>
+<thead><tr><th>Link</th><th>Question</th><th>Closed at</th><th>Payout</th><th>Realized PnL</th><th>Reason</th></tr></thead>
+<tbody>{recent_closed_body}</tbody>
+</table>
 </div>
 <div class='card'>
 <div><strong>Current mode status:</strong></div>

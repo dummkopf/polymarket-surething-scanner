@@ -1,1 +1,56 @@
-[]
+[
+  {
+    "market_id": "1930971",
+    "condition_id": "0x0ba105316e67d13cc2e5ec1aea9a404f0d36ec5bf188d591069f5655014de3fe",
+    "token_id": "11703568071055981183689633475345140479292077977522565844432693495144707345446",
+    "question": "Will claude-opus-4-6-thinking be the best AI model on April 17, 2026?",
+    "description": "This market will resolve according to the model that has the highest arena score based on the Chatbot Arena LLM Leaderboard (https://lmarena.ai/) when the table under the \"Leaderboard\" tab is checked on April 17, 2026, 12:00 PM ET.\n\nResults from the \"Score\" column under the \"Text Arena | Overall\" Leaderboard tab at https://lmarena.ai/leaderboard/text with style control off will be used to resolve this market.\n\nModels will be ranked primarily by their arena score at this market’s check time, with alphabetical order of model names as listed in this market group (full string, including suffixes such as “-thinking”) used as a tiebreaker (e.g., if the two models are tied by arena score, “claude-opus-4-6” would be ranked ahead of “claude-opus-4-6-thinking”). This market will resolve based on the model that occupies first place under this ranking.\n\nThe resolution source for this market is the Chatbot Arena LLM Leaderboard found at https://lmarena.ai/. If this resolution source is unavailable at check time, this market will remain open until the leaderboard comes back online and will resolve based on the first check after it becomes available. If it becomes permanently unavailable, this market will resolve based on another resolution source.",
+    "end_date": "2026-04-17T00:00:00+00:00",
+    "best_ask": 0.956,
+    "depth_usd": 726.3,
+    "resolution_source": "",
+    "category_tag": "",
+    "volume": 707.214203,
+    "slug": "will-claude-opus-4-6-thinking-be-the-best-ai-model-on-april-17-2026",
+    "event_slug": "best-ai-model-on-april-17-style-control-off",
+    "tick_size": 0.001,
+    "min_order_size": 5.0,
+    "neg_risk": true
+  },
+  {
+    "market_id": "1931704",
+    "condition_id": "0xde85d1160feb72c7f22fb7bc2ebbd62333db12dbf2886c32b47da5ce1e02d497",
+    "token_id": "11940689228682040055225196493275922626540895169471010060268583436184731323705",
+    "question": "Will the U.S. flu hospitalization rate per 100,000 in Week 14 be between 80 and 85?",
+    "description": "This market will resolve according to the cumulative influenza-associated hospitalization rate per 100,000 population for the United States, as reported for the specified week.\n\nIf the recorded data falls exactly between two brackets, this market will resolve to the higher bracket.\n\nThe resolution source for this market will be CDC FluView / FluSurv-NET (see: https://www.cdc.gov/fluview/index.html). If the FluSurv-NET hospitalization rate for the specified week is not released by 11:59 PM ET on the tenth calendar day following the date of the prior FluView weekly report release, this market will resolve to the lowest bracket.\n\nNote: Only the CDC FluSurv-NET cumulative hospitalization rate per 100,000 population for the specified week will qualify, regardless of estimates, projections, state-level reports, or other influenza surveillance metrics published by the CDC or other sources.",
+    "end_date": "2026-04-17T00:00:00+00:00",
+    "best_ask": 0.94,
+    "depth_usd": 150.95,
+    "resolution_source": "",
+    "category_tag": "",
+    "volume": 437.786216,
+    "slug": "will-the-us-flu-hospitalization-rate-per-100000-in-week-14-be-between-80-and-85",
+    "event_slug": "flu-hospitalization-rate-week-14-2026",
+    "tick_size": 0.01,
+    "min_order_size": 5.0,
+    "neg_risk": true
+  },
+  {
+    "market_id": "1965591",
+    "condition_id": "0xb57b6d2367726374df00362c269e3efdd0f2f55be95d9eb4867d120284755143",
+    "token_id": "32200491770766963902430638018524417300090968935163953644163306650719744450573",
+    "question": "Will the highest temperature in Austin be 80°F or higher on April 15?",
+    "description": "This market will resolve to the temperature range that contains the highest temperature recorded at the Austin-Bergstrom International Airport Station in degrees Fahrenheit on 15 Apr '26.\n\nThe resolution source for this market will be information from Wunderground, specifically the highest temperature recorded for all times on this day by the Forecast for the Austin-Bergstrom International Airport Station once information is finalized, available here: https://www.wunderground.com/history/daily/us/tx/austin/KAUS.\n\nTo toggle between Fahrenheit and Celsius, click the gear icon next to the search bar and switch the Temperature setting between °F and °C.\n\nThis market can not resolve to \"Yes\" until all data for this date has been finalized.\n\nThe resolution source for this market measures temperatures to whole degrees Fahrenheit (eg, 21°F). Thus, this is the level of precision that will be used when resolving the market.\n\nAny revisions to temperatures recorded after data is finalized for this market's timeframe will not be considered for this market's resolution.",
+    "end_date": "2026-04-15T12:00:00+00:00",
+    "best_ask": 0.92,
+    "depth_usd": 813.22,
+    "resolution_source": "https://www.wunderground.com/history/daily/us/tx/austin/KAUS",
+    "category_tag": "",
+    "volume": 2480.4921620000023,
+    "slug": "highest-temperature-in-austin-on-april-15-2026-80forhigher",
+    "event_slug": "highest-temperature-in-austin-on-april-15-2026",
+    "tick_size": 0.01,
+    "min_order_size": 5.0,
+    "neg_risk": true
+  }
+]

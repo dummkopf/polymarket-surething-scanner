@@ -1,6 +1,31 @@
 {
-  "scanned_at": null,
-  "total_scanned": 0,
-  "quick_pass_count": 0,
-  "candidates_count": 0
+  "scanned_at": "2026-04-14T15:41:34.063291+00:00",
+  "total_scanned": 49753,
+  "quick_pass_count": 8,
+  "candidates_count": 3,
+  "stale_skips": 1,
+  "crypto_skips": 3805,
+  "stock_skips": 1853,
+  "sports_skips": 32992,
+  "commodity_skips": 830,
+  "high_randomness_narrative_skips": 124,
+  "exclude_crypto": true,
+  "exclude_stock_related": true,
+  "exclude_sports_related": true,
+  "exclude_commodity_related": true,
+  "exclude_high_randomness_narrative": true,
+  "scan_mode": "paper",
+  "thresholds": {
+    "hours_ahead": 72.0,
+    "quick_yes_price_min": 0.9,
+    "quick_yes_price_max": 0.98,
+    "price_min": 0.92,
+    "price_max": 0.99,
+    "min_depth_usd": 10.0,
+    "depth_price_cap": 0.97,
+    "stale_disagree_threshold": 0.07,
+    "gamma_page_size": 100,
+    "books_chunk_size": 60,
+    "clob_pause_sec": 0.5
+  }
 }
