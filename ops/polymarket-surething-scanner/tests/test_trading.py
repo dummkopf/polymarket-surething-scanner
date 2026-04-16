@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from trading import (
     build_execution_plan,
     build_mode_settings,
     build_pending_settlements,
+    execute_live,
     load_json,
     load_trading_state,
     reconcile_positions_from_remote,
@@ -68,6 +70,108 @@ class TradingTests(unittest.TestCase):
         plan = build_execution_plan([candidate], state, settings, confirmed_ids=set(), preflight={"status": "ok"})
         self.assertEqual(plan[0]["action"], "skip")
         self.assertEqual(plan[0]["reason"], "await_confirm_2_runs")
+
+    def test_execute_live_forces_neg_risk_false_by_default(self) -> None:
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.calls: list[bool] = []
+
+            def place_buy(self, **kwargs):
+                self.calls.append(bool(kwargs.get("neg_risk")))
+                return {"success": True}
+
+        candidate = make_candidate()
+        candidate.neg_risk = True
+        config = {
+            "runtime": {"mode": "live"},
+            "scanner": {},
+            "live": {"force_neg_risk_false": True, "pre_submit_quote_recheck": False},
+        }
+        settings = build_mode_settings(config, "live")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "trading_state.json"
+            journal_path = Path(tmp) / "journal.jsonl"
+            notifications_path = Path(tmp) / "notifications.jsonl"
+            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
+            trader = FakeTrader()
+            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 1)
+            self.assertEqual(trader.calls, [False])
+
+    def test_execute_live_retries_invalid_signature_with_neg_risk_false(self) -> None:
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.calls: list[bool] = []
+
+            def place_buy(self, **kwargs):
+                neg_risk = bool(kwargs.get("neg_risk"))
+                self.calls.append(neg_risk)
+                if len(self.calls) == 1:
+                    raise Exception("400 invalid signature")
+                return {"success": True}
+
+        candidate = make_candidate()
+        candidate.neg_risk = True
+        config = {
+            "runtime": {"mode": "live"},
+            "scanner": {},
+            "live": {
+                "force_neg_risk_false": False,
+                "retry_without_neg_risk_on_invalid_signature": True,
+                "pre_submit_quote_recheck": False,
+            },
+        }
+        settings = build_mode_settings(config, "live")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "trading_state.json"
+            journal_path = Path(tmp) / "journal.jsonl"
+            notifications_path = Path(tmp) / "notifications.jsonl"
+            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
+            trader = FakeTrader()
+            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 1)
+            self.assertEqual(trader.calls, [True, False])
+
+    def test_execute_live_skips_recent_fill_duplicate(self) -> None:
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def place_buy(self, **kwargs):
+                self.calls += 1
+                return {"success": True}
+
+        candidate = make_candidate()
+        config = {
+            "runtime": {"mode": "live"},
+            "scanner": {},
+            "live": {"recent_trade_dedupe_minutes": 120, "pre_submit_quote_recheck": False},
+        }
+        settings = build_mode_settings(config, "live")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "trading_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "live",
+                        "recent_fills": [
+                            {
+                                "token_id": candidate.token_id,
+                                "market_id": candidate.market_id,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            journal_path = Path(tmp) / "journal.jsonl"
+            notifications_path = Path(tmp) / "notifications.jsonl"
+            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
+            trader = FakeTrader()
+            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 0)
+            self.assertEqual(trader.calls, 0)
 
     def test_append_new_fills_dedupes_trade_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

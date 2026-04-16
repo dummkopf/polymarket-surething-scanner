@@ -252,6 +252,11 @@ DEFAULT_LIVE = {
     "claim_shell_command": "",
     "claim_shell_timeout_sec": 120,
     "profile_address": "",
+    "force_neg_risk_false": True,
+    "retry_without_neg_risk_on_invalid_signature": True,
+    "recent_trade_dedupe_minutes": 120,
+    "pre_submit_quote_recheck": True,
+    "pre_submit_quote_timeout_sec": 12,
 }
 
 
@@ -284,7 +289,149 @@ def build_mode_settings(config: dict[str, Any], mode: str) -> dict[str, Any]:
         "runtime": runtime_cfg,
         "execution": merged,
         "live": live_cfg,
+        "scanner": config.get("scanner", {}) if isinstance(config.get("scanner"), dict) else {},
     }
+
+
+def get_best_ask(book: dict[str, Any]) -> float | None:
+    asks = book.get("asks") if isinstance(book, dict) else None
+    if not isinstance(asks, list) or not asks:
+        return None
+    prices: list[float] = []
+    for ask in asks:
+        try:
+            prices.append(float(ask.get("price")))
+        except Exception:
+            continue
+    return min(prices) if prices else None
+
+
+def depth_usd_upto(book: dict[str, Any], max_price: float) -> float:
+    asks = book.get("asks") if isinstance(book, dict) else None
+    if not isinstance(asks, list):
+        return 0.0
+    total_notional = 0.0
+    for ask in asks:
+        try:
+            price = float(ask.get("price"))
+            size = float(ask.get("size"))
+            if price <= max_price:
+                total_notional += price * size
+        except Exception:
+            continue
+    return total_notional
+
+
+def is_invalid_signature_error(value: Any) -> bool:
+    text = safe_str(value).lower()
+    if "invalid signature" in text:
+        return True
+    if isinstance(value, dict):
+        for key in ("error", "errorMsg", "message", "status", "reason"):
+            if "invalid signature" in safe_str(value.get(key)).lower():
+                return True
+    return False
+
+
+def has_recent_fill(
+    state: dict[str, Any],
+    token_id: str,
+    market_id: str,
+    dedupe_minutes: int,
+    submitted_token_ids: set[str] | None = None,
+    submitted_market_ids: set[str] | None = None,
+) -> bool:
+    if token_id and submitted_token_ids and token_id in submitted_token_ids:
+        return True
+    if market_id and submitted_market_ids and market_id in submitted_market_ids:
+        return True
+    if dedupe_minutes <= 0:
+        return False
+
+    cutoff = now_utc() - timedelta(minutes=dedupe_minutes)
+    rows = state.get("recent_fills", []) if isinstance(state.get("recent_fills"), list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_token = safe_str(row.get("token_id"))
+        row_market = safe_str(row.get("market_id"))
+        if token_id and row_token and row_token != token_id:
+            if not market_id or row_market != market_id:
+                continue
+        elif market_id and row_market and row_market != market_id:
+            continue
+
+        ts = iso_to_dt(safe_str(row.get("timestamp")))
+        if ts is None or ts >= cutoff:
+            return True
+    return False
+
+
+def refresh_candidate_for_live_submit(
+    candidate: CandidateMarket,
+    scanner_cfg: dict[str, Any],
+    timeout_sec: int,
+) -> tuple[CandidateMarket | None, str | None]:
+    price_min = safe_float(scanner_cfg.get("price_min"), 0.0)
+    price_max = safe_float(scanner_cfg.get("price_max"), 1.0)
+    min_depth = safe_float(scanner_cfg.get("min_depth_usd"), 0.0)
+    depth_price_cap = safe_float(scanner_cfg.get("depth_price_cap"), 1.0)
+    stale_threshold = safe_float(scanner_cfg.get("stale_disagree_threshold"), 0.0)
+
+    try:
+        with httpx.Client(timeout=timeout_sec) as client:
+            book_resp = client.post(f"{CLOB_BASE}/books", json=[{"token_id": candidate.token_id}])
+            book_resp.raise_for_status()
+            book_payload = book_resp.json()
+            book = book_payload[0] if isinstance(book_payload, list) and book_payload else {}
+            if not isinstance(book, dict) or not book:
+                return None, "quote_unavailable"
+
+            best_ask = get_best_ask(book)
+            if best_ask is None:
+                return None, "quote_unavailable"
+
+            price = None
+            try:
+                price_resp = client.get(f"{CLOB_BASE}/price", params={"token_id": candidate.token_id, "side": "BUY"})
+                price_resp.raise_for_status()
+                price_payload = price_resp.json()
+                price = safe_float(price_payload.get("price")) if isinstance(price_payload, dict) else None
+            except Exception:
+                price = None
+
+            if price is not None and stale_threshold > 0 and abs(price - best_ask) > stale_threshold:
+                return None, "stale_quote"
+
+            depth_usd = depth_usd_upto(book, depth_price_cap)
+            if best_ask < price_min or best_ask > price_max:
+                return None, "price_out_of_range"
+            if depth_usd < min_depth:
+                return None, "insufficient_depth_live"
+
+            refreshed = deepcopy(candidate)
+            refreshed.best_ask = round(best_ask, 4)
+            refreshed.depth_usd = round(depth_usd, 2)
+            refreshed.tick_size = safe_float(book.get("tick_size"), candidate.tick_size or 0.01)
+            refreshed.min_order_size = safe_float(book.get("min_order_size"), candidate.min_order_size or 0.0)
+            return refreshed, None
+    except Exception as exc:
+        return None, f"quote_refresh_error:{safe_str(exc)}"
+
+
+def revalidate_live_plan_item(
+    candidate: CandidateMarket,
+    state: dict[str, Any],
+    settings: dict[str, Any],
+    preflight: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    plan = build_execution_plan([candidate], state, settings, confirmed_ids={candidate.market_id}, preflight=preflight)
+    if not plan:
+        return None, "revalidation_failed"
+    item = plan[0]
+    if item.get("action") != "open":
+        return None, safe_str(item.get("reason"), "revalidation_failed")
+    return item, None
 
 
 def update_signal_state(path: Path, candidates: list[CandidateMarket], confirm_runs_required: int) -> tuple[dict[str, Any], set[str]]:
@@ -1362,6 +1509,15 @@ def execute_live(
     state["last_preflight"] = preflight
     accepted_orders = 0
     candidates_by_market = {candidate.market_id: candidate for candidate in candidates if candidate.market_id}
+    submitted_token_ids: set[str] = set()
+    submitted_market_ids: set[str] = set()
+    scanner_cfg = settings.get("scanner", {}) if isinstance(settings.get("scanner"), dict) else {}
+    live_cfg = settings.get("live", {}) if isinstance(settings.get("live"), dict) else {}
+    dedupe_minutes = safe_int(live_cfg.get("recent_trade_dedupe_minutes"), 120)
+    force_neg_risk_false = parse_bool(live_cfg.get("force_neg_risk_false"), True)
+    retry_without_neg_risk = parse_bool(live_cfg.get("retry_without_neg_risk_on_invalid_signature"), True)
+    pre_submit_quote_recheck = parse_bool(live_cfg.get("pre_submit_quote_recheck"), True)
+    pre_submit_quote_timeout = safe_int(live_cfg.get("pre_submit_quote_timeout_sec"), 12)
 
     for item in plan:
         if item.get("action") != "open":
@@ -1377,23 +1533,112 @@ def execute_live(
             "shares": item.get("shares"),
             "order_size_usd": item.get("order_size_usd"),
         }
-        try:
-            candidate = candidates_by_market.get(safe_str(item.get("market_id")))
-            response = trader.place_buy(
-                token_id=safe_str(item.get("token_id")),
-                price=safe_float(item.get("best_ask"), 0.0),
-                shares=safe_float(item.get("shares"), 0.0),
-                order_size_usd=safe_float(item.get("order_size_usd"), 0.0),
-                tick_size=safe_float(candidate.tick_size, 0.01) if candidate is not None else 0.01,
-                min_order_size=safe_float(candidate.min_order_size, 0.0) if candidate is not None else 0.0,
-                neg_risk=bool(candidate.neg_risk) if candidate is not None else False,
+        candidate = candidates_by_market.get(safe_str(item.get("market_id")))
+        token_id = safe_str(item.get("token_id"))
+        market_id = safe_str(item.get("market_id"))
+
+        if has_recent_fill(state, token_id, market_id, dedupe_minutes, submitted_token_ids, submitted_market_ids):
+            journal_event["status"] = "skipped"
+            journal_event["reason"] = "recent_trade_dedupe"
+            append_notification(
+                notifications_path,
+                "order_guard",
+                "warn",
+                f"live order skipped by recent-trade dedupe: {safe_str(item.get('question'))}",
+                journal_event,
             )
+            append_jsonl(journal_path, journal_event)
+            continue
+
+        try:
+            if candidate is None:
+                raise LiveExecutionError("candidate_missing_for_submit")
+
+            candidate_for_submit = candidate
+            if pre_submit_quote_recheck:
+                refreshed_candidate, refresh_error = refresh_candidate_for_live_submit(candidate, scanner_cfg, pre_submit_quote_timeout)
+                if refreshed_candidate is None:
+                    journal_event["status"] = "skipped"
+                    journal_event["reason"] = refresh_error or "quote_refresh_failed"
+                    append_notification(
+                        notifications_path,
+                        "order_guard",
+                        "warn",
+                        f"live order skipped during quote recheck: {safe_str(item.get('question'))}",
+                        journal_event,
+                    )
+                    append_jsonl(journal_path, journal_event)
+                    continue
+                candidate_for_submit = refreshed_candidate
+
+            revalidated_item, revalidation_reason = revalidate_live_plan_item(candidate_for_submit, state, settings, preflight)
+            if revalidated_item is None:
+                journal_event["status"] = "skipped"
+                journal_event["reason"] = revalidation_reason or "revalidation_failed"
+                append_notification(
+                    notifications_path,
+                    "order_guard",
+                    "warn",
+                    f"live order skipped during final revalidation: {safe_str(item.get('question'))}",
+                    journal_event,
+                )
+                append_jsonl(journal_path, journal_event)
+                continue
+
+            journal_event["price"] = revalidated_item.get("best_ask")
+            journal_event["shares"] = revalidated_item.get("shares")
+            journal_event["order_size_usd"] = revalidated_item.get("order_size_usd")
+            journal_event["neg_risk_requested"] = bool(candidate_for_submit.neg_risk)
+
+            neg_risk_for_submit = False if force_neg_risk_false else bool(candidate_for_submit.neg_risk)
+            try:
+                response = trader.place_buy(
+                    token_id=token_id,
+                    price=safe_float(revalidated_item.get("best_ask"), 0.0),
+                    shares=safe_float(revalidated_item.get("shares"), 0.0),
+                    order_size_usd=safe_float(revalidated_item.get("order_size_usd"), 0.0),
+                    tick_size=safe_float(candidate_for_submit.tick_size, 0.01),
+                    min_order_size=safe_float(candidate_for_submit.min_order_size, 0.0),
+                    neg_risk=neg_risk_for_submit,
+                )
+            except Exception as exc:
+                if not (retry_without_neg_risk and neg_risk_for_submit and is_invalid_signature_error(exc)):
+                    raise
+                journal_event["neg_risk_retry"] = "forcing_false_after_invalid_signature_exception"
+                response = trader.place_buy(
+                    token_id=token_id,
+                    price=safe_float(revalidated_item.get("best_ask"), 0.0),
+                    shares=safe_float(revalidated_item.get("shares"), 0.0),
+                    order_size_usd=safe_float(revalidated_item.get("order_size_usd"), 0.0),
+                    tick_size=safe_float(candidate_for_submit.tick_size, 0.01),
+                    min_order_size=safe_float(candidate_for_submit.min_order_size, 0.0),
+                    neg_risk=False,
+                )
+                neg_risk_for_submit = False
+
+            if (not response_success(response)) and retry_without_neg_risk and neg_risk_for_submit and is_invalid_signature_error(response):
+                journal_event["neg_risk_retry"] = "forcing_false_after_invalid_signature_response"
+                response = trader.place_buy(
+                    token_id=token_id,
+                    price=safe_float(revalidated_item.get("best_ask"), 0.0),
+                    shares=safe_float(revalidated_item.get("shares"), 0.0),
+                    order_size_usd=safe_float(revalidated_item.get("order_size_usd"), 0.0),
+                    tick_size=safe_float(candidate_for_submit.tick_size, 0.01),
+                    min_order_size=safe_float(candidate_for_submit.min_order_size, 0.0),
+                    neg_risk=False,
+                )
+                neg_risk_for_submit = False
+
             journal_event["response"] = response
             if not response_success(response):
                 raise LiveExecutionError(f"order rejected: {response}")
             accepted_orders += 1
             errors = 0
             journal_event["status"] = "submitted"
+            journal_event["neg_risk_used"] = neg_risk_for_submit
+            submitted_token_ids.add(token_id)
+            if market_id:
+                submitted_market_ids.add(market_id)
             append_notification(
                 notifications_path,
                 "order_submission",
