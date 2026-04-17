@@ -15,7 +15,7 @@ import httpx
 from dotenv import load_dotenv
 from eth_account import Account
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY
 
 from models import CandidateMarket
@@ -591,8 +591,6 @@ def build_execution_plan(
             reason = "preflight_failed"
         elif market_id not in confirmed_ids:
             reason = f"await_confirm_{confirm_runs_required}_runs"
-        elif candidate.restricted and mode in {"shadow", "live"}:
-            reason = "restricted_market"
         elif candidate.best_ask <= 0 or shares <= 0 or limit_price <= 0:
             reason = "invalid_price"
         elif minutes_to_expiry < min_minutes_to_expiry:
@@ -634,6 +632,7 @@ def build_execution_plan(
                 "shares": shares,
                 "tick_size": tick_size,
                 "min_order_size": min_order_size,
+                "neg_risk": bool(getattr(candidate, "neg_risk", False)),
                 "minutes_to_expiry": minutes_to_expiry,
                 "restricted": candidate.restricted,
                 "action": action,
@@ -908,6 +907,7 @@ class LiveTrader:
         shares: float = 0.0,
         tick_size: float | None = None,
         min_order_size: float | None = None,
+        neg_risk: bool | None = None,
     ) -> dict[str, Any]:
         """Place a BUY order using the correct CLOB flow for the configured order type.
 
@@ -944,31 +944,54 @@ class LiveTrader:
         if normalized_price <= 0:
             raise LiveExecutionError(f"invalid price after normalization: {normalized_price}")
 
-        if order_type_name in {"FOK", "FAK"}:
-            # ── Market-order path (amount in USDC, no 5-share floor) ──
+        is_market = order_type_name in {"FOK", "FAK"}
+        if is_market:
             amount_usd = round(max(order_size_usd, 0.01), 2)
-            order = self.client.create_market_order(
-                MarketOrderArgs(
-                    token_id=token_id,
-                    amount=amount_usd,
-                    price=normalized_price,
-                    side=BUY,
-                    order_type=order_type,
-                )
+            market_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=amount_usd,
+                price=normalized_price,
+                side=BUY,
+                order_type=order_type,
             )
         else:
-            # ── Limit-order path (size in shares, 5-share minimum applies) ──
             resolved_min = safe_float(min_order_size, 0.0)
             if resolved_min <= 0:
                 resolved_min = DEFAULT_MIN_ORDER_SIZE
             normalized_shares = clamp_live_shares(shares, resolved_min)
             if normalized_shares <= 0:
                 raise LiveExecutionError(f"invalid share size after normalization: {normalized_shares}")
-            order = self.client.create_order(
-                OrderArgs(token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY)
+            limit_args = OrderArgs(
+                token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY
             )
 
-        return self.client.post_order(order, order_type, post_only=post_only)
+        def _build(flag: bool | None):
+            opts = PartialCreateOrderOptions(neg_risk=flag) if flag is not None else None
+            if is_market:
+                return self.client.create_market_order(market_args, options=opts) if opts else self.client.create_market_order(market_args)
+            return self.client.create_order(limit_args, options=opts) if opts else self.client.create_order(limit_args)
+
+        # Try neg_risk values in order: candidate-provided flag first, then the opposite.
+        # Polymarket signs against two different CTF adapters (neg_risk vs vanilla);
+        # a mismatched flag surfaces as "invalid signature" at submit time.
+        first = neg_risk if neg_risk is not None else None
+        attempts: list[bool | None] = [first]
+        for alt in (True, False):
+            if alt not in attempts:
+                attempts.append(alt)
+
+        last_err: Exception | None = None
+        for flag in attempts:
+            try:
+                order = _build(flag)
+                return self.client.post_order(order, order_type, post_only=post_only)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "invalid signature" in msg or "signature" in msg and "invalid" in msg:
+                    last_err = exc
+                    continue
+                raise
+        raise LiveExecutionError(f"order rejected after neg_risk retries: {last_err}")
 
     def fetch_open_orders(self) -> list[dict[str, Any]]:
         if self.client is None:
@@ -1499,6 +1522,7 @@ def execute_live(
                 shares=safe_float(item.get("shares"), 0.0),
                 tick_size=safe_float(item.get("tick_size"), 0.0) or None,
                 min_order_size=safe_float(item.get("min_order_size"), 0.0) or None,
+                neg_risk=bool(item.get("neg_risk")) if item.get("neg_risk") is not None else None,
             )
             journal_event["response"] = response
             if not response_success(response):

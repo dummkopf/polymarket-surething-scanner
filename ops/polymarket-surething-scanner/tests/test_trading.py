@@ -58,7 +58,7 @@ class TradingTests(unittest.TestCase):
             _, confirmed = update_signal_state(path, [candidate], confirm_runs_required=2)
             self.assertEqual(confirmed, {"m1"})
 
-    def test_live_plan_blocks_restricted_market(self) -> None:
+    def test_live_plan_allows_restricted_market(self) -> None:
         config = {
             "runtime": {"mode": "live"},
             "live": {"enabled": True},
@@ -67,8 +67,7 @@ class TradingTests(unittest.TestCase):
         state = load_trading_state(Path("/tmp/does-not-exist.json"), "live", settings)
         candidate = make_candidate(restricted=True)
         plan = build_execution_plan([candidate], state, settings, confirmed_ids={candidate.market_id}, preflight={"status": "ok"})
-        self.assertEqual(plan[0]["action"], "skip")
-        self.assertEqual(plan[0]["reason"], "restricted_market")
+        self.assertNotEqual(plan[0]["reason"], "restricted_market")
 
     def test_append_new_fills_dedupes_trade_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
