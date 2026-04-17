@@ -540,7 +540,9 @@ def build_execution_plan(
     planned_new_positions = 0
 
     plan: list[dict[str, Any]] = []
-    ranked = sorted(candidates, key=lambda candidate: (-candidate.best_ask, -candidate.depth_usd, candidate.end_date))
+    # Prioritize: lowest ask (highest ROI if resolves YES), deepest book
+    # (safer fill), soonest expiry (faster capital turnover).
+    ranked = sorted(candidates, key=lambda c: (c.best_ask, -c.depth_usd, c.end_date))
 
     for candidate in ranked:
         market_id = candidate.market_id
