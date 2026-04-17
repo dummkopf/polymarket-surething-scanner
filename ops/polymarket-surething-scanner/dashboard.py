@@ -49,9 +49,29 @@ def render_dashboard(
     totals = trading_state.get("totals", {}) if isinstance(trading_state, dict) else {}
     last_plan = trading_state.get("last_plan", []) if isinstance(trading_state, dict) else []
     by_day = daily_stats.get("by_day", {}) if isinstance(daily_stats, dict) else {}
-    latest_day = sorted(by_day.keys())[-1] if by_day else None
+    sorted_days = sorted(by_day.keys()) if by_day else []
+    latest_day = sorted_days[-1] if sorted_days else None
     day_data = by_day.get(latest_day, {}) if latest_day else {}
     mode = runtime_summary.get("mode") or trading_state.get("mode") or "paper"
+
+    recent_7_days = sorted_days[-7:] if sorted_days else []
+    pnl_rows = []
+    cumulative_pnl = 0.0
+    for day_key in recent_7_days:
+        d = by_day.get(day_key, {})
+        daily_realized = float(d.get("realized_pnl_today_usd", 0) or 0)
+        cumulative_pnl = float(d.get("historical_realized_pnl_usd", 0) or 0)
+        orders = int(d.get("orders_placed", 0) or 0)
+        color = "#6ee7b7" if daily_realized >= 0 else "#fca5a5"
+        pnl_rows.append(
+            "<tr>"
+            f"<td>{html.escape(day_key)}</td>"
+            f"<td style='color:{color}'>{_fmt_money(daily_realized, 4)}</td>"
+            f"<td>{_fmt_money(cumulative_pnl, 4)}</td>"
+            f"<td>{orders}</td>"
+            "</tr>"
+        )
+    pnl_body = "\n".join(pnl_rows) if pnl_rows else "<tr><td colspan='4'>No daily PNL data yet</td></tr>"
 
     candidate_rows = []
     for candidate in candidates:
@@ -165,6 +185,13 @@ small {{ color: #9fb0db; }}
   <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>{_fmt_money(day_data.get('historical_net_pnl_usd', totals.get('historical_net_pnl_usd', 'NA')))}</div></div>
 </div>
 <div class='note'>Current execution mode is isolated under state/runtime/&lt;mode&gt;. Paper mode still mirrors the old legacy state files for compatibility.</div>
+</div>
+<div class='card'>
+<div><strong>Daily Realized PNL (past 7 days):</strong></div>
+<table>
+<thead><tr><th>Date</th><th>Daily Realized</th><th>Cumulative Realized</th><th>Orders</th></tr></thead>
+<tbody>{pnl_body}</tbody>
+</table>
 </div>
 <div class='card'>
 <div><strong>Execution / reuse view:</strong></div>

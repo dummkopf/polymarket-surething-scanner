@@ -212,6 +212,33 @@ def is_high_randomness_narrative_market(market: dict[str, Any]) -> bool:
     return (conversational_context and subjective_prompt) or next_show_pattern or all_in_like
 
 
+def is_repetitive_daily_event_market(market: dict[str, Any]) -> bool:
+    question = str(market.get("question", "")).lower()
+    hay = build_market_haystack(market)
+    repetitive_phrases = [
+        "publicly insult someone on",
+        "publicly insult",
+        "insult someone on",
+    ]
+    if any(phrase in question for phrase in repetitive_phrases):
+        return True
+    series_slug = str(market.get("seriesSlug", "")).lower()
+    events = market.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict):
+                s = str(event.get("seriesSlug", "")).lower()
+                if s:
+                    series_slug = s
+    daily_series_markers = [
+        "will-trump-publicly-insult",
+        "trump-insult",
+    ]
+    if any(marker in series_slug or marker in hay for marker in daily_series_markers):
+        return True
+    return False
+
+
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
     all_markets: list[dict[str, Any]] = []
     offset = 0
@@ -347,6 +374,7 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     exclude_stock_related = bool(scanner_cfg.get("exclude_stock_related", True))
     exclude_sports_related = bool(scanner_cfg.get("exclude_sports_related", True))
     exclude_high_randomness_narrative = bool(scanner_cfg.get("exclude_high_randomness_narrative", True))
+    exclude_repetitive_daily_event = bool(scanner_cfg.get("exclude_repetitive_daily_event", True))
 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
@@ -357,6 +385,7 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     stock_skips = 0
     sports_skips = 0
     high_randomness_narrative_skips = 0
+    repetitive_daily_event_skips = 0
 
     async with httpx.AsyncClient() as client:
         markets = await fetch_markets(client, page_size)
@@ -381,6 +410,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                 continue
             if exclude_high_randomness_narrative and is_high_randomness_narrative_market(market):
                 high_randomness_narrative_skips += 1
+                continue
+            if exclude_repetitive_daily_event and is_repetitive_daily_event_market(market):
+                repetitive_daily_event_skips += 1
                 continue
 
             end_date = parse_iso(market.get("endDate"))
@@ -473,11 +505,13 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
         "stock_skips": stock_skips,
         "sports_skips": sports_skips,
         "high_randomness_narrative_skips": high_randomness_narrative_skips,
+        "repetitive_daily_event_skips": repetitive_daily_event_skips,
         "filter_restricted": filter_restricted,
         "exclude_crypto": exclude_crypto,
         "exclude_stock_related": exclude_stock_related,
         "exclude_sports_related": exclude_sports_related,
         "exclude_high_randomness_narrative": exclude_high_randomness_narrative,
+        "exclude_repetitive_daily_event": exclude_repetitive_daily_event,
     }
     return candidates, metrics
 
@@ -498,14 +532,18 @@ def persist_outputs(
     candidates_path.write_text(json.dumps([candidate.to_dict() for candidate in candidates], ensure_ascii=False, indent=2), encoding="utf-8")
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    render_dashboard(
-        candidates_path,
-        metrics_path,
-        dashboard_path,
-        trading_state_path=Path(trading_result["paths"]["trading_state"]),
-        daily_stats_path=Path(trading_result["paths"]["daily_stats"]),
-        runtime_summary_path=Path(trading_result["paths"]["summary"]),
-    )
+    mode = trading_result.get("mode", "paper")
+    mode_dashboard_path = dashboard_path.parent / f"dashboard_{mode}.html"
+
+    for path in (dashboard_path, mode_dashboard_path):
+        render_dashboard(
+            candidates_path,
+            metrics_path,
+            path,
+            trading_state_path=Path(trading_result["paths"]["trading_state"]),
+            daily_stats_path=Path(trading_result["paths"]["daily_stats"]),
+            runtime_summary_path=Path(trading_result["paths"]["summary"]),
+        )
 
 
 def parse_args() -> argparse.Namespace:
