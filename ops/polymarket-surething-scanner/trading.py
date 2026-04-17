@@ -763,6 +763,51 @@ def finalize_state(
     return state
 
 
+def _settle_expired_positions(state: dict[str, Any]) -> int:
+    """Auto-settle paper/shadow positions past their expected_resolve_at.
+
+    Assumes YES resolution ($1.00/share payout) since the scanner only
+    buys high-probability YES tokens.
+    """
+    now = now_utc()
+    positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+    closed_positions = state.setdefault("closed_positions", [])
+    settled = 0
+    remaining: list[dict[str, Any]] = []
+    for position in positions:
+        resolve_str = safe_str(position.get("expected_resolve_at"))
+        if not resolve_str:
+            remaining.append(position)
+            continue
+        try:
+            resolve_at = datetime.fromisoformat(resolve_str)
+        except Exception:
+            remaining.append(position)
+            continue
+        if now <= resolve_at:
+            remaining.append(position)
+            continue
+        shares = safe_float(position.get("shares"), 0.0)
+        cost = safe_float(position.get("size_usd"), 0.0)
+        payout = round(shares * 1.0, 4)
+        realized_pnl = round(payout - cost, 4)
+        closed_positions.append({
+            **position,
+            "payout_usd": payout,
+            "realized_pnl": realized_pnl,
+            "closed_at": now_iso_cst(),
+            "close_reason": "simulated_settlement",
+        })
+        released = max(0.0, payout)
+        state["settled_cash_released_usd"] = round(
+            safe_float(state.get("settled_cash_released_usd"), 0.0) + released, 4
+        )
+        settled += 1
+    state["positions"] = remaining
+    state["closed_positions"] = closed_positions[-500:]
+    return settled
+
+
 def execute_simulated(
     path: Path,
     candidates: list[CandidateMarket],
@@ -775,6 +820,9 @@ def execute_simulated(
     positions = state.setdefault("positions", [])
     allow_add = parse_bool(settings["execution"].get("allow_add_to_existing"), False)
     candidates_by_market = {candidate.market_id: candidate for candidate in candidates if candidate.market_id}
+
+    settled_count = _settle_expired_positions(state)
+    positions = state["positions"]
 
     opened_new = 0
     added_existing = 0
@@ -790,7 +838,7 @@ def execute_simulated(
 
     if preflight:
         state["last_preflight"] = preflight
-    state = finalize_state(state, settings, candidates, plan, opened_new, added_existing)
+    state = finalize_state(state, settings, candidates, plan, opened_new, added_existing, settled_count)
     save_json(path, state)
     return state
 
