@@ -22,6 +22,7 @@ from models import CandidateMarket
 
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
+GAMMA_BASE = "https://gamma-api.polymarket.com"
 CST = timezone(timedelta(hours=8))
 VALID_MODES = {"paper", "shadow", "live"}
 # Paper/shadow simulation records shares at this precision for display. Live
@@ -763,38 +764,93 @@ def finalize_state(
     return state
 
 
+def _fetch_resolved_payouts(condition_ids: list[str]) -> dict[str, float]:
+    """Fetch actual resolution outcomes from the Gamma API.
+
+    Returns ``{condition_id: yes_price_per_share}`` — 1.0 for YES, 0.0
+    for NO.  Markets that haven't resolved yet are omitted.
+    """
+    results: dict[str, float] = {}
+    if not condition_ids:
+        return results
+    try:
+        with httpx.Client(timeout=15) as client:
+            for cid in condition_ids:
+                try:
+                    resp = client.get(
+                        f"{GAMMA_BASE}/markets",
+                        params={"condition_id": cid, "limit": 1},
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    markets = resp.json()
+                    if not isinstance(markets, list) or not markets:
+                        continue
+                    market = markets[0]
+                    if not market.get("closed"):
+                        continue
+                    raw_prices = market.get("outcomePrices")
+                    if isinstance(raw_prices, str):
+                        try:
+                            raw_prices = json.loads(raw_prices)
+                        except Exception:
+                            continue
+                    if isinstance(raw_prices, list) and raw_prices:
+                        yes_price = float(raw_prices[0])
+                        if yes_price >= 0.99:
+                            results[cid] = 1.0
+                        elif yes_price <= 0.01:
+                            results[cid] = 0.0
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return results
+
+
 def _settle_expired_positions(state: dict[str, Any]) -> int:
     """Auto-settle paper/shadow positions past their expected_resolve_at.
 
-    Assumes YES resolution ($1.00/share payout) since the scanner only
-    buys high-probability YES tokens.
+    Checks actual resolution via the Gamma API — only settles markets
+    that have genuinely closed with a definitive outcome.
     """
     now = now_utc()
     positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
     closed_positions = state.setdefault("closed_positions", [])
-    settled = 0
-    remaining: list[dict[str, Any]] = []
-    for position in positions:
+
+    expired: list[tuple[int, dict[str, Any]]] = []
+    for idx, position in enumerate(positions):
         resolve_str = safe_str(position.get("expected_resolve_at"))
         if not resolve_str:
-            remaining.append(position)
             continue
         try:
             resolve_at = datetime.fromisoformat(resolve_str)
         except Exception:
-            remaining.append(position)
             continue
-        if now <= resolve_at:
-            remaining.append(position)
+        if now > resolve_at:
+            expired.append((idx, position))
+
+    if not expired:
+        return 0
+
+    condition_ids = [safe_str(p.get("condition_id")) for _, p in expired if p.get("condition_id")]
+    payouts = _fetch_resolved_payouts(list(dict.fromkeys(condition_ids)))
+
+    settled_indices: set[int] = set()
+    for idx, position in expired:
+        cid = safe_str(position.get("condition_id"))
+        if cid not in payouts:
             continue
+        yes_price = payouts[cid]
         shares = safe_float(position.get("shares"), 0.0)
         cost = safe_float(position.get("size_usd"), 0.0)
-        payout = round(shares * 1.0, 4)
+        payout = round(shares * yes_price, 4)
         realized_pnl = round(payout - cost, 4)
         closed_positions.append({
             **position,
             "payout_usd": payout,
             "realized_pnl": realized_pnl,
+            "resolved_yes": yes_price >= 0.99,
             "closed_at": now_iso_cst(),
             "close_reason": "simulated_settlement",
         })
@@ -802,10 +858,11 @@ def _settle_expired_positions(state: dict[str, Any]) -> int:
         state["settled_cash_released_usd"] = round(
             safe_float(state.get("settled_cash_released_usd"), 0.0) + released, 4
         )
-        settled += 1
-    state["positions"] = remaining
+        settled_indices.add(idx)
+
+    state["positions"] = [p for i, p in enumerate(positions) if i not in settled_indices]
     state["closed_positions"] = closed_positions[-500:]
-    return settled
+    return len(settled_indices)
 
 
 def execute_simulated(
