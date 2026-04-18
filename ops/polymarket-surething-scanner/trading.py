@@ -519,7 +519,12 @@ def build_execution_plan(
     mode = settings["mode"]
     preflight = preflight or {}
     positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
-    existing = {str(position.get("market_id", "")): position for position in positions}
+    existing: dict[str, dict[str, Any]] = {}
+    for position in positions:
+        for key in ("market_id", "condition_id", "token_id"):
+            val = str(position.get(key, ""))
+            if val:
+                existing.setdefault(val, position)
 
     order_size_usd = safe_float(execution.get("order_size_usd"), 1.0)
     max_position_usd = safe_float(execution.get("max_position_usd_per_market"), 5.0)
@@ -548,7 +553,7 @@ def build_execution_plan(
 
     for candidate in ranked:
         market_id = candidate.market_id
-        current = existing.get(market_id)
+        current = existing.get(market_id) or existing.get(candidate.condition_id) or existing.get(candidate.token_id)
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
         current_size += planned_per_market.get(market_id, 0.0)
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
