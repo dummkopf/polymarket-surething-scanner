@@ -764,30 +764,25 @@ def finalize_state(
     return state
 
 
-def _fetch_resolved_payouts(condition_ids: list[str]) -> dict[str, float]:
+def _fetch_resolved_payouts(market_ids: list[str]) -> dict[str, float]:
     """Fetch actual resolution outcomes from the Gamma API.
 
-    Returns ``{condition_id: yes_price_per_share}`` — 1.0 for YES, 0.0
-    for NO.  Markets that haven't resolved yet are omitted.
+    Queries ``/markets/{market_id}`` (numeric ID) for each expired
+    position.  Returns ``{market_id: yes_price_per_share}`` — 1.0 for
+    YES, 0.0 for NO.  Markets that haven't resolved yet are omitted.
     """
     results: dict[str, float] = {}
-    if not condition_ids:
+    if not market_ids:
         return results
     try:
         with httpx.Client(timeout=15) as client:
-            for cid in condition_ids:
+            for mid in market_ids:
                 try:
-                    resp = client.get(
-                        f"{GAMMA_BASE}/markets",
-                        params={"condition_id": cid, "limit": 1},
-                        timeout=10,
-                    )
-                    resp.raise_for_status()
-                    markets = resp.json()
-                    if not isinstance(markets, list) or not markets:
+                    resp = client.get(f"{GAMMA_BASE}/markets/{mid}", timeout=10)
+                    if resp.status_code != 200:
                         continue
-                    market = markets[0]
-                    if not market.get("closed"):
+                    market = resp.json()
+                    if not isinstance(market, dict) or not market.get("closed"):
                         continue
                     raw_prices = market.get("outcomePrices")
                     if isinstance(raw_prices, str):
@@ -798,9 +793,9 @@ def _fetch_resolved_payouts(condition_ids: list[str]) -> dict[str, float]:
                     if isinstance(raw_prices, list) and raw_prices:
                         yes_price = float(raw_prices[0])
                         if yes_price >= 0.99:
-                            results[cid] = 1.0
+                            results[mid] = 1.0
                         elif yes_price <= 0.01:
-                            results[cid] = 0.0
+                            results[mid] = 0.0
                 except Exception:
                     continue
     except Exception:
@@ -833,15 +828,15 @@ def _settle_expired_positions(state: dict[str, Any]) -> int:
     if not expired:
         return 0
 
-    condition_ids = [safe_str(p.get("condition_id")) for _, p in expired if p.get("condition_id")]
-    payouts = _fetch_resolved_payouts(list(dict.fromkeys(condition_ids)))
+    market_ids = [safe_str(p.get("market_id")) for _, p in expired if p.get("market_id")]
+    payouts = _fetch_resolved_payouts(list(dict.fromkeys(market_ids)))
 
     settled_indices: set[int] = set()
     for idx, position in expired:
-        cid = safe_str(position.get("condition_id"))
-        if cid not in payouts:
+        mid = safe_str(position.get("market_id"))
+        if mid not in payouts:
             continue
-        yes_price = payouts[cid]
+        yes_price = payouts[mid]
         shares = safe_float(position.get("shares"), 0.0)
         cost = safe_float(position.get("size_usd"), 0.0)
         payout = round(shares * yes_price, 4)
