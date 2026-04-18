@@ -708,12 +708,15 @@ def finalize_state(
     total_open_cost, total_deployed_now, total_unrealized = summarize_positions(positions, candidates_by_market)
     now = now_cst()
     day_key = now.strftime("%Y-%m-%d")
+    tracking_start = safe_str(settings.get("live", {}).get("tracking_start_date"))
     realized_today = 0.0
     realized_total = 0.0
     for closed in closed_positions:
+        closed_at = safe_str(closed.get("closed_at"))
+        if tracking_start and closed_at < tracking_start:
+            continue
         realized = safe_float(closed.get("realized_pnl"), 0.0)
         realized_total += realized
-        closed_at = safe_str(closed.get("closed_at"))
         if closed_at.startswith(day_key):
             realized_today += realized
 
