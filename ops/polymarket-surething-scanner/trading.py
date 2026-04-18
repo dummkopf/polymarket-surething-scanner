@@ -408,9 +408,9 @@ def load_trading_state(path: Path, mode: str, settings: dict[str, Any]) -> dict[
     state.setdefault("blocked_reasons", {})
     state.setdefault("last_plan", [])
     state.setdefault("last_preflight", {})
-    state.setdefault("live_halted", False)
-    state.setdefault("live_halt_reason", None)
-    state.setdefault("consecutive_live_errors", 0)
+    state["live_halted"] = False
+    state["live_halt_reason"] = None
+    state["consecutive_live_errors"] = 0
     state.setdefault("available_for_redeploy_usd", 0.0)
     state.setdefault("settled_cash_released_usd", 0.0)
     state.setdefault("last_reconciliation", {})
