@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from eth_account import Account
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType, PartialCreateOrderOptions
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from models import CandidateMarket
 
@@ -249,6 +249,8 @@ def get_mode_paths(base_dir: Path, config: dict[str, Any], mode: str) -> dict[st
         "status_snapshot": runtime_dir / "status_snapshot.json",
         "notifications": runtime_dir / "notification_feed.jsonl",
         "summary": shared_dir / "summary.json",
+        "stop_loss_state": runtime_dir / "stop_loss_state.json",
+        "stop_loss_plan": runtime_dir / "stop_loss_plan.json",
     }
 
 
@@ -302,6 +304,17 @@ DEFAULT_RUNTIME = {
 }
 
 
+DEFAULT_STOP_LOSS = {
+    "enabled": False,
+    "absolute_price": 0.68,
+    "relative_drop": 0.25,
+    "confirm_scans_required": 2,
+    "min_bid_depth_usd": 20.0,
+    "order_type": "FOK",
+    "dry_run": True,
+}
+
+
 def build_mode_settings(config: dict[str, Any], mode: str) -> dict[str, Any]:
     runtime = config.get("runtime", {}) if isinstance(config.get("runtime"), dict) else {}
     risk = config.get("risk", {}) if isinstance(config.get("risk"), dict) else {}
@@ -320,11 +333,14 @@ def build_mode_settings(config: dict[str, Any], mode: str) -> dict[str, Any]:
 
     live_cfg = deep_merge(DEFAULT_LIVE, live)
     runtime_cfg = deep_merge(DEFAULT_RUNTIME, runtime)
+    stop_loss_cfg_raw = config.get("stop_loss", {}) if isinstance(config.get("stop_loss"), dict) else {}
+    stop_loss_cfg = deep_merge(DEFAULT_STOP_LOSS, stop_loss_cfg_raw)
     return {
         "mode": mode,
         "runtime": runtime_cfg,
         "execution": merged,
         "live": live_cfg,
+        "stop_loss": stop_loss_cfg,
     }
 
 
@@ -415,6 +431,7 @@ def load_trading_state(path: Path, mode: str, settings: dict[str, Any]) -> dict[
     state.setdefault("settled_cash_released_usd", 0.0)
     state.setdefault("last_reconciliation", {})
     state.setdefault("last_settlement", {})
+    state.setdefault("last_stop_loss", {})
     state["mode"] = mode
     return state
 
@@ -1106,6 +1123,135 @@ class LiveTrader:
                 raise
         raise LiveExecutionError(f"order rejected after neg_risk retries: {last_err}")
 
+    def place_sell(
+        self,
+        token_id: str,
+        shares: float,
+        price: float,
+        tick_size: float | None = None,
+        neg_risk: bool | None = None,
+        order_type_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Place a SELL order using the same FOK/FAK vs GTC/GTD logic as ``place_buy``.
+
+        For market SELL (FOK/FAK), ``MarketOrderArgs.amount`` is **shares** to
+        sell (not USDC) — this is the opposite of BUY, where amount is USDC.
+        """
+        if self.client is None:
+            raise LiveExecutionError("client not initialized")
+
+        order_type_name = safe_str(order_type_override or self.live_cfg.get("order_type"), "FOK").upper()
+        order_type = getattr(OrderType, order_type_name, OrderType.FOK)
+
+        resolved_tick = safe_float(tick_size, 0.0)
+        if resolved_tick <= 0:
+            try:
+                resolved_tick = float(self.client.get_tick_size(token_id))
+            except Exception:
+                resolved_tick = DEFAULT_TICK_SIZE
+
+        normalized_price = clamp_live_price(price, resolved_tick)
+        if normalized_price <= 0:
+            raise LiveExecutionError(f"invalid sell price after normalization: {normalized_price}")
+
+        normalized_shares = round(max(shares, 0.0), LIVE_CLOB_SIZE_DECIMALS)
+        if normalized_shares <= 0:
+            raise LiveExecutionError(f"invalid sell share size: {normalized_shares}")
+
+        is_market = order_type_name in {"FOK", "FAK"}
+        if is_market:
+            market_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=normalized_shares,
+                price=normalized_price,
+                side=SELL,
+                order_type=order_type,
+            )
+        else:
+            limit_args = OrderArgs(
+                token_id=token_id, price=normalized_price, size=normalized_shares, side=SELL
+            )
+
+        def _build(flag: bool | None):
+            opts = PartialCreateOrderOptions(neg_risk=flag) if flag is not None else None
+            if is_market:
+                return self.client.create_market_order(market_args, options=opts) if opts else self.client.create_market_order(market_args)
+            return self.client.create_order(limit_args, options=opts) if opts else self.client.create_order(limit_args)
+
+        first = neg_risk if neg_risk is not None else None
+        attempts: list[bool | None] = [first]
+        for alt in (True, False):
+            if alt not in attempts:
+                attempts.append(alt)
+
+        last_err: Exception | None = None
+        for flag in attempts:
+            try:
+                order = _build(flag)
+                return self.client.post_order(order, order_type)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "invalid signature" in msg or "signature" in msg and "invalid" in msg:
+                    last_err = exc
+                    continue
+                raise
+        raise LiveExecutionError(f"sell order rejected after neg_risk retries: {last_err}")
+
+    def fetch_bid_info(self, token_ids: list[str]) -> dict[str, dict[str, float]]:
+        """Fetch bid-side info for sell-side monitoring.
+
+        Returns ``{token_id: {"best_bid": price, "bid_depth_usd": usd_depth}}``.
+        Uses the CLOB ``/books`` endpoint so we can evaluate bid-side depth,
+        not just the top-of-book price.
+        """
+        result: dict[str, dict[str, float]] = {}
+        if not token_ids:
+            return result
+        chunk_size = 60
+        try:
+            with httpx.Client(timeout=20) as client:
+                for start in range(0, len(token_ids), chunk_size):
+                    batch = token_ids[start : start + chunk_size]
+                    try:
+                        response = client.post(
+                            f"{CLOB_BASE}/books",
+                            json=[{"token_id": tid} for tid in batch],
+                            timeout=20,
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+                    except Exception:
+                        continue
+                    entries: list[dict[str, Any]] = []
+                    if isinstance(payload, list):
+                        entries = [item for item in payload if isinstance(item, dict)]
+                    elif isinstance(payload, dict):
+                        entries = [value for value in payload.values() if isinstance(value, dict)]
+                    for item in entries:
+                        token = safe_str(item.get("asset_id") or item.get("token_id"))
+                        if not token:
+                            continue
+                        bids = item.get("bids") or []
+                        best_bid = 0.0
+                        depth_usd = 0.0
+                        if isinstance(bids, list) and bids:
+                            # /books returns bids sorted highest-first.
+                            for level in bids:
+                                if not isinstance(level, dict):
+                                    continue
+                                lvl_price = safe_float(level.get("price"), 0.0)
+                                lvl_size = safe_float(level.get("size"), 0.0)
+                                if best_bid == 0.0 and lvl_price > 0:
+                                    best_bid = lvl_price
+                                depth_usd += lvl_price * lvl_size
+                        result[token] = {
+                            "best_bid": round(best_bid, 6),
+                            "bid_depth_usd": round(depth_usd, 4),
+                        }
+        except Exception:
+            pass
+        return result
+
     def fetch_open_orders(self) -> list[dict[str, Any]]:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
@@ -1402,6 +1548,257 @@ def archive_closed_positions(
     return len(archived), released, archived
 
 
+def fetch_bid_info_public(token_ids: list[str]) -> dict[str, dict[str, float]]:
+    """Unauthenticated /books fetch for paper/shadow bid-side monitoring.
+
+    Mirrors ``LiveTrader.fetch_bid_info`` so the detection logic is identical
+    across modes.
+    """
+    result: dict[str, dict[str, float]] = {}
+    if not token_ids:
+        return result
+    chunk_size = 60
+    try:
+        with httpx.Client(timeout=20) as client:
+            for start in range(0, len(token_ids), chunk_size):
+                batch = token_ids[start : start + chunk_size]
+                try:
+                    response = client.post(
+                        f"{CLOB_BASE}/books",
+                        json=[{"token_id": tid} for tid in batch],
+                        timeout=20,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except Exception:
+                    continue
+                entries: list[dict[str, Any]] = []
+                if isinstance(payload, list):
+                    entries = [item for item in payload if isinstance(item, dict)]
+                elif isinstance(payload, dict):
+                    entries = [value for value in payload.values() if isinstance(value, dict)]
+                for item in entries:
+                    token = safe_str(item.get("asset_id") or item.get("token_id"))
+                    if not token:
+                        continue
+                    bids = item.get("bids") or []
+                    best_bid = 0.0
+                    depth_usd = 0.0
+                    if isinstance(bids, list) and bids:
+                        for level in bids:
+                            if not isinstance(level, dict):
+                                continue
+                            lvl_price = safe_float(level.get("price"), 0.0)
+                            lvl_size = safe_float(level.get("size"), 0.0)
+                            if best_bid == 0.0 and lvl_price > 0:
+                                best_bid = lvl_price
+                            depth_usd += lvl_price * lvl_size
+                    result[token] = {
+                        "best_bid": round(best_bid, 6),
+                        "bid_depth_usd": round(depth_usd, 4),
+                    }
+    except Exception:
+        pass
+    return result
+
+
+def run_stop_loss_cycle(
+    state: dict[str, Any],
+    settings: dict[str, Any],
+    paths: dict[str, Path],
+    mode: str,
+    trader: LiveTrader | None,
+) -> dict[str, Any]:
+    """Orchestrate stop-loss detection + execution for one scan.
+
+    Returns a report dict used by the summary/status snapshot.
+    """
+    stop_cfg = settings.get("stop_loss", {}) if isinstance(settings.get("stop_loss"), dict) else {}
+    report = {
+        "enabled": parse_bool(stop_cfg.get("enabled"), False),
+        "dry_run": parse_bool(stop_cfg.get("dry_run"), True),
+        "planned": 0,
+        "executed": 0,
+        "dry_run_count": 0,
+        "statuses": [],
+        "plan": [],
+        "executed_rows": [],
+    }
+    if not report["enabled"]:
+        return report
+
+    positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+    token_ids = [safe_str(p.get("token_id")) for p in positions if isinstance(p, dict) and safe_str(p.get("token_id"))]
+    if not token_ids:
+        return report
+
+    if mode == "live" and trader is not None:
+        bid_info = trader.fetch_bid_info(token_ids)
+    else:
+        bid_info = fetch_bid_info_public(token_ids)
+
+    _, statuses = update_stop_loss_state(paths["stop_loss_state"], positions, bid_info, stop_cfg)
+    plan = build_stop_loss_plan(statuses, positions, stop_cfg)
+    save_json(paths["stop_loss_plan"], {"generated_at": now_iso_cst(), "plan": plan, "statuses": statuses})
+
+    state, executed, dry_run_count, executed_rows = execute_stop_loss(
+        state,
+        plan,
+        paths["journal"],
+        paths["notifications"],
+        trader,
+        mode,
+    )
+    report.update({
+        "planned": len(plan),
+        "executed": executed,
+        "dry_run_count": dry_run_count,
+        "statuses": statuses,
+        "plan": plan,
+        "executed_rows": executed_rows,
+    })
+    return report
+
+
+def update_stop_loss_state(
+    path: Path,
+    positions: list[dict[str, Any]],
+    bid_info: dict[str, dict[str, float]],
+    stop_cfg: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Track consecutive sub-threshold hits per position, return per-position status.
+
+    Trigger condition (OR of two signals):
+    * best_bid <= absolute_price
+    * entry_price - best_bid >= relative_drop
+
+    Both conditions are additionally gated by min_bid_depth_usd — a thin book
+    with a 0.50c bid on 5 shares is treated as a stale quote, not a real
+    repricing, so we do not count it toward the hit counter.
+    """
+    abs_price = safe_float(stop_cfg.get("absolute_price"), 0.68)
+    rel_drop = safe_float(stop_cfg.get("relative_drop"), 0.25)
+    min_depth = safe_float(stop_cfg.get("min_bid_depth_usd"), 0.0)
+    confirm_runs = max(1, safe_int(stop_cfg.get("confirm_scans_required"), 2))
+
+    state = load_json(path, {"tokens": {}, "updated_at": None})
+    if not isinstance(state, dict):
+        state = {"tokens": {}, "updated_at": None}
+    tokens = state.setdefault("tokens", {})
+    if not isinstance(tokens, dict):
+        tokens = {}
+        state["tokens"] = tokens
+
+    statuses: list[dict[str, Any]] = []
+    seen_tokens: set[str] = set()
+
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        token_id = safe_str(position.get("token_id"))
+        if not token_id:
+            continue
+        seen_tokens.add(token_id)
+        entry_price = safe_float(position.get("entry_price"), 0.0)
+        info = bid_info.get(token_id, {})
+        best_bid = safe_float(info.get("best_bid"), 0.0)
+        bid_depth_usd = safe_float(info.get("bid_depth_usd"), 0.0)
+
+        triggered_reasons: list[str] = []
+        thin_book = min_depth > 0 and bid_depth_usd < min_depth
+        has_quote = best_bid > 0
+
+        if has_quote and not thin_book:
+            if best_bid <= abs_price + 1e-9:
+                triggered_reasons.append("absolute_price")
+            if entry_price > 0 and (entry_price - best_bid) >= rel_drop - 1e-9:
+                triggered_reasons.append("relative_drop")
+
+        record = tokens.get(token_id, {}) if isinstance(tokens.get(token_id), dict) else {}
+        prev_hits = safe_int(record.get("consecutive_hits", 0))
+        if triggered_reasons:
+            hits = prev_hits + 1
+        else:
+            hits = 0
+
+        record.update({
+            "token_id": token_id,
+            "market_id": safe_str(position.get("market_id")),
+            "condition_id": safe_str(position.get("condition_id")),
+            "question": safe_str(position.get("question")),
+            "entry_price": round(entry_price, 6),
+            "best_bid": round(best_bid, 6),
+            "bid_depth_usd": round(bid_depth_usd, 4),
+            "triggered_reasons": triggered_reasons,
+            "thin_book": thin_book,
+            "has_quote": has_quote,
+            "consecutive_hits": hits,
+            "last_seen_at": now_iso_cst(),
+            "confirm_runs_required": confirm_runs,
+        })
+        tokens[token_id] = record
+
+        statuses.append({
+            **record,
+            "confirmed": hits >= confirm_runs and bool(triggered_reasons),
+        })
+
+    # Drop stale tokens no longer in open positions so state stays tidy.
+    for stale in [tid for tid in list(tokens.keys()) if tid not in seen_tokens]:
+        tokens.pop(stale, None)
+
+    state["updated_at"] = now_iso_cst()
+    save_json(path, state)
+    return state, statuses
+
+
+def build_stop_loss_plan(
+    statuses: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+    stop_cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Turn confirmed stop-loss triggers into actionable sell plan items."""
+    if not parse_bool(stop_cfg.get("enabled"), False):
+        return []
+    pos_by_token = {safe_str(p.get("token_id")): p for p in positions if isinstance(p, dict) and safe_str(p.get("token_id"))}
+    order_type = safe_str(stop_cfg.get("order_type"), "FOK").upper()
+    dry_run = parse_bool(stop_cfg.get("dry_run"), True)
+
+    plan: list[dict[str, Any]] = []
+    for status in statuses:
+        if not status.get("confirmed"):
+            continue
+        token_id = safe_str(status.get("token_id"))
+        position = pos_by_token.get(token_id)
+        if not position:
+            continue
+        shares = safe_float(position.get("shares"), 0.0)
+        if shares <= 0:
+            continue
+        best_bid = safe_float(status.get("best_bid"), 0.0)
+        if best_bid <= 0:
+            continue
+        plan.append({
+            "action": "stop_loss_dry_run" if dry_run else "stop_loss",
+            "token_id": token_id,
+            "market_id": safe_str(position.get("market_id")),
+            "condition_id": safe_str(position.get("condition_id")),
+            "question": safe_str(position.get("question")),
+            "entry_price": safe_float(position.get("entry_price"), 0.0),
+            "shares": round(shares, LIVE_CLOB_SIZE_DECIMALS),
+            "size_usd": safe_float(position.get("size_usd"), 0.0),
+            "best_bid": round(best_bid, 6),
+            "bid_depth_usd": safe_float(status.get("bid_depth_usd"), 0.0),
+            "reasons": list(status.get("triggered_reasons") or []),
+            "expected_proceeds_usd": round(shares * best_bid, 4),
+            "order_type": order_type,
+            "dry_run": dry_run,
+            "neg_risk": bool(position.get("neg_risk", False)),
+            "tick_size": safe_float(position.get("tick_size", DEFAULT_TICK_SIZE), DEFAULT_TICK_SIZE),
+        })
+    return plan
+
+
 def build_pending_settlements(state: dict[str, Any], settings: dict[str, Any]) -> list[dict[str, Any]]:
     grace_minutes = safe_int(settings["live"].get("settlement_grace_minutes"), 180)
     pending: list[dict[str, Any]] = []
@@ -1486,6 +1883,7 @@ def write_status_snapshot(path: Path, state: dict[str, Any], summary: dict[str, 
         "totals": state.get("totals", {}),
         "reconciliation": state.get("last_reconciliation", {}),
         "settlement": state.get("last_settlement", {}),
+        "stop_loss": summary.get("stop_loss", state.get("last_stop_loss", {})),
         "positions": truncate_list(state.get("positions", []), 25),
         "pending_settlements": truncate_list(state.get("pending_settlements", []), 25),
         "recent_fills": truncate_list(state.get("recent_fills", []), 20),
@@ -1675,6 +2073,142 @@ def execute_live(
     return state, accepted_orders
 
 
+def execute_stop_loss(
+    state: dict[str, Any],
+    plan: list[dict[str, Any]],
+    journal_path: Path,
+    notifications_path: Path,
+    trader: LiveTrader | None,
+    mode: str,
+) -> tuple[dict[str, Any], int, int, list[dict[str, Any]]]:
+    """Execute confirmed stop-loss sell actions.
+
+    Behavior depends on ``plan_item["dry_run"]`` and mode:
+
+    * ``dry_run=True`` (live): logs intended sell to journal/notifications but
+      DOES NOT call ``place_sell``. Position stays open so the user can observe.
+    * ``dry_run=False`` (live): places the sell via ``trader.place_sell``, then
+      records the closed position (open position removal happens on next remote
+      reconciliation so state stays consistent with Polymarket).
+    * ``mode != "live"`` (paper/shadow): simulates the sell at ``best_bid``,
+      moves the position to ``closed_positions``, updates realized PnL.
+    """
+    executed = 0
+    dry_run_count = 0
+    executed_rows: list[dict[str, Any]] = []
+    if not plan:
+        return state, executed, dry_run_count, executed_rows
+
+    positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+    pos_by_token = {safe_str(p.get("token_id")): p for p in positions if isinstance(p, dict)}
+
+    for item in plan:
+        token_id = safe_str(item.get("token_id"))
+        position = pos_by_token.get(token_id, {})
+        dry_run = parse_bool(item.get("dry_run"), True)
+
+        journal_event = {
+            "ts": now_iso_cst(),
+            "mode": mode,
+            "kind": "stop_loss",
+            "market_id": item.get("market_id"),
+            "condition_id": item.get("condition_id"),
+            "token_id": token_id,
+            "question": item.get("question"),
+            "entry_price": item.get("entry_price"),
+            "best_bid": item.get("best_bid"),
+            "shares": item.get("shares"),
+            "reasons": item.get("reasons"),
+            "order_type": item.get("order_type"),
+            "expected_proceeds_usd": item.get("expected_proceeds_usd"),
+            "dry_run": dry_run,
+        }
+
+        if mode == "live" and dry_run:
+            journal_event["status"] = "dry_run"
+            dry_run_count += 1
+            append_notification(
+                notifications_path,
+                "stop_loss",
+                "warn",
+                f"stop-loss WOULD TRIGGER (dry-run): {safe_str(item.get('question'))}",
+                journal_event,
+            )
+            append_jsonl(journal_path, journal_event)
+            executed_rows.append(journal_event)
+            continue
+
+        if mode == "live" and trader is not None:
+            try:
+                response = trader.place_sell(
+                    token_id=token_id,
+                    shares=safe_float(item.get("shares"), 0.0),
+                    price=safe_float(item.get("best_bid"), 0.0),
+                    tick_size=safe_float(item.get("tick_size"), 0.0) or None,
+                    neg_risk=bool(item.get("neg_risk")) if item.get("neg_risk") is not None else None,
+                    order_type_override=safe_str(item.get("order_type"), "FOK"),
+                )
+                journal_event["response"] = response
+                if not response_success(response):
+                    raise LiveExecutionError(f"sell rejected: {response}")
+                executed += 1
+                journal_event["status"] = "submitted"
+                append_notification(
+                    notifications_path,
+                    "stop_loss",
+                    "warn",
+                    f"stop-loss submitted: {safe_str(item.get('question'))}",
+                    journal_event,
+                )
+            except Exception as exc:
+                journal_event["status"] = "error"
+                journal_event["error"] = str(exc)
+                append_notification(
+                    notifications_path,
+                    "stop_loss",
+                    "error",
+                    f"stop-loss submission failed: {safe_str(item.get('question'))}",
+                    journal_event,
+                )
+            append_jsonl(journal_path, journal_event)
+            executed_rows.append(journal_event)
+            continue
+
+        # Paper / shadow: simulate the sell immediately at best_bid.
+        shares = safe_float(item.get("shares"), 0.0)
+        best_bid = safe_float(item.get("best_bid"), 0.0)
+        size_usd = safe_float(position.get("size_usd", item.get("size_usd")), 0.0)
+        payout = round(shares * best_bid, 6)
+        realized = round(payout - size_usd, 6)
+        closed_entry = {
+            **position,
+            "close_reason": "stop_loss_simulated",
+            "closed_at": now_iso_cst(),
+            "payout_usd": payout,
+            "realized_pnl": realized,
+            "exit_price": best_bid,
+            "stop_loss_reasons": item.get("reasons"),
+        }
+        state["closed_positions"] = truncate_list((state.get("closed_positions", []) or []) + [closed_entry], 500)
+        state["positions"] = [p for p in positions if safe_str(p.get("token_id")) != token_id]
+        positions = state["positions"]
+        executed += 1
+        journal_event["status"] = "simulated"
+        journal_event["payout_usd"] = payout
+        journal_event["realized_pnl"] = realized
+        append_notification(
+            notifications_path,
+            "stop_loss",
+            "warn",
+            f"stop-loss simulated: {safe_str(item.get('question'))}",
+            journal_event,
+        )
+        append_jsonl(journal_path, journal_event)
+        executed_rows.append(journal_event)
+
+    return state, executed, dry_run_count, executed_rows
+
+
 def mirror_legacy_outputs(base_dir: Path, config: dict[str, Any], trading_state_path: Path, daily_stats_path: Path) -> None:
     out = config.get("output", {}) if isinstance(config.get("output"), dict) else {}
     paper_state_path = (base_dir / out.get("paper_state_json", "state/paper_state.json")).resolve()
@@ -1731,6 +2265,21 @@ def run_trading_cycle(
             paths,
             preflight,
         )
+        save_json(paths["trading_state"], state)
+
+    # Stop-loss runs before the buy planner so confirmed sells liquidate first
+    # and free capital; in live dry-run mode this only logs intentions.
+    stop_loss_report: dict[str, Any] = {"enabled": False}
+    if mode != "live" or (live_trader is not None and preflight.get("status") == "ok"):
+        stop_loss_report = run_stop_loss_cycle(state, settings, paths, mode, live_trader)
+        state["last_stop_loss"] = {
+            "ts": now_iso_cst(),
+            "enabled": bool(stop_loss_report.get("enabled")),
+            "dry_run": bool(stop_loss_report.get("dry_run")),
+            "planned": safe_int(stop_loss_report.get("planned"), 0),
+            "executed": safe_int(stop_loss_report.get("executed"), 0),
+            "dry_run_count": safe_int(stop_loss_report.get("dry_run_count"), 0),
+        }
         save_json(paths["trading_state"], state)
 
     plan = build_execution_plan(candidates, state, settings, confirmed_ids, preflight)
@@ -1791,6 +2340,14 @@ def run_trading_cycle(
         "reconciliation": reconciliation_report or state.get("last_reconciliation", {}),
         "settlement": settlement_report or state.get("last_settlement", {}),
         "available_for_redeploy_usd": round(safe_float(state.get("available_for_redeploy_usd"), 0.0), 2),
+        "stop_loss": {
+            "enabled": bool(stop_loss_report.get("enabled")),
+            "dry_run": bool(stop_loss_report.get("dry_run")),
+            "planned": safe_int(stop_loss_report.get("planned"), 0),
+            "executed": safe_int(stop_loss_report.get("executed"), 0),
+            "dry_run_count": safe_int(stop_loss_report.get("dry_run_count"), 0),
+            "plan": stop_loss_report.get("plan", []),
+        },
     }
     save_json(paths["summary"], summary)
     status_snapshot = write_status_snapshot(paths["status_snapshot"], state, summary, preflight)

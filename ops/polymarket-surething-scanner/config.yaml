@@ -77,6 +77,18 @@ risk:
   min_depth_multiple: 8.0
   allow_add_to_existing: false
 
+stop_loss:
+  # Liquidate open positions when the mark drops sharply below entry. Runs
+  # before the buy planner each scan. In live mode, dry_run=true only logs
+  # intentions — no real sell orders are submitted.
+  enabled: true
+  absolute_price: 0.68       # trigger if best_bid <= this
+  relative_drop: 0.25        # OR trigger if entry_price - best_bid >= this
+  confirm_scans_required: 2  # must be below for this many consecutive scans
+  min_bid_depth_usd: 20.0    # require this much bid-side liquidity (skip thin books)
+  order_type: FOK
+  dry_run: true              # LIVE: true = log-only (observation mode), false = real sell
+
 output:
   candidates_json: state/latest_candidates.json
   metrics_json: state/scan_metrics.json

@@ -18,11 +18,14 @@ from trading import (
     build_execution_plan,
     build_mode_settings,
     build_pending_settlements,
+    build_stop_loss_plan,
+    execute_stop_loss,
     load_json,
     load_trading_state,
     reconcile_positions_from_remote,
     resolve_mode,
     update_signal_state,
+    update_stop_loss_state,
 )
 
 
@@ -209,6 +212,174 @@ class TradingTests(unittest.TestCase):
         self.assertIn("Surething LIVE 状态", text)
         self.assertIn("可再部署", text)
         self.assertIn("最近fills", text)
+
+
+class StopLossTests(unittest.TestCase):
+    STOP_CFG = {
+        "enabled": True,
+        "absolute_price": 0.68,
+        "relative_drop": 0.25,
+        "confirm_scans_required": 2,
+        "min_bid_depth_usd": 20.0,
+        "order_type": "FOK",
+        "dry_run": True,
+    }
+
+    def make_position(self, token_id: str = "tok-1", entry: float = 0.93, shares: float = 10.0) -> dict:
+        return {
+            "market_id": "m1",
+            "condition_id": "cond-1",
+            "token_id": token_id,
+            "question": "Question m1",
+            "entry_price": entry,
+            "shares": shares,
+            "size_usd": round(entry * shares, 4),
+            "opened_at": "2026-04-18T00:00:00+00:00",
+        }
+
+    def test_no_trigger_when_price_above_both_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sl.json"
+            pos = [self.make_position(entry=0.93)]
+            bids = {"tok-1": {"best_bid": 0.75, "bid_depth_usd": 500.0}}
+            _, statuses = update_stop_loss_state(path, pos, bids, self.STOP_CFG)
+            self.assertEqual(statuses[0]["triggered_reasons"], [])
+            self.assertEqual(statuses[0]["consecutive_hits"], 0)
+            self.assertFalse(statuses[0]["confirmed"])
+
+    def test_absolute_threshold_requires_two_scans_to_confirm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sl.json"
+            pos = [self.make_position(entry=0.93)]
+            bids = {"tok-1": {"best_bid": 0.68, "bid_depth_usd": 500.0}}
+            _, statuses = update_stop_loss_state(path, pos, bids, self.STOP_CFG)
+            self.assertIn("absolute_price", statuses[0]["triggered_reasons"])
+            self.assertEqual(statuses[0]["consecutive_hits"], 1)
+            self.assertFalse(statuses[0]["confirmed"])
+            _, statuses = update_stop_loss_state(path, pos, bids, self.STOP_CFG)
+            self.assertEqual(statuses[0]["consecutive_hits"], 2)
+            self.assertTrue(statuses[0]["confirmed"])
+
+    def test_relative_drop_triggers_for_high_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sl.json"
+            pos = [self.make_position(entry=0.99)]
+            bids = {"tok-1": {"best_bid": 0.73, "bid_depth_usd": 500.0}}
+            _, statuses = update_stop_loss_state(path, pos, bids, self.STOP_CFG)
+            self.assertIn("relative_drop", statuses[0]["triggered_reasons"])
+            self.assertNotIn("absolute_price", statuses[0]["triggered_reasons"])
+
+    def test_recovery_resets_confirmation_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sl.json"
+            pos = [self.make_position(entry=0.93)]
+            bids_below = {"tok-1": {"best_bid": 0.65, "bid_depth_usd": 500.0}}
+            bids_recover = {"tok-1": {"best_bid": 0.85, "bid_depth_usd": 500.0}}
+            _, statuses = update_stop_loss_state(path, pos, bids_below, self.STOP_CFG)
+            self.assertEqual(statuses[0]["consecutive_hits"], 1)
+            _, statuses = update_stop_loss_state(path, pos, bids_recover, self.STOP_CFG)
+            self.assertEqual(statuses[0]["consecutive_hits"], 0)
+            _, statuses = update_stop_loss_state(path, pos, bids_below, self.STOP_CFG)
+            self.assertEqual(statuses[0]["consecutive_hits"], 1)
+            self.assertFalse(statuses[0]["confirmed"])
+
+    def test_thin_book_does_not_count_toward_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sl.json"
+            pos = [self.make_position(entry=0.93)]
+            bids = {"tok-1": {"best_bid": 0.50, "bid_depth_usd": 5.0}}  # thin book
+            _, statuses = update_stop_loss_state(path, pos, bids, self.STOP_CFG)
+            self.assertTrue(statuses[0]["thin_book"])
+            self.assertEqual(statuses[0]["triggered_reasons"], [])
+            self.assertEqual(statuses[0]["consecutive_hits"], 0)
+
+    def test_build_plan_includes_dry_run_flag(self) -> None:
+        status = {
+            "token_id": "tok-1",
+            "confirmed": True,
+            "triggered_reasons": ["absolute_price"],
+            "best_bid": 0.68,
+            "bid_depth_usd": 500.0,
+        }
+        pos = [self.make_position()]
+        plan = build_stop_loss_plan([status], pos, self.STOP_CFG)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["action"], "stop_loss_dry_run")
+        self.assertTrue(plan[0]["dry_run"])
+        self.assertAlmostEqual(plan[0]["expected_proceeds_usd"], 10.0 * 0.68, places=4)
+
+    def test_build_plan_skips_unconfirmed(self) -> None:
+        status = {"token_id": "tok-1", "confirmed": False, "triggered_reasons": ["absolute_price"], "best_bid": 0.68}
+        plan = build_stop_loss_plan([status], [self.make_position()], self.STOP_CFG)
+        self.assertEqual(plan, [])
+
+    def test_build_plan_disabled_returns_empty(self) -> None:
+        status = {"token_id": "tok-1", "confirmed": True, "triggered_reasons": ["absolute_price"], "best_bid": 0.68}
+        cfg = {**self.STOP_CFG, "enabled": False}
+        plan = build_stop_loss_plan([status], [self.make_position()], cfg)
+        self.assertEqual(plan, [])
+
+    def test_execute_dry_run_does_not_modify_positions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "journal.jsonl"
+            notifications = Path(tmp) / "notifications.jsonl"
+            pos = self.make_position()
+            state = {"positions": [pos], "closed_positions": []}
+            plan = [{
+                "action": "stop_loss_dry_run",
+                "token_id": "tok-1",
+                "market_id": "m1",
+                "question": "Question m1",
+                "entry_price": 0.93,
+                "shares": 10.0,
+                "size_usd": 9.3,
+                "best_bid": 0.68,
+                "bid_depth_usd": 500.0,
+                "reasons": ["absolute_price"],
+                "order_type": "FOK",
+                "dry_run": True,
+                "expected_proceeds_usd": 6.8,
+            }]
+            state, executed, dry_run_count, rows = execute_stop_loss(
+                state, plan, journal, notifications, trader=None, mode="live"
+            )
+            self.assertEqual(executed, 0)
+            self.assertEqual(dry_run_count, 1)
+            self.assertEqual(len(state["positions"]), 1)  # position untouched
+            self.assertEqual(len(state["closed_positions"]), 0)
+            self.assertEqual(rows[0]["status"], "dry_run")
+
+    def test_execute_paper_simulates_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "journal.jsonl"
+            notifications = Path(tmp) / "notifications.jsonl"
+            pos = self.make_position()
+            state = {"positions": [pos], "closed_positions": []}
+            plan = [{
+                "action": "stop_loss",
+                "token_id": "tok-1",
+                "market_id": "m1",
+                "question": "Question m1",
+                "entry_price": 0.93,
+                "shares": 10.0,
+                "size_usd": 9.3,
+                "best_bid": 0.68,
+                "reasons": ["absolute_price"],
+                "order_type": "FOK",
+                "dry_run": False,
+                "expected_proceeds_usd": 6.8,
+            }]
+            state, executed, dry_run_count, rows = execute_stop_loss(
+                state, plan, journal, notifications, trader=None, mode="paper"
+            )
+            self.assertEqual(executed, 1)
+            self.assertEqual(dry_run_count, 0)
+            self.assertEqual(len(state["positions"]), 0)
+            self.assertEqual(len(state["closed_positions"]), 1)
+            closed = state["closed_positions"][0]
+            self.assertAlmostEqual(closed["payout_usd"], 6.8, places=4)
+            self.assertAlmostEqual(closed["realized_pnl"], 6.8 - 9.3, places=4)
+            self.assertEqual(closed["close_reason"], "stop_loss_simulated")
 
 
 if __name__ == "__main__":
