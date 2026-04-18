@@ -88,6 +88,7 @@ stop_loss:
   min_bid_depth_usd: 20.0    # require this much bid-side liquidity (skip thin books)
   order_type: FOK
   dry_run: true              # LIVE: true = log-only (observation mode), false = real sell
+  fast_recheck_sec: 300      # seconds to wait before re-checking first-hit tokens (0 = disable)
 
 output:
   candidates_json: state/latest_candidates.json

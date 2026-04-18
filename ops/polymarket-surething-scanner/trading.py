@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import shlex
 import subprocess
 from collections import Counter
@@ -312,6 +313,7 @@ DEFAULT_STOP_LOSS = {
     "min_bid_depth_usd": 20.0,
     "order_type": "FOK",
     "dry_run": True,
+    "fast_recheck_sec": 300,
 }
 
 
@@ -1638,6 +1640,32 @@ def run_stop_loss_cycle(
         bid_info = fetch_bid_info_public(token_ids)
 
     _, statuses = update_stop_loss_state(paths["stop_loss_state"], positions, bid_info, stop_cfg)
+
+    # Fast recheck: if any position just reached its first hit (consecutive_hits
+    # == 1 but not yet confirmed), wait a short interval and re-fetch bids for
+    # those tokens only, so confirmation can happen in ~5min instead of 30min.
+    first_hit_tokens = [
+        s["token_id"] for s in statuses
+        if safe_int(s.get("consecutive_hits"), 0) == 1 and not s.get("confirmed")
+    ]
+    recheck_sec = safe_int(stop_cfg.get("fast_recheck_sec"), 300)
+    if first_hit_tokens and recheck_sec > 0:
+        append_notification(
+            paths["notifications"],
+            "stop_loss",
+            "warn",
+            f"stop-loss first hit on {len(first_hit_tokens)} token(s), rechecking in {recheck_sec}s",
+            {"tokens": first_hit_tokens, "recheck_sec": recheck_sec},
+        )
+        time.sleep(recheck_sec)
+        if mode == "live" and trader is not None:
+            bid_info_recheck = trader.fetch_bid_info(first_hit_tokens)
+        else:
+            bid_info_recheck = fetch_bid_info_public(first_hit_tokens)
+        bid_info.update(bid_info_recheck)
+        positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
+        _, statuses = update_stop_loss_state(paths["stop_loss_state"], positions, bid_info, stop_cfg)
+
     plan = build_stop_loss_plan(statuses, positions, stop_cfg)
     save_json(paths["stop_loss_plan"], {"generated_at": now_iso_cst(), "plan": plan, "statuses": statuses})
 
