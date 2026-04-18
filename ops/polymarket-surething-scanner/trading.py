@@ -539,6 +539,7 @@ def build_execution_plan(
     planned_orders = 0
     planned_exposure = 0.0
     planned_new_positions = 0
+    planned_per_market: dict[str, float] = {}
 
     plan: list[dict[str, Any]] = []
     # Prioritize: lowest ask (highest ROI if resolves YES), deepest book
@@ -549,6 +550,7 @@ def build_execution_plan(
         market_id = candidate.market_id
         current = existing.get(market_id)
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
+        current_size += planned_per_market.get(market_id, 0.0)
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
 
         # Per-market CLOB metadata from the /books response.
@@ -617,6 +619,7 @@ def build_execution_plan(
         if action == "open":
             planned_orders += 1
             planned_exposure += effective_order_usd
+            planned_per_market[market_id] = planned_per_market.get(market_id, 0.0) + effective_order_usd
             if not current:
                 planned_new_positions += 1
 
