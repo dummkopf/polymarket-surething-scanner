@@ -15,9 +15,30 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from eth_account import Account
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, MarketOrderArgs, OpenOrderParams, OrderArgs, OrderType, PartialCreateOrderOptions
+from py_clob_client.client import ClobClient as ClobClientV1
+from py_clob_client.clob_types import (
+    ApiCreds as ApiCredsV1,
+    AssetType as AssetTypeV1,
+    BalanceAllowanceParams as BalanceAllowanceParamsV1,
+    MarketOrderArgs as MarketOrderArgsV1,
+    OpenOrderParams as OpenOrderParamsV1,
+    OrderArgs as OrderArgsV1,
+    OrderType as OrderTypeV1,
+    PartialCreateOrderOptions as PartialCreateOrderOptionsV1,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
+
+from py_clob_client_v2 import (
+    ClobClient as ClobClientV2,
+    ApiCreds as ApiCredsV2,
+    AssetType as AssetTypeV2,
+    BalanceAllowanceParams as BalanceAllowanceParamsV2,
+    MarketOrderArgs as MarketOrderArgsV2,
+    OpenOrderParams as OpenOrderParamsV2,
+    OrderArgs as OrderArgsV2,
+    OrderType as OrderTypeV2,
+    PartialCreateOrderOptions as PartialCreateOrderOptionsV2,
+)
 
 from models import CandidateMarket
 
@@ -313,6 +334,7 @@ DEFAULT_LIVE = {
     "claim_shell_command": "",
     "claim_shell_timeout_sec": 120,
     "profile_address": "",
+    "use_v2_client": False,
 }
 
 
@@ -986,19 +1008,35 @@ class LiveTrader:
             or (Account.from_key(self.private_key).address if self.private_key else "")
         )
         self.live_cfg = live_cfg
-        self.client: ClobClient | None = None
+        self.use_v2 = parse_bool(live_cfg.get("use_v2_client"), False)
+        self.client: ClobClientV1 | ClobClientV2 | None = None
 
-    def _build_client(self) -> ClobClient:
+    def _build_client(self) -> ClobClientV1 | ClobClientV2:
         if not self.private_key:
             raise LiveExecutionError("missing POLYMARKET_PRIVATE_KEY")
         if self.signature_type in {1, 2} and not self.funder:
             raise LiveExecutionError("POLYMARKET_FUNDER required for proxy/email wallet signatures")
 
+        if self.use_v2:
+            creds = None
+            if self.api_key and self.api_secret and self.api_passphrase:
+                creds = ApiCredsV2(self.api_key, self.api_secret, self.api_passphrase)
+            client = ClobClientV2(
+                self.host,
+                chain_id=self.chain_id,
+                key=self.private_key,
+                creds=creds,
+                signature_type=self.signature_type,
+                funder=self.funder,
+            )
+            if creds is None:
+                client.set_api_creds(client.create_or_derive_api_key())
+            return client
+
         creds = None
         if self.api_key and self.api_secret and self.api_passphrase:
-            creds = ApiCreds(self.api_key, self.api_secret, self.api_passphrase)
-
-        client = ClobClient(
+            creds = ApiCredsV1(self.api_key, self.api_secret, self.api_passphrase)
+        client = ClobClientV1(
             self.host,
             chain_id=self.chain_id,
             key=self.private_key,
@@ -1035,7 +1073,10 @@ class LiveTrader:
             raise LiveExecutionError("POLYMARKET_LIVE_ENABLED=true not set")
 
         self.client = self._build_client()
-        allowance = self.client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        if self.use_v2:
+            allowance = self.client.get_balance_allowance(BalanceAllowanceParamsV2(asset_type=AssetTypeV2.COLLATERAL))
+        else:
+            allowance = self.client.get_balance_allowance(BalanceAllowanceParamsV1(asset_type=AssetTypeV1.COLLATERAL))
         collateral_balance = self._extract_balance(allowance)
         min_balance = safe_float(self.live_cfg.get("min_collateral_balance_usd"), 0.0)
         if collateral_balance < min_balance:
@@ -1045,7 +1086,10 @@ class LiveTrader:
 
         open_orders_count = None
         if parse_bool(self.live_cfg.get("require_empty_open_orders"), True):
-            open_orders = self.client.get_orders(OpenOrderParams())
+            if self.use_v2:
+                open_orders = self.client.get_open_orders(OpenOrderParamsV2())
+            else:
+                open_orders = self.client.get_orders(OpenOrderParamsV1())
             open_orders_count = len(open_orders) if isinstance(open_orders, list) else 0
             if open_orders_count > 0:
                 raise LiveExecutionError(f"remote open orders must be empty before live start (found {open_orders_count})")
@@ -1111,9 +1155,23 @@ class LiveTrader:
             raise LiveExecutionError(f"invalid price after normalization: {normalized_price}")
 
         is_market = order_type_name in {"FOK", "FAK"}
+
+        first = neg_risk if neg_risk is not None else None
+        attempts: list[bool | None] = [first]
+        for alt in (True, False):
+            if alt not in attempts:
+                attempts.append(alt)
+
+        if self.use_v2:
+            return self._place_buy_v2(
+                token_id, normalized_price, order_size_usd, shares,
+                order_type_name, order_type, post_only, is_market,
+                resolved_tick, min_order_size, attempts,
+            )
+
         if is_market:
             amount_usd = round(max(order_size_usd, 0.01), 2)
-            market_args = MarketOrderArgs(
+            market_args = MarketOrderArgsV1(
                 token_id=token_id,
                 amount=amount_usd,
                 price=normalized_price,
@@ -1127,24 +1185,15 @@ class LiveTrader:
             normalized_shares = clamp_live_shares(shares, resolved_min)
             if normalized_shares <= 0:
                 raise LiveExecutionError(f"invalid share size after normalization: {normalized_shares}")
-            limit_args = OrderArgs(
+            limit_args = OrderArgsV1(
                 token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY
             )
 
         def _build(flag: bool | None):
-            opts = PartialCreateOrderOptions(neg_risk=flag) if flag is not None else None
+            opts = PartialCreateOrderOptionsV1(neg_risk=flag) if flag is not None else None
             if is_market:
                 return self.client.create_market_order(market_args, options=opts) if opts else self.client.create_market_order(market_args)
             return self.client.create_order(limit_args, options=opts) if opts else self.client.create_order(limit_args)
-
-        # Try neg_risk values in order: candidate-provided flag first, then the opposite.
-        # Polymarket signs against two different CTF adapters (neg_risk vs vanilla);
-        # a mismatched flag surfaces as "invalid signature" at submit time.
-        first = neg_risk if neg_risk is not None else None
-        attempts: list[bool | None] = [first]
-        for alt in (True, False):
-            if alt not in attempts:
-                attempts.append(alt)
 
         last_err: Exception | None = None
         for flag in attempts:
@@ -1158,6 +1207,55 @@ class LiveTrader:
                     continue
                 raise
         raise LiveExecutionError(f"order rejected after neg_risk retries: {last_err}")
+
+    def _place_buy_v2(
+        self,
+        token_id: str,
+        normalized_price: float,
+        order_size_usd: float,
+        shares: float,
+        order_type_name: str,
+        order_type: Any,
+        post_only: bool,
+        is_market: bool,
+        resolved_tick: float,
+        min_order_size: float | None,
+        attempts: list[bool | None],
+    ) -> dict[str, Any]:
+        v2_order_type = getattr(OrderTypeV2, order_type_name, OrderTypeV2.FOK)
+        tick_str = str(resolved_tick) if resolved_tick > 0 else "0.01"
+
+        last_err: Exception | None = None
+        for flag in attempts:
+            try:
+                opts = PartialCreateOrderOptionsV2(tick_size=tick_str, neg_risk=flag) if flag is not None else PartialCreateOrderOptionsV2(tick_size=tick_str)
+                if is_market:
+                    amount_usd = round(max(order_size_usd, 0.01), 2)
+                    market_args = MarketOrderArgsV2(
+                        token_id=token_id,
+                        amount=amount_usd,
+                        price=normalized_price,
+                        side=BUY,
+                    )
+                    return self.client.create_and_post_market_order(market_args, options=opts, order_type=v2_order_type)
+                else:
+                    resolved_min = safe_float(min_order_size, 0.0)
+                    if resolved_min <= 0:
+                        resolved_min = DEFAULT_MIN_ORDER_SIZE
+                    normalized_shares = clamp_live_shares(shares, resolved_min)
+                    if normalized_shares <= 0:
+                        raise LiveExecutionError(f"invalid share size after normalization: {normalized_shares}")
+                    limit_args = OrderArgsV2(
+                        token_id=token_id, price=normalized_price, size=normalized_shares, side=BUY
+                    )
+                    return self.client.create_and_post_order(limit_args, options=opts, order_type=v2_order_type, post_only=post_only)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "invalid signature" in msg or "signature" in msg and "invalid" in msg:
+                    last_err = exc
+                    continue
+                raise
+        raise LiveExecutionError(f"v2 order rejected after neg_risk retries: {last_err}")
 
     def place_sell(
         self,
@@ -1195,8 +1293,21 @@ class LiveTrader:
             raise LiveExecutionError(f"invalid sell share size: {normalized_shares}")
 
         is_market = order_type_name in {"FOK", "FAK"}
+
+        first = neg_risk if neg_risk is not None else None
+        attempts: list[bool | None] = [first]
+        for alt in (True, False):
+            if alt not in attempts:
+                attempts.append(alt)
+
+        if self.use_v2:
+            return self._place_sell_v2(
+                token_id, normalized_price, normalized_shares,
+                order_type_name, is_market, resolved_tick, attempts,
+            )
+
         if is_market:
-            market_args = MarketOrderArgs(
+            market_args = MarketOrderArgsV1(
                 token_id=token_id,
                 amount=normalized_shares,
                 price=normalized_price,
@@ -1204,21 +1315,15 @@ class LiveTrader:
                 order_type=order_type,
             )
         else:
-            limit_args = OrderArgs(
+            limit_args = OrderArgsV1(
                 token_id=token_id, price=normalized_price, size=normalized_shares, side=SELL
             )
 
         def _build(flag: bool | None):
-            opts = PartialCreateOrderOptions(neg_risk=flag) if flag is not None else None
+            opts = PartialCreateOrderOptionsV1(neg_risk=flag) if flag is not None else None
             if is_market:
                 return self.client.create_market_order(market_args, options=opts) if opts else self.client.create_market_order(market_args)
             return self.client.create_order(limit_args, options=opts) if opts else self.client.create_order(limit_args)
-
-        first = neg_risk if neg_risk is not None else None
-        attempts: list[bool | None] = [first]
-        for alt in (True, False):
-            if alt not in attempts:
-                attempts.append(alt)
 
         last_err: Exception | None = None
         for flag in attempts:
@@ -1232,6 +1337,44 @@ class LiveTrader:
                     continue
                 raise
         raise LiveExecutionError(f"sell order rejected after neg_risk retries: {last_err}")
+
+    def _place_sell_v2(
+        self,
+        token_id: str,
+        normalized_price: float,
+        normalized_shares: float,
+        order_type_name: str,
+        is_market: bool,
+        resolved_tick: float,
+        attempts: list[bool | None],
+    ) -> dict[str, Any]:
+        v2_order_type = getattr(OrderTypeV2, order_type_name, OrderTypeV2.FOK)
+        tick_str = str(resolved_tick) if resolved_tick > 0 else "0.01"
+
+        last_err: Exception | None = None
+        for flag in attempts:
+            try:
+                opts = PartialCreateOrderOptionsV2(tick_size=tick_str, neg_risk=flag) if flag is not None else PartialCreateOrderOptionsV2(tick_size=tick_str)
+                if is_market:
+                    market_args = MarketOrderArgsV2(
+                        token_id=token_id,
+                        amount=normalized_shares,
+                        price=normalized_price,
+                        side=SELL,
+                    )
+                    return self.client.create_and_post_market_order(market_args, options=opts, order_type=v2_order_type)
+                else:
+                    limit_args = OrderArgsV2(
+                        token_id=token_id, price=normalized_price, size=normalized_shares, side=SELL
+                    )
+                    return self.client.create_and_post_order(limit_args, options=opts, order_type=v2_order_type)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "invalid signature" in msg or "signature" in msg and "invalid" in msg:
+                    last_err = exc
+                    continue
+                raise
+        raise LiveExecutionError(f"v2 sell order rejected after neg_risk retries: {last_err}")
 
     def fetch_bid_info(self, token_ids: list[str]) -> dict[str, dict[str, float]]:
         """Fetch bid-side info for sell-side monitoring.
@@ -1291,7 +1434,10 @@ class LiveTrader:
     def fetch_open_orders(self) -> list[dict[str, Any]]:
         if self.client is None:
             raise LiveExecutionError("client not initialized")
-        payload = self.client.get_orders(OpenOrderParams())
+        if self.use_v2:
+            payload = self.client.get_open_orders(OpenOrderParamsV2())
+        else:
+            payload = self.client.get_orders(OpenOrderParamsV1())
         return payload if isinstance(payload, list) else []
 
     def fetch_trades(self) -> list[dict[str, Any]]:

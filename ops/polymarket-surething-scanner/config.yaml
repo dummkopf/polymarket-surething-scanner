@@ -69,6 +69,7 @@ live:
   profile_address: ""
   claim_shell_command: ""
   claim_shell_timeout_sec: 120
+  use_v2_client: false
 
 risk:
   # Global guardrails applied before any execution mode-specific overrides.

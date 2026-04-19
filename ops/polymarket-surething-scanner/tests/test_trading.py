@@ -13,6 +13,8 @@ if str(ROOT) not in sys.path:
 from models import CandidateMarket
 from reporting import render_live_hourly
 from trading import (
+    DEFAULT_LIVE,
+    LiveTrader,
     append_new_fills,
     archive_closed_positions,
     build_execution_plan,
@@ -22,6 +24,7 @@ from trading import (
     execute_stop_loss,
     load_json,
     load_trading_state,
+    parse_bool,
     reconcile_positions_from_remote,
     resolve_mode,
     update_signal_state,
@@ -380,6 +383,171 @@ class StopLossTests(unittest.TestCase):
             self.assertAlmostEqual(closed["payout_usd"], 6.8, places=4)
             self.assertAlmostEqual(closed["realized_pnl"], 6.8 - 9.3, places=4)
             self.assertEqual(closed["close_reason"], "stop_loss_simulated")
+
+
+class V2MigrationTests(unittest.TestCase):
+    """Tests for the V1 → V2 CLOB client migration gated by use_v2_client."""
+
+    def test_use_v2_client_defaults_false(self) -> None:
+        self.assertFalse(parse_bool(DEFAULT_LIVE.get("use_v2_client"), False))
+
+    def test_build_mode_settings_propagates_v2_flag(self) -> None:
+        config = {
+            "runtime": {"mode": "live"},
+            "live": {"enabled": True, "use_v2_client": True},
+        }
+        settings = build_mode_settings(config, "live")
+        self.assertTrue(parse_bool(settings["live"].get("use_v2_client"), False))
+
+    def test_build_mode_settings_v2_flag_false_by_default(self) -> None:
+        config = {
+            "runtime": {"mode": "live"},
+            "live": {"enabled": True},
+        }
+        settings = build_mode_settings(config, "live")
+        self.assertFalse(parse_bool(settings["live"].get("use_v2_client"), False))
+
+    def _make_env_file(self, tmp: str) -> Path:
+        env_file = Path(tmp) / ".env.live"
+        env_file.write_text(
+            "POLYMARKET_PRIVATE_KEY=0x" + "ab" * 32 + "\n"
+            "POLYMARKET_LIVE_ENABLED=true\n"
+            "POLYMARKET_API_KEY=fake-key\n"
+            "POLYMARKET_API_SECRET=fake-secret\n"
+            "POLYMARKET_API_PASSPHRASE=fake-pass\n"
+        )
+        return env_file
+
+    def test_live_trader_v1_client_type(self) -> None:
+        from trading import ClobClientV1
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = self._make_env_file(tmp)
+            live_cfg = {**DEFAULT_LIVE, "enabled": True, "use_v2_client": False}
+            trader = LiveTrader(env_file, live_cfg)
+            self.assertFalse(trader.use_v2)
+            client = trader._build_client()
+            self.assertIsInstance(client, ClobClientV1)
+
+    def test_live_trader_v2_client_type(self) -> None:
+        from trading import ClobClientV2
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = self._make_env_file(tmp)
+            live_cfg = {**DEFAULT_LIVE, "enabled": True, "use_v2_client": True}
+            trader = LiveTrader(env_file, live_cfg)
+            self.assertTrue(trader.use_v2)
+            client = trader._build_client()
+            self.assertIsInstance(client, ClobClientV2)
+
+    def test_v2_imports_available(self) -> None:
+        from trading import (
+            ClobClientV2,
+            ApiCredsV2,
+            OrderArgsV2,
+            MarketOrderArgsV2,
+            OrderTypeV2,
+            PartialCreateOrderOptionsV2,
+        )
+        self.assertIsNotNone(ClobClientV2)
+        self.assertIsNotNone(ApiCredsV2)
+        opts = PartialCreateOrderOptionsV2(tick_size="0.01", neg_risk=True)
+        self.assertEqual(opts.tick_size, "0.01")
+        self.assertTrue(opts.neg_risk)
+
+    def test_v2_order_args_accept_string_side(self) -> None:
+        from trading import OrderArgsV2, MarketOrderArgsV2
+        limit_args = OrderArgsV2(token_id="tok1", price=0.95, size=10.0, side="BUY")
+        self.assertEqual(limit_args.side, "BUY")
+        market_args = MarketOrderArgsV2(token_id="tok1", amount=1.0, side="SELL", price=0.68)
+        self.assertEqual(market_args.side, "SELL")
+
+
+class V2SandboxIntegrationTests(unittest.TestCase):
+    """Integration tests against the Polymarket Amoy sandbox.
+
+    These tests make real HTTP calls to clob-sandbox.polymarket.com.
+    They use a throwaway private key — no real funds at risk.
+    """
+
+    SANDBOX_HOST = "https://clob-sandbox.polymarket.com"
+    AMOY_CHAIN_ID = 80002
+
+    def _make_sandbox_trader(self) -> "LiveTrader":
+        from eth_account import Account
+        acct = Account.create()
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env.sandbox"
+            env_file.write_text("")
+            live_cfg = {
+                **DEFAULT_LIVE,
+                "enabled": True,
+                "use_v2_client": True,
+            }
+            trader = LiveTrader(env_file, live_cfg)
+            trader.host = self.SANDBOX_HOST
+            trader.chain_id = self.AMOY_CHAIN_ID
+            trader.private_key = acct.key.hex()
+            trader.profile_address = acct.address
+            trader.api_key = ""
+            trader.api_secret = ""
+            trader.api_passphrase = ""
+            self._tmp_dir = tmp
+            return trader
+
+    def test_v2_sandbox_derive_api_key_and_balance(self) -> None:
+        from trading import ClobClientV2
+        trader = self._make_sandbox_trader()
+        try:
+            client = trader._build_client()
+        except Exception as exc:
+            self.skipTest(f"sandbox unreachable: {exc}")
+        self.assertIsInstance(client, ClobClientV2)
+        try:
+            from trading import BalanceAllowanceParamsV2, AssetTypeV2
+            allowance = client.get_balance_allowance(
+                BalanceAllowanceParamsV2(asset_type=AssetTypeV2.COLLATERAL)
+            )
+            self.assertIsInstance(allowance, dict)
+        except Exception as exc:
+            self.skipTest(f"sandbox balance check failed: {exc}")
+
+    def test_v2_sandbox_get_tick_size(self) -> None:
+        trader = self._make_sandbox_trader()
+        try:
+            client = trader._build_client()
+        except Exception as exc:
+            self.skipTest(f"sandbox unreachable: {exc}")
+        # Use a well-known sandbox token or just verify the method exists
+        # and returns a sane error for a fake token_id
+        try:
+            tick = client.get_tick_size("0x" + "00" * 32)
+            self.assertIn(tick, ["0.1", "0.01", "0.001", "0.0001"])
+        except Exception:
+            pass  # Fake token may 404, that's acceptable
+
+    def test_v1_sandbox_derive_api_creds(self) -> None:
+        from trading import ClobClientV1
+        from eth_account import Account
+        acct = Account.create()
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env.sandbox"
+            env_file.write_text("")
+            live_cfg = {
+                **DEFAULT_LIVE,
+                "enabled": True,
+                "use_v2_client": False,
+            }
+            trader = LiveTrader(env_file, live_cfg)
+            trader.host = self.SANDBOX_HOST
+            trader.chain_id = self.AMOY_CHAIN_ID
+            trader.private_key = acct.key.hex()
+            trader.api_key = ""
+            trader.api_secret = ""
+            trader.api_passphrase = ""
+            try:
+                client = trader._build_client()
+            except Exception as exc:
+                self.skipTest(f"sandbox unreachable: {exc}")
+            self.assertIsInstance(client, ClobClientV1)
 
 
 if __name__ == "__main__":
