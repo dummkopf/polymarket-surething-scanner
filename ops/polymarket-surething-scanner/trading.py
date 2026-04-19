@@ -1962,6 +1962,40 @@ def sync_live_state(
 
     reconciled_positions, drift_report = reconcile_positions_from_remote(state, remote_positions_raw, candidates)
     archived_count, released, archived_rows = archive_closed_positions(state, remote_closed_raw, candidates)
+    # Detect positions that vanished from the remote open list (user redeemed
+    # manually, or Polymarket settled) but were not captured by the
+    # closed-positions API.  Look up actual resolution from Gamma so PnL is
+    # correct even for NO outcomes.
+    local_tokens_before = {safe_str(p.get("token_id")): p for p in state.get("positions", []) if isinstance(p, dict) and safe_str(p.get("token_id"))}
+    reconciled_tokens = {safe_str(p.get("token_id")) for p in reconciled_positions if isinstance(p, dict)}
+    archived_tokens = {safe_str(a.get("token_id")) for a in archived_rows if isinstance(a, dict)}
+    vanished_positions = {tid: pos for tid, pos in local_tokens_before.items() if tid not in reconciled_tokens and tid not in archived_tokens}
+    if vanished_positions:
+        vanished_market_ids = [safe_str(p.get("market_id")) for p in vanished_positions.values() if safe_str(p.get("market_id"))]
+        resolved_payouts = _fetch_resolved_payouts(vanished_market_ids)
+        vanished_rows: list[dict[str, Any]] = []
+        for token_id, local_pos in vanished_positions.items():
+            market_id = safe_str(local_pos.get("market_id"))
+            shares = safe_float(local_pos.get("shares"), 0.0)
+            size_usd = safe_float(local_pos.get("size_usd"), 0.0)
+            yes_price = resolved_payouts.get(market_id)
+            if yes_price is not None:
+                payout = round(shares * yes_price, 6)
+            else:
+                payout = round(shares, 6)
+            vanished_rows.append({
+                **local_pos,
+                "close_reason": "vanished_from_remote",
+                "closed_at": now_iso_cst(),
+                "payout_usd": payout,
+                "realized_pnl": round(payout - size_usd, 6),
+            })
+        state["closed_positions"] = truncate_list((state.get("closed_positions", []) or []) + vanished_rows, 500)
+        archived_count += len(vanished_rows)
+        vanished_released = sum(safe_float(v.get("payout_usd"), 0.0) for v in vanished_rows)
+        released += vanished_released
+        state["settled_cash_released_usd"] = round(safe_float(state.get("settled_cash_released_usd"), 0.0) + vanished_released, 6)
+        archived_rows.extend(vanished_rows)
     state["positions"] = reconciled_positions
     state["pending_settlements"] = build_pending_settlements(state, settings)
 
