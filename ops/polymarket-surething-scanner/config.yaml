@@ -73,6 +73,11 @@ live:
   profile_address: ""
   claim_shell_command: ""
   claim_shell_timeout_sec: 120
+  weather_fast_lane_enabled: true
+  weather_fast_lane_confirm_scans_required: 1
+  weather_fast_lane_min_best_ask: 0.94
+  weather_fast_lane_resolve_within_hours: 12
+  weather_fast_lane_max_price_drift_on_submit: 0.01
 
 risk:
   # Global guardrails applied before any execution mode-specific overrides.

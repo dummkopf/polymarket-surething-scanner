@@ -257,6 +257,11 @@ DEFAULT_LIVE = {
     "recent_trade_dedupe_minutes": 120,
     "pre_submit_quote_recheck": True,
     "pre_submit_quote_timeout_sec": 12,
+    "weather_fast_lane_enabled": False,
+    "weather_fast_lane_confirm_scans_required": 1,
+    "weather_fast_lane_min_best_ask": 0.94,
+    "weather_fast_lane_resolve_within_hours": 12,
+    "weather_fast_lane_max_price_drift_on_submit": 0.01,
 }
 
 
@@ -367,6 +372,40 @@ def has_recent_fill(
     return False
 
 
+def is_weather_fast_lane_candidate(candidate: CandidateMarket, live_cfg: dict[str, Any], now: datetime | None = None) -> bool:
+    if not parse_bool(live_cfg.get("weather_fast_lane_enabled"), False):
+        return False
+
+    resolution_source = safe_str(candidate.resolution_source).lower()
+    if "wunderground" not in resolution_source:
+        return False
+
+    current_time = now or now_utc()
+    resolve_within_hours = safe_float(live_cfg.get("weather_fast_lane_resolve_within_hours"), 12.0)
+    remaining_hours = (candidate.end_date - current_time).total_seconds() / 3600.0
+    if remaining_hours < 0 or remaining_hours > resolve_within_hours:
+        return False
+
+    min_best_ask = safe_float(live_cfg.get("weather_fast_lane_min_best_ask"), 0.94)
+    if safe_float(candidate.best_ask) < min_best_ask:
+        return False
+
+    return True
+
+
+def required_confirm_runs(candidate: CandidateMarket, settings: dict[str, Any], mode: str, now: datetime | None = None) -> int:
+    execution = settings.get("execution", {}) if isinstance(settings.get("execution"), dict) else {}
+    default_required = max(1, safe_int(execution.get("confirm_scans_required"), 2))
+    if mode != "live":
+        return default_required
+
+    live_cfg = settings.get("live", {}) if isinstance(settings.get("live"), dict) else {}
+    if not is_weather_fast_lane_candidate(candidate, live_cfg, now=now):
+        return default_required
+
+    return max(1, safe_int(live_cfg.get("weather_fast_lane_confirm_scans_required"), 1))
+
+
 def refresh_candidate_for_live_submit(
     candidate: CandidateMarket,
     scanner_cfg: dict[str, Any],
@@ -425,7 +464,14 @@ def revalidate_live_plan_item(
     settings: dict[str, Any],
     preflight: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    plan = build_execution_plan([candidate], state, settings, confirmed_ids={candidate.market_id}, preflight=preflight)
+    plan = build_execution_plan(
+        [candidate],
+        state,
+        settings,
+        confirmed_ids={candidate.market_id},
+        signal_state={"markets": {candidate.market_id: {"consecutive_hits": safe_int(settings.get("execution", {}).get("confirm_scans_required"), 2)}}},
+        preflight=preflight,
+    )
     if not plan:
         return None, "revalidation_failed"
     item = plan[0]
@@ -619,6 +665,7 @@ def build_execution_plan(
     state: dict[str, Any],
     settings: dict[str, Any],
     confirmed_ids: set[str],
+    signal_state: dict[str, Any] | None = None,
     preflight: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     execution = settings["execution"]
@@ -626,6 +673,7 @@ def build_execution_plan(
     preflight = preflight or {}
     positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
     existing = {str(position.get("market_id", "")): position for position in positions}
+    signal_markets = signal_state.get("markets", {}) if isinstance(signal_state, dict) else {}
 
     order_size_usd = safe_float(execution.get("order_size_usd"), 1.0)
     max_position_usd = safe_float(execution.get("max_position_usd_per_market"), 5.0)
@@ -636,7 +684,6 @@ def build_execution_plan(
     min_minutes_to_expiry = safe_int(execution.get("min_minutes_to_expiry"), 90)
     min_depth_multiple = safe_float(execution.get("min_depth_multiple"), 8.0)
     allow_add = parse_bool(execution.get("allow_add_to_existing"), False)
-    confirm_runs_required = safe_int(execution.get("confirm_scans_required"), 2)
 
     now = now_utc()
     day_key = now_cst().strftime("%Y-%m-%d")
@@ -655,6 +702,15 @@ def build_execution_plan(
         current_size = safe_float(current.get("size_usd"), 0.0) if current else 0.0
         minutes_to_expiry = max(0, int((candidate.end_date - now).total_seconds() // 60))
         shares = round(order_size_usd / candidate.best_ask, LIVE_SIZE_DECIMALS) if candidate.best_ask > 0 else 0.0
+        confirm_runs_required = required_confirm_runs(candidate, settings, mode, now=now)
+        fast_lane_weather = mode == "live" and confirm_runs_required == 1 and is_weather_fast_lane_candidate(
+            candidate,
+            settings.get("live", {}) if isinstance(settings.get("live"), dict) else {},
+            now=now,
+        )
+        signal_record = signal_markets.get(market_id, {}) if isinstance(signal_markets, dict) else {}
+        consecutive_hits = safe_int(signal_record.get("consecutive_hits"), 0)
+        is_confirmed = consecutive_hits >= confirm_runs_required if signal_record else (market_id in confirmed_ids)
 
         reason = None
         if parse_bool(state.get("live_halted"), False) and mode == "live":
@@ -663,7 +719,7 @@ def build_execution_plan(
             reason = "preflight_failed"
         elif candidate.restricted and mode in ("live", "shadow"):
             reason = "restricted_market"
-        elif market_id not in confirmed_ids:
+        elif not is_confirmed:
             reason = f"await_confirm_{confirm_runs_required}_runs"
         elif candidate.best_ask <= 0 or shares <= 0:
             reason = "invalid_price"
@@ -705,6 +761,9 @@ def build_execution_plan(
                 "shares": shares,
                 "minutes_to_expiry": minutes_to_expiry,
                 "restricted": candidate.restricted,
+                "confirm_runs_required": confirm_runs_required,
+                "consecutive_hits": consecutive_hits,
+                "fast_lane_weather": fast_lane_weather,
                 "action": action,
                 "reason": reason or "approved",
                 "expected_resolve_at": candidate.end_date.isoformat(),
@@ -1532,6 +1591,8 @@ def execute_live(
             "price": item.get("best_ask"),
             "shares": item.get("shares"),
             "order_size_usd": item.get("order_size_usd"),
+            "fast_lane_weather": bool(item.get("fast_lane_weather", False)),
+            "confirm_runs_required": item.get("confirm_runs_required"),
         }
         candidate = candidates_by_market.get(safe_str(item.get("market_id")))
         token_id = safe_str(item.get("token_id"))
@@ -1570,6 +1631,24 @@ def execute_live(
                     append_jsonl(journal_path, journal_event)
                     continue
                 candidate_for_submit = refreshed_candidate
+
+            if bool(item.get("fast_lane_weather", False)):
+                max_price_drift = safe_float(live_cfg.get("weather_fast_lane_max_price_drift_on_submit"), 0.01)
+                planned_price = safe_float(item.get("best_ask"), 0.0)
+                refreshed_price = safe_float(candidate_for_submit.best_ask, planned_price)
+                journal_event["refreshed_best_ask"] = refreshed_price
+                if refreshed_price > planned_price + max_price_drift:
+                    journal_event["status"] = "skipped"
+                    journal_event["reason"] = "weather_fast_lane_price_drift"
+                    append_notification(
+                        notifications_path,
+                        "order_guard",
+                        "warn",
+                        f"live weather fast-lane skipped by price drift: {safe_str(item.get('question'))}",
+                        journal_event,
+                    )
+                    append_jsonl(journal_path, journal_event)
+                    continue
 
             revalidated_item, revalidation_reason = revalidate_live_plan_item(candidate_for_submit, state, settings, preflight)
             if revalidated_item is None:
@@ -1729,7 +1808,7 @@ def run_trading_cycle(
         )
         save_json(paths["trading_state"], state)
 
-    plan = build_execution_plan(candidates, state, settings, confirmed_ids, preflight)
+    plan = build_execution_plan(candidates, state, settings, confirmed_ids, signal_state=signal_state, preflight=preflight)
 
     executed_orders = 0
     if mode == "live" and live_trader is not None and preflight.get("status") == "ok":

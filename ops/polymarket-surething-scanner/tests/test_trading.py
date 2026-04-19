@@ -6,11 +6,13 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import trading
 from models import CandidateMarket
 from reporting import render_live_hourly
 from trading import (
@@ -70,6 +72,29 @@ class TradingTests(unittest.TestCase):
         plan = build_execution_plan([candidate], state, settings, confirmed_ids=set(), preflight={"status": "ok"})
         self.assertEqual(plan[0]["action"], "skip")
         self.assertEqual(plan[0]["reason"], "await_confirm_2_runs")
+
+    def test_live_weather_fast_lane_can_bypass_second_confirmation(self) -> None:
+        config = {
+            "runtime": {"mode": "live"},
+            "live": {
+                "enabled": True,
+                "weather_fast_lane_enabled": True,
+                "weather_fast_lane_confirm_scans_required": 1,
+                "weather_fast_lane_min_best_ask": 0.94,
+                "weather_fast_lane_resolve_within_hours": 12,
+            },
+        }
+        settings = build_mode_settings(config, "live")
+        state = load_trading_state(Path("/tmp/does-not-exist.json"), "live", settings)
+        candidate = make_candidate(hours_ahead=10)
+        candidate.resolution_source = "https://www.wunderground.com/history/daily/us/tx/austin/KAUS"
+        candidate.best_ask = 0.95
+        signal_state = {"markets": {candidate.market_id: {"consecutive_hits": 1}}}
+        plan = build_execution_plan([candidate], state, settings, confirmed_ids=set(), signal_state=signal_state, preflight={"status": "ok"})
+        self.assertEqual(plan[0]["action"], "open")
+        self.assertEqual(plan[0]["confirm_runs_required"], 1)
+        self.assertEqual(plan[0]["consecutive_hits"], 1)
+        self.assertTrue(plan[0]["fast_lane_weather"])
 
     def test_execute_live_forces_neg_risk_false_by_default(self) -> None:
         class FakeTrader:
@@ -170,6 +195,53 @@ class TradingTests(unittest.TestCase):
             plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
             trader = FakeTrader()
             _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 0)
+            self.assertEqual(trader.calls, 0)
+
+    def test_execute_live_skips_weather_fast_lane_on_price_drift(self) -> None:
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def place_buy(self, **kwargs):
+                self.calls += 1
+                return {"success": True}
+
+        candidate = make_candidate(hours_ahead=10)
+        candidate.resolution_source = "https://www.wunderground.com/history/daily/us/tx/austin/KAUS"
+        candidate.best_ask = 0.95
+        config = {
+            "runtime": {"mode": "live"},
+            "scanner": {},
+            "live": {
+                "weather_fast_lane_enabled": True,
+                "weather_fast_lane_confirm_scans_required": 1,
+                "weather_fast_lane_min_best_ask": 0.94,
+                "weather_fast_lane_resolve_within_hours": 12,
+                "weather_fast_lane_max_price_drift_on_submit": 0.01,
+                "pre_submit_quote_recheck": True,
+            },
+        }
+        settings = build_mode_settings(config, "live")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "trading_state.json"
+            journal_path = Path(tmp) / "journal.jsonl"
+            notifications_path = Path(tmp) / "notifications.jsonl"
+            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
+            trader = FakeTrader()
+            refreshed = make_candidate(market_id=candidate.market_id, hours_ahead=10)
+            refreshed.token_id = candidate.token_id
+            refreshed.condition_id = candidate.condition_id
+            refreshed.slug = candidate.slug
+            refreshed.event_slug = candidate.event_slug
+            refreshed.question = candidate.question
+            refreshed.resolution_source = candidate.resolution_source
+            refreshed.best_ask = 0.97
+            refreshed.depth_usd = candidate.depth_usd
+            refreshed.tick_size = candidate.tick_size
+            refreshed.min_order_size = candidate.min_order_size
+            with mock.patch.object(trading, "refresh_candidate_for_live_submit", return_value=(refreshed, None)):
+                _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
             self.assertEqual(accepted, 0)
             self.assertEqual(trader.calls, 0)
 
