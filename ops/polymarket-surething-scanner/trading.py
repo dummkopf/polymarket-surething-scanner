@@ -170,6 +170,23 @@ def first_non_empty(payload: dict[str, Any], keys: list[str], default: Any = Non
     return default
 
 
+def _to_iso_timestamp(value: Any) -> str:
+    """Convert a value that might be a Unix timestamp, ISO string, or number to ISO-8601."""
+    s = safe_str(value)
+    if not s:
+        return ""
+    if s.replace(".", "", 1).isdigit():
+        try:
+            ts = float(s)
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000.0
+            dt = datetime.fromtimestamp(ts, tz=CST)
+            return dt.isoformat()
+        except (ValueError, OSError, OverflowError):
+            pass
+    return s
+
+
 def truncate_list(items: list[Any], limit: int) -> list[Any]:
     if limit <= 0:
         return []
@@ -729,8 +746,25 @@ def finalize_state(
     closed_count: int = 0,
 ) -> dict[str, Any]:
     positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
-    closed_positions = state.get("closed_positions", []) if isinstance(state.get("closed_positions"), list) else []
+    closed_positions_raw = state.get("closed_positions", []) if isinstance(state.get("closed_positions"), list) else []
     candidates_by_market = {candidate.market_id: candidate for candidate in candidates if candidate.market_id}
+
+    # Normalize closed_at timestamps (Unix → ISO) and dedup by token_id,
+    # keeping the entry with the richest data (highest abs(realized_pnl)).
+    deduped: dict[str, dict[str, Any]] = {}
+    for closed in closed_positions_raw:
+        if not isinstance(closed, dict):
+            continue
+        raw_ts = safe_str(closed.get("closed_at"))
+        if raw_ts and raw_ts.replace(".", "", 1).isdigit():
+            closed["closed_at"] = _to_iso_timestamp(raw_ts)
+        token_id = safe_str(closed.get("token_id"))
+        key = token_id or f"no-token-{id(closed)}"
+        existing = deduped.get(key)
+        if existing is None or abs(safe_float(closed.get("realized_pnl"), 0.0)) > abs(safe_float(existing.get("realized_pnl"), 0.0)):
+            deduped[key] = closed
+    closed_positions = list(deduped.values())
+    state["closed_positions"] = closed_positions
 
     total_open_cost, total_deployed_now, total_unrealized = summarize_positions(positions, candidates_by_market)
     now = now_cst()
@@ -1392,6 +1426,20 @@ def normalize_remote_closed_position(raw: dict[str, Any], meta_by_token: dict[st
     realized = normalize_usd_amount(first_non_empty(raw, ["cashPnl", "cash_pnl", "realizedPnl", "realized_pnl"]), payout - initial_value)
     if not token_id and not market_id:
         return None
+    # If API returned cashPnl but not initialValue/currentValue, reconstruct
+    # from shares so the dashboard can display cost/payout correctly.
+    shares = safe_float(first_non_empty(raw, ["size", "amount", "shares"]), 0.0)
+    if initial_value <= 0 and realized != 0 and shares > 0:
+        avg_price = safe_float(first_non_empty(raw, ["avgPrice", "avg_price"]), 0.0)
+        if avg_price > 0:
+            initial_value = round(avg_price * shares, 6)
+            payout = round(initial_value + realized, 6)
+        elif payout > 0:
+            initial_value = round(payout - realized, 6)
+    if payout <= 0 and initial_value > 0 and realized != 0:
+        payout = round(initial_value + realized, 6)
+    closed_at_raw = first_non_empty(raw, ["updatedAt", "closedAt", "closed_at", "timestamp"])
+    closed_at = _to_iso_timestamp(closed_at_raw) if closed_at_raw else now_iso_cst()
     return {
         "market_id": market_id or safe_str(meta.get("market_id")),
         "condition_id": safe_str(first_non_empty(raw, ["conditionId", "condition_id"])) or safe_str(meta.get("condition_id")),
@@ -1403,7 +1451,7 @@ def normalize_remote_closed_position(raw: dict[str, Any], meta_by_token: dict[st
         "size_usd": round(initial_value, 6),
         "payout_usd": round(payout, 6),
         "realized_pnl": round(realized, 6),
-        "closed_at": safe_str(first_non_empty(raw, ["updatedAt", "closedAt", "closed_at", "timestamp"])) or now_iso_cst(),
+        "closed_at": closed_at,
         "raw": raw,
     }
 
@@ -1514,10 +1562,10 @@ def archive_closed_positions(
     meta_by_token, _ = build_meta_maps(state, candidates)
     open_positions = state.get("positions", []) if isinstance(state.get("positions"), list) else []
     open_by_token = {safe_str(item.get("token_id")): item for item in open_positions if safe_str(item.get("token_id"))}
-    existing_closed = {
-        f"{safe_str(item.get('token_id'))}:{safe_str(item.get('closed_at'))}:{safe_float(item.get('payout_usd'), 0.0)}"
+    existing_closed_tokens = {
+        safe_str(item.get("token_id"))
         for item in state.get("closed_positions", [])
-        if isinstance(item, dict)
+        if isinstance(item, dict) and safe_str(item.get("token_id"))
     }
     archived: list[dict[str, Any]] = []
     released = 0.0
@@ -1527,8 +1575,7 @@ def archive_closed_positions(
         if normalized is None:
             continue
         token_id = safe_str(normalized.get("token_id"))
-        key = f"{token_id}:{safe_str(normalized.get('closed_at'))}:{safe_float(normalized.get('payout_usd'), 0.0)}"
-        if key in existing_closed:
+        if token_id in existing_closed_tokens:
             continue
         local = open_by_token.get(token_id)
         if local is None and token_id not in {safe_str(fill.get("token_id")) for fill in state.get("recent_fills", []) if isinstance(fill, dict)}:
@@ -1539,7 +1586,7 @@ def archive_closed_positions(
             "close_reason": "remote_settled_archive",
         }
         archived.append(closed)
-        existing_closed.add(key)
+        existing_closed_tokens.add(token_id)
         released += max(0.0, safe_float(closed.get("payout_usd"), 0.0))
 
     if archived:
