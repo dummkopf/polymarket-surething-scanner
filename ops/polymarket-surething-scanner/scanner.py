@@ -23,6 +23,12 @@ def load_config(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def build_scanner_settings(config: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
+    """Scanner thresholds are shared across paper/shadow/live modes."""
+    scanner_cfg = config.get("scanner", {}) if isinstance(config.get("scanner"), dict) else {}
+    return dict(scanner_cfg)
+
+
 def parse_json_field(value: Any, default: list[Any] | None = None) -> list[Any]:
     if default is None:
         default = []
@@ -165,6 +171,49 @@ def is_sports_related_market(market: dict[str, Any]) -> bool:
     return any(phrase in hay for phrase in sports_phrases) or any(token in tokens for token in sports_words)
 
 
+def is_commodity_related_market(market: dict[str, Any]) -> bool:
+    hay = build_market_haystack(market)
+    tokens = set(re.findall(r"[a-z0-9]+", hay))
+    commodity_phrases = [
+        "crude oil",
+        "natural gas",
+        "brent oil",
+        "brent crude",
+        "wti crude",
+        "wti crude oil",
+        "heating oil",
+        "gasoline",
+        "gold spot",
+        "silver spot",
+        "up or down",
+    ]
+    commodity_words = {
+        "commodity",
+        "commodities",
+        "oil",
+        "crude",
+        "gas",
+        "gasoline",
+        "natural",
+        "energy",
+        "brent",
+        "wti",
+        "ng",
+        "xauusd",
+        "xagusd",
+        "gold",
+        "silver",
+        "copper",
+        "platinum",
+        "palladium",
+    }
+    price_words = {"closes", "close", "above", "below", "higher", "lower", "price"}
+    phrase_hit = any(phrase in hay for phrase in commodity_phrases)
+    token_hit = any(token in tokens for token in commodity_words)
+    price_hit = any(token in tokens for token in price_words)
+    return phrase_hit and token_hit or token_hit and price_hit
+
+
 def is_high_randomness_narrative_market(market: dict[str, Any]) -> bool:
     hay = build_market_haystack(market)
     question = str(market.get("question", "")).lower()
@@ -210,6 +259,33 @@ def is_high_randomness_narrative_market(market: dict[str, Any]) -> bool:
     all_in_like = "all-in podcast" in hay or "all in podcast" in hay or event_title.endswith("podcast")
 
     return (conversational_context and subjective_prompt) or next_show_pattern or all_in_like
+
+
+def is_repetitive_daily_event_market(market: dict[str, Any]) -> bool:
+    question = str(market.get("question", "")).lower()
+    hay = build_market_haystack(market)
+    repetitive_phrases = [
+        "publicly insult someone on",
+        "publicly insult",
+        "insult someone on",
+    ]
+    if any(phrase in question for phrase in repetitive_phrases):
+        return True
+    series_slug = str(market.get("seriesSlug", "")).lower()
+    events = market.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict):
+                s = str(event.get("seriesSlug", "")).lower()
+                if s:
+                    series_slug = s
+    daily_series_markers = [
+        "will-trump-publicly-insult",
+        "trump-insult",
+    ]
+    if any(marker in series_slug or marker in hay for marker in daily_series_markers):
+        return True
+    return False
 
 
 async def fetch_markets(client: httpx.AsyncClient, page_size: int) -> list[dict[str, Any]]:
@@ -287,6 +363,34 @@ def get_best_ask(book: dict[str, Any]) -> float | None:
     return min(prices) if prices else None
 
 
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_book_tick_size(book: dict[str, Any]) -> float:
+    # /books returns tick_size as a string like "0.01" or "0.001".
+    return _coerce_float(book.get("tick_size") if isinstance(book, dict) else None, 0.01)
+
+
+def get_book_min_order_size(book: dict[str, Any]) -> float:
+    # /books returns min_order_size in outcome-token units (shares).
+    return _coerce_float(book.get("min_order_size") if isinstance(book, dict) else None, 5.0)
+
+
+def get_book_neg_risk(book: dict[str, Any]) -> bool:
+    value = book.get("neg_risk") if isinstance(book, dict) else None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
 def depth_usd_upto(book: dict[str, Any], max_price: float) -> float:
     asks = book.get("asks") if isinstance(book, dict) else None
     if not isinstance(asks, list):
@@ -318,7 +422,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     exclude_crypto = bool(scanner_cfg.get("exclude_crypto", True))
     exclude_stock_related = bool(scanner_cfg.get("exclude_stock_related", True))
     exclude_sports_related = bool(scanner_cfg.get("exclude_sports_related", True))
+    exclude_commodity_related = bool(scanner_cfg.get("exclude_commodity_related", True))
     exclude_high_randomness_narrative = bool(scanner_cfg.get("exclude_high_randomness_narrative", True))
+    exclude_repetitive_daily_event = bool(scanner_cfg.get("exclude_repetitive_daily_event", True))
 
     candidates: list[CandidateMarket] = []
     quick_pass: list[dict[str, Any]] = []
@@ -328,7 +434,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
     crypto_skips = 0
     stock_skips = 0
     sports_skips = 0
+    commodity_skips = 0
     high_randomness_narrative_skips = 0
+    repetitive_daily_event_skips = 0
 
     async with httpx.AsyncClient() as client:
         markets = await fetch_markets(client, page_size)
@@ -351,8 +459,14 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
             if exclude_sports_related and is_sports_related_market(market):
                 sports_skips += 1
                 continue
+            if exclude_commodity_related and is_commodity_related_market(market):
+                commodity_skips += 1
+                continue
             if exclude_high_randomness_narrative and is_high_randomness_narrative_market(market):
                 high_randomness_narrative_skips += 1
+                continue
+            if exclude_repetitive_daily_event and is_repetitive_daily_event_market(market):
+                repetitive_daily_event_skips += 1
                 continue
 
             end_date = parse_iso(market.get("endDate"))
@@ -427,9 +541,9 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
                     slug=str(market.get("slug", "")),
                     event_slug=event_slug,
                     restricted=bool(item.get("restricted", False)),
-                    tick_size=float(book.get("tick_size") or 0.01),
-                    min_order_size=float(book.get("min_order_size") or 0.0),
-                    neg_risk=bool(book.get("neg_risk", False)),
+                    tick_size=get_book_tick_size(book),
+                    min_order_size=get_book_min_order_size(book),
+                    neg_risk=get_book_neg_risk(book),
                 )
             )
 
@@ -444,12 +558,16 @@ async def run_scan(config_path: Path) -> tuple[list[CandidateMarket], dict[str, 
         "crypto_skips": crypto_skips,
         "stock_skips": stock_skips,
         "sports_skips": sports_skips,
+        "commodity_skips": commodity_skips,
         "high_randomness_narrative_skips": high_randomness_narrative_skips,
+        "repetitive_daily_event_skips": repetitive_daily_event_skips,
         "filter_restricted": filter_restricted,
         "exclude_crypto": exclude_crypto,
         "exclude_stock_related": exclude_stock_related,
         "exclude_sports_related": exclude_sports_related,
+        "exclude_commodity_related": exclude_commodity_related,
         "exclude_high_randomness_narrative": exclude_high_randomness_narrative,
+        "exclude_repetitive_daily_event": exclude_repetitive_daily_event,
     }
     return candidates, metrics
 
@@ -470,14 +588,18 @@ def persist_outputs(
     candidates_path.write_text(json.dumps([candidate.to_dict() for candidate in candidates], ensure_ascii=False, indent=2), encoding="utf-8")
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    render_dashboard(
-        candidates_path,
-        metrics_path,
-        dashboard_path,
-        trading_state_path=Path(trading_result["paths"]["trading_state"]),
-        daily_stats_path=Path(trading_result["paths"]["daily_stats"]),
-        runtime_summary_path=Path(trading_result["paths"]["summary"]),
-    )
+    mode = trading_result.get("mode", "paper")
+    mode_dashboard_path = dashboard_path.parent / f"dashboard_{mode}.html"
+
+    for path in (dashboard_path, mode_dashboard_path):
+        render_dashboard(
+            candidates_path,
+            metrics_path,
+            path,
+            trading_state_path=Path(trading_result["paths"]["trading_state"]),
+            daily_stats_path=Path(trading_result["paths"]["daily_stats"]),
+            runtime_summary_path=Path(trading_result["paths"]["summary"]),
+        )
 
 
 def parse_args() -> argparse.Namespace:

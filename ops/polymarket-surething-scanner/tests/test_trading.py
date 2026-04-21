@@ -73,36 +73,25 @@ class TradingTests(unittest.TestCase):
         self.assertEqual(plan[0]["action"], "skip")
         self.assertEqual(plan[0]["reason"], "await_confirm_2_runs")
 
-    def test_live_weather_fast_lane_can_bypass_second_confirmation(self) -> None:
+    def test_live_plan_opens_when_confirmed(self) -> None:
         config = {
             "runtime": {"mode": "live"},
-            "live": {
-                "enabled": True,
-                "weather_fast_lane_enabled": True,
-                "weather_fast_lane_confirm_scans_required": 1,
-                "weather_fast_lane_min_best_ask": 0.94,
-                "weather_fast_lane_resolve_within_hours": 12,
-            },
+            "live": {"enabled": True},
         }
         settings = build_mode_settings(config, "live")
         state = load_trading_state(Path("/tmp/does-not-exist.json"), "live", settings)
         candidate = make_candidate(hours_ahead=10)
-        candidate.resolution_source = "https://www.wunderground.com/history/daily/us/tx/austin/KAUS"
-        candidate.best_ask = 0.95
-        signal_state = {"markets": {candidate.market_id: {"consecutive_hits": 1}}}
-        plan = build_execution_plan([candidate], state, settings, confirmed_ids=set(), signal_state=signal_state, preflight={"status": "ok"})
+        plan = build_execution_plan([candidate], state, settings, confirmed_ids={candidate.market_id}, preflight={"status": "ok"})
         self.assertEqual(plan[0]["action"], "open")
-        self.assertEqual(plan[0]["confirm_runs_required"], 1)
-        self.assertEqual(plan[0]["consecutive_hits"], 1)
-        self.assertTrue(plan[0]["fast_lane_weather"])
+        self.assertEqual(plan[0]["reason"], "approved")
 
-    def test_execute_live_forces_neg_risk_false_by_default(self) -> None:
+    def test_execute_live_passes_candidate_neg_risk_flag(self) -> None:
         class FakeTrader:
             def __init__(self) -> None:
-                self.calls: list[bool] = []
+                self.calls: list[bool | None] = []
 
             def place_buy(self, **kwargs):
-                self.calls.append(bool(kwargs.get("neg_risk")))
+                self.calls.append(kwargs.get("neg_risk"))
                 return {"success": True}
 
         candidate = make_candidate()
@@ -110,7 +99,7 @@ class TradingTests(unittest.TestCase):
         config = {
             "runtime": {"mode": "live"},
             "scanner": {},
-            "live": {"force_neg_risk_false": True, "pre_submit_quote_recheck": False},
+            "live": {},
         }
         settings = build_mode_settings(config, "live")
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,30 +110,23 @@ class TradingTests(unittest.TestCase):
             trader = FakeTrader()
             _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
             self.assertEqual(accepted, 1)
-            self.assertEqual(trader.calls, [False])
+            self.assertEqual(trader.calls, [True])
 
-    def test_execute_live_retries_invalid_signature_with_neg_risk_false(self) -> None:
+    def test_execute_live_records_submission_error(self) -> None:
         class FakeTrader:
             def __init__(self) -> None:
-                self.calls: list[bool] = []
+                self.calls: list[bool | None] = []
 
             def place_buy(self, **kwargs):
-                neg_risk = bool(kwargs.get("neg_risk"))
-                self.calls.append(neg_risk)
-                if len(self.calls) == 1:
-                    raise Exception("400 invalid signature")
-                return {"success": True}
+                self.calls.append(kwargs.get("neg_risk"))
+                raise Exception("400 invalid signature")
 
         candidate = make_candidate()
         candidate.neg_risk = True
         config = {
             "runtime": {"mode": "live"},
             "scanner": {},
-            "live": {
-                "force_neg_risk_false": False,
-                "retry_without_neg_risk_on_invalid_signature": True,
-                "pre_submit_quote_recheck": False,
-            },
+            "live": {},
         }
         settings = build_mode_settings(config, "live")
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,74 +135,55 @@ class TradingTests(unittest.TestCase):
             notifications_path = Path(tmp) / "notifications.jsonl"
             plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
             trader = FakeTrader()
-            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
-            self.assertEqual(accepted, 1)
-            self.assertEqual(trader.calls, [True, False])
-
-    def test_execute_live_skips_recent_fill_duplicate(self) -> None:
-        class FakeTrader:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def place_buy(self, **kwargs):
-                self.calls += 1
-                return {"success": True}
-
-        candidate = make_candidate()
-        config = {
-            "runtime": {"mode": "live"},
-            "scanner": {},
-            "live": {"recent_trade_dedupe_minutes": 120, "pre_submit_quote_recheck": False},
-        }
-        settings = build_mode_settings(config, "live")
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "trading_state.json"
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "mode": "live",
-                        "recent_fills": [
-                            {
-                                "token_id": candidate.token_id,
-                                "market_id": candidate.market_id,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            journal_path = Path(tmp) / "journal.jsonl"
-            notifications_path = Path(tmp) / "notifications.jsonl"
-            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
-            trader = FakeTrader()
-            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            state, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
             self.assertEqual(accepted, 0)
-            self.assertEqual(trader.calls, 0)
+            self.assertEqual(trader.calls, [True])
+            self.assertEqual(state["consecutive_live_errors"], 1)
 
-    def test_execute_live_skips_weather_fast_lane_on_price_drift(self) -> None:
+    def test_execute_live_prefers_limit_price_over_best_ask(self) -> None:
         class FakeTrader:
             def __init__(self) -> None:
-                self.calls = 0
+                self.prices: list[float] = []
 
             def place_buy(self, **kwargs):
-                self.calls += 1
+                self.prices.append(float(kwargs.get("price")))
+                return {"success": True}
+
+        candidate = make_candidate()
+        config = {
+            "runtime": {"mode": "live"},
+            "scanner": {},
+            "live": {},
+        }
+        settings = build_mode_settings(config, "live")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "trading_state.json"
+            journal_path = Path(tmp) / "journal.jsonl"
+            notifications_path = Path(tmp) / "notifications.jsonl"
+            plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
+            plan[0]["limit_price"] = 0.96
+            plan[0]["best_ask"] = 0.95
+            trader = FakeTrader()
+            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 1)
+            self.assertEqual(trader.prices, [0.96])
+
+    def test_execute_live_passes_tick_size_and_min_order_size(self) -> None:
+        class FakeTrader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def place_buy(self, **kwargs):
+                self.calls.append(kwargs)
                 return {"success": True}
 
         candidate = make_candidate(hours_ahead=10)
-        candidate.resolution_source = "https://www.wunderground.com/history/daily/us/tx/austin/KAUS"
-        candidate.best_ask = 0.95
+        candidate.tick_size = 0.01
+        candidate.min_order_size = 5.0
         config = {
             "runtime": {"mode": "live"},
             "scanner": {},
-            "live": {
-                "weather_fast_lane_enabled": True,
-                "weather_fast_lane_confirm_scans_required": 1,
-                "weather_fast_lane_min_best_ask": 0.94,
-                "weather_fast_lane_resolve_within_hours": 12,
-                "weather_fast_lane_max_price_drift_on_submit": 0.01,
-                "pre_submit_quote_recheck": True,
-            },
+            "live": {},
         }
         settings = build_mode_settings(config, "live")
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,21 +192,11 @@ class TradingTests(unittest.TestCase):
             notifications_path = Path(tmp) / "notifications.jsonl"
             plan = build_execution_plan([candidate], load_trading_state(state_path, "live", settings), settings, {candidate.market_id}, {"status": "ok"})
             trader = FakeTrader()
-            refreshed = make_candidate(market_id=candidate.market_id, hours_ahead=10)
-            refreshed.token_id = candidate.token_id
-            refreshed.condition_id = candidate.condition_id
-            refreshed.slug = candidate.slug
-            refreshed.event_slug = candidate.event_slug
-            refreshed.question = candidate.question
-            refreshed.resolution_source = candidate.resolution_source
-            refreshed.best_ask = 0.97
-            refreshed.depth_usd = candidate.depth_usd
-            refreshed.tick_size = candidate.tick_size
-            refreshed.min_order_size = candidate.min_order_size
-            with mock.patch.object(trading, "refresh_candidate_for_live_submit", return_value=(refreshed, None)):
-                _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
-            self.assertEqual(accepted, 0)
-            self.assertEqual(trader.calls, 0)
+            _, accepted = execute_live(state_path, journal_path, notifications_path, [candidate], plan, settings, {"status": "ok"}, trader)
+            self.assertEqual(accepted, 1)
+            self.assertEqual(len(trader.calls), 1)
+            self.assertEqual(trader.calls[0]["tick_size"], plan[0]["tick_size"])
+            self.assertEqual(trader.calls[0]["min_order_size"], plan[0]["min_order_size"])
 
     def test_append_new_fills_dedupes_trade_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

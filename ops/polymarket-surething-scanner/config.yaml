@@ -79,6 +79,26 @@ live:
   weather_fast_lane_resolve_within_hours: 12
   weather_fast_lane_max_price_drift_on_submit: 0.01
 
+stop_loss:
+  enabled: true
+  dry_run: true
+  order_type: FOK
+  mark_reference_notional_usd: 10.0
+  soft_mark_price: 0.82
+  hard_mark_price: 0.76
+  soft_relative_drop: 0.10
+  hard_relative_drop: 0.15
+  bid_exit_soft_max: 0.76
+  bid_exit_hard_max: 0.70
+  bid_hard_requires_ask_max: 0.82
+  bid_hard_requires_spread_max: 0.12
+  illiquid_bid_vwap_max: 0.10
+  illiquid_ask_vwap_min: 0.88
+  book_timeout_sec: 15
+  books_chunk_size: 60
+  confirm_scans_required: 2
+  max_review_rows: 20
+
 risk:
   # Global guardrails applied before any execution mode-specific overrides.
   confirm_scans_required: 2

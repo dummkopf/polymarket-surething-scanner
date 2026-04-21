@@ -48,6 +48,24 @@ class ScannerFilterTests(unittest.TestCase):
         }
         self.assertTrue(is_commodity_related_market(market))
 
+    def test_filters_wti_close_above_market(self) -> None:
+        market = {
+            "question": "WTI Crude Oil (WTI) closes above $84 on April 20?",
+            "description": "Resolves based on the front-month WTI crude oil settlement price.",
+            "slug": "wti-crude-oil-wti-closes-above-84-on-april-20",
+            "events": [{"title": "WTI crude oil"}],
+        }
+        self.assertTrue(is_commodity_related_market(market))
+
+    def test_filters_natural_gas_direction_market(self) -> None:
+        market = {
+            "question": "Natural Gas (NG) Up or Down on April 20?",
+            "description": "Resolves based on the NG price move on the day.",
+            "slug": "natural-gas-ng-up-or-down-on-april-20",
+            "events": [{"title": "Natural gas direction"}],
+        }
+        self.assertTrue(is_commodity_related_market(market))
+
     def test_does_not_filter_mass_participation_event_market(self) -> None:
         market = {
             "question": "Which app will be #1 on the US App Store on March 31?",
