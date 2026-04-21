@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import html
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-CST = timezone(timedelta(hours=8))
 
 
 def _load_json(path: Path | None) -> Any:
@@ -24,17 +22,9 @@ def _fmt_money(value: Any, digits: int = 2) -> str:
     except Exception:
         return "NA"
 
-
 def _fmt_number(value: Any, digits: int = 2) -> str:
     try:
         return f"{float(value):,.{digits}f}"
-    except Exception:
-        return "NA"
-
-
-def _fmt_percent(value: Any, digits: int = 1) -> str:
-    try:
-        return f"{float(value):.{digits}f}%"
     except Exception:
         return "NA"
 
@@ -44,172 +34,6 @@ def _fmt_pairs(payload: dict[str, Any], limit: int = 6) -> str:
         return "NA"
     items = sorted(payload.items(), key=lambda item: (-float(item[1]), item[0]))[:limit]
     return ", ".join(f"{html.escape(str(key))}: {value}" for key, value in items)
-
-
-def _fmt_thresholds(payload: dict[str, Any]) -> str:
-    if not isinstance(payload, dict) or not payload:
-        return "NA"
-    ordered_keys = [
-        "hours_ahead",
-        "quick_yes_price_min",
-        "quick_yes_price_max",
-        "price_min",
-        "price_max",
-        "min_depth_usd",
-        "depth_price_cap",
-        "stale_disagree_threshold",
-        "gamma_page_size",
-        "books_chunk_size",
-        "clob_pause_sec",
-    ]
-    pairs = []
-    for key in ordered_keys:
-        if key in payload:
-            pairs.append(f"{html.escape(key)}={html.escape(str(payload[key]))}")
-    return ", ".join(pairs) if pairs else "NA"
-
-
-def _parse_iso_dt(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def _select_dashboard_day(
-    trading_state: dict[str, Any],
-    daily_stats: dict[str, Any],
-    runtime_summary: dict[str, Any],
-) -> tuple[str | None, dict[str, Any]]:
-    by_day = daily_stats.get("by_day", {}) if isinstance(daily_stats, dict) else {}
-    totals = trading_state.get("totals", {}) if isinstance(trading_state, dict) else {}
-    day_candidates: list[str] = []
-
-    for raw_value in (
-        trading_state.get("last_run"),
-        runtime_summary.get("last_run"),
-        runtime_summary.get("generated_at"),
-    ):
-        dt = _parse_iso_dt(raw_value)
-        if dt is not None:
-            day_candidates.append(dt.astimezone(CST).strftime("%Y-%m-%d"))
-
-    for bucket in ("positions", "closed_positions", "recent_fills"):
-        rows = trading_state.get(bucket, []) if isinstance(trading_state, dict) else []
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for key in ("closed_at", "timestamp", "opened_at", "first_fill_at"):
-                dt = _parse_iso_dt(row.get(key))
-                if dt is not None:
-                    day_candidates.append(dt.astimezone(CST).strftime("%Y-%m-%d"))
-                    break
-
-    latest_day = max(day_candidates) if day_candidates else (sorted(by_day.keys())[-1] if by_day else None)
-    if latest_day is None:
-        return None, {}
-
-    merged_day = dict(by_day.get(latest_day, {})) if isinstance(by_day.get(latest_day, {}), dict) else {}
-    merged_day.setdefault("orders_placed", trading_state.get("daily_orders", {}).get(latest_day, 0))
-    merged_day.setdefault("planned_orders", 0)
-    merged_day.setdefault("blocked_reasons", {})
-    merged_day["open_cost_usd"] = totals.get("open_cost_usd", merged_day.get("open_cost_usd", 0.0))
-    merged_day["deployed_now_usd"] = totals.get("deployed_now_usd", merged_day.get("deployed_now_usd", 0.0))
-    merged_day["realized_pnl_today_usd"] = totals.get("realized_pnl_today_usd", merged_day.get("realized_pnl_today_usd", 0.0))
-    merged_day["historical_realized_pnl_usd"] = totals.get(
-        "realized_pnl_total_usd",
-        merged_day.get("historical_realized_pnl_usd", 0.0),
-    )
-    merged_day["net_pnl_today_usd"] = totals.get("net_pnl_today_usd", merged_day.get("net_pnl_today_usd", 0.0))
-    merged_day["historical_net_pnl_usd"] = totals.get(
-        "historical_net_pnl_usd",
-        merged_day.get("historical_net_pnl_usd", 0.0),
-    )
-    merged_day["available_for_redeploy_usd"] = totals.get(
-        "available_for_redeploy_usd",
-        merged_day.get("available_for_redeploy_usd", 0.0),
-    )
-    merged_day["settled_cash_released_usd"] = totals.get(
-        "settled_cash_released_usd",
-        merged_day.get("settled_cash_released_usd", 0.0),
-    )
-    return latest_day, merged_day
-
-
-def _build_closed_performance(closed_positions: list[dict[str, Any]]) -> dict[str, Any]:
-    closed = [item for item in closed_positions if isinstance(item, dict)]
-    realized_values = [float(item.get("realized_pnl", 0) or 0) for item in closed]
-    wins = sum(1 for value in realized_values if value > 0)
-    losses = sum(1 for value in realized_values if value < 0)
-    breakeven = len(realized_values) - wins - losses
-    total_realized = sum(realized_values)
-    avg_realized = total_realized / len(realized_values) if realized_values else 0.0
-    win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) else None
-
-    return {
-        "closed_count": len(realized_values),
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "win_rate_pct": win_rate,
-        "avg_realized_pnl_usd": avg_realized,
-        "best_close_usd": max(realized_values) if realized_values else None,
-        "worst_close_usd": min(realized_values) if realized_values else None,
-    }
-
-
-def _build_daily_trend(by_day: dict[str, Any], limit: int = 7) -> list[tuple[str, dict[str, Any]]]:
-    if not isinstance(by_day, dict):
-        return []
-    trend: list[tuple[str, dict[str, Any]]] = []
-    for day in sorted(by_day.keys())[-limit:]:
-        payload = by_day.get(day, {})
-        if isinstance(payload, dict):
-            trend.append((day, payload))
-    return trend
-
-
-def _build_recent_closed_rows(closed_positions: list[dict[str, Any]], limit: int = 5) -> str:
-    rows: list[str] = []
-    ordered = sorted(
-        [item for item in closed_positions if isinstance(item, dict)],
-        key=lambda item: str(item.get("closed_at", "")),
-        reverse=True,
-    )[:limit]
-    for item in ordered:
-        slug = item.get("event_slug") or item.get("slug") or ""
-        market_url = f"https://polymarket.com/event/{slug}" if slug else ""
-        rows.append(
-            "<tr>"
-            f"<td><a href='{html.escape(market_url)}' target='_blank'>open</a></td>"
-            f"<td>{html.escape(item.get('question', ''))}</td>"
-            f"<td>{html.escape(str(item.get('closed_at', 'NA')))}</td>"
-            f"<td>{_fmt_money(item.get('payout_usd', 'NA'))}</td>"
-            f"<td>{_fmt_money(item.get('realized_pnl', 'NA'), 4)}</td>"
-            f"<td>{html.escape(str(item.get('close_reason', 'NA')))}</td>"
-            "</tr>"
-        )
-    return "\n".join(rows) if rows else "<tr><td colspan='6'>No closed positions yet</td></tr>"
-
-
-def _build_daily_trend_rows(trend: list[tuple[str, dict[str, Any]]]) -> str:
-    rows: list[str] = []
-    for day, payload in reversed(trend):
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(day)}</td>"
-            f"<td>{_fmt_money(payload.get('net_pnl_today_usd', 'NA'))}</td>"
-            f"<td>{_fmt_money(payload.get('realized_pnl_today_usd', 'NA'))}</td>"
-            f"<td>{_fmt_money(payload.get('deployed_now_usd', 'NA'))}</td>"
-            f"<td>{html.escape(str(payload.get('orders_placed', 'NA')))}</td>"
-            f"<td>{html.escape(str(payload.get('scans', 'NA')))}</td>"
-            "</tr>"
-        )
-    return "\n".join(rows) if rows else "<tr><td colspan='6'>No daily history yet</td></tr>"
 
 
 def render_dashboard(
@@ -230,42 +54,47 @@ def render_dashboard(
     closed_positions = trading_state.get("closed_positions", []) if isinstance(trading_state, dict) else []
     totals = trading_state.get("totals", {}) if isinstance(trading_state, dict) else {}
     last_plan = trading_state.get("last_plan", []) if isinstance(trading_state, dict) else []
-    latest_day, day_data = _select_dashboard_day(trading_state, daily_stats, runtime_summary)
     by_day = daily_stats.get("by_day", {}) if isinstance(daily_stats, dict) else {}
+    sorted_days = sorted(by_day.keys()) if by_day else []
+    latest_day = sorted_days[-1] if sorted_days else None
+    day_data = by_day.get(latest_day, {}) if latest_day else {}
     mode = runtime_summary.get("mode") or trading_state.get("mode") or "paper"
-    thresholds = metrics.get("thresholds", {}) if isinstance(metrics, dict) else {}
-    closed_perf = _build_closed_performance(closed_positions)
-    daily_trend = _build_daily_trend(by_day, limit=7)
-    daily_trend_body = _build_daily_trend_rows(daily_trend)
-    recent_closed_body = _build_recent_closed_rows(closed_positions)
+
+    recent_7_days = sorted_days[-7:] if sorted_days else []
+    pnl_rows = []
+    cumulative_pnl = 0.0
+    for day_key in recent_7_days:
+        d = by_day.get(day_key, {})
+        daily_realized = float(d.get("realized_pnl_today_usd", 0) or 0)
+        cumulative_pnl = float(d.get("historical_realized_pnl_usd", 0) or 0)
+        orders = int(d.get("orders_placed", 0) or 0)
+        color = "#6ee7b7" if daily_realized >= 0 else "#fca5a5"
+        pnl_rows.append(
+            "<tr>"
+            f"<td>{html.escape(day_key)}</td>"
+            f"<td style='color:{color}'>{_fmt_money(daily_realized, 4)}</td>"
+            f"<td>{_fmt_money(cumulative_pnl, 4)}</td>"
+            f"<td>{orders}</td>"
+            "</tr>"
+        )
+    pnl_body = "\n".join(pnl_rows) if pnl_rows else "<tr><td colspan='4'>No daily PNL data yet</td></tr>"
 
     candidate_rows = []
     for candidate in candidates:
         event_slug = candidate.get("event_slug") or candidate.get("slug") or ""
         market_url = f"https://polymarket.com/event/{event_slug}" if event_slug else ""
-        try:
-            end_dt = datetime.fromisoformat(str(candidate.get("end_date", "")).replace("Z", "+00:00"))
-            hours_left = max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600.0)
-            hours_left_text = f"{hours_left:.1f}h"
-        except Exception:
-            hours_left_text = "NA"
+        restricted_badge = " <small>restricted</small>" if candidate.get("restricted") else ""
         candidate_rows.append(
             "<tr>"
             f"<td><a href='{html.escape(market_url)}' target='_blank'>open</a></td>"
-            f"<td>{html.escape(candidate.get('question', ''))}</td>"
-            f"<td>{html.escape(str(candidate.get('category_tag', 'NA')))}</td>"
+            f"<td>{html.escape(candidate.get('question', ''))}{restricted_badge}</td>"
             f"<td>{candidate.get('best_ask', 'NA')}</td>"
-            f"<td>{_fmt_number(candidate.get('volume', 'NA'))}</td>"
             f"<td>{candidate.get('depth_usd', 'NA')}</td>"
-            f"<td>{hours_left_text}</td>"
             f"<td>{html.escape(candidate.get('end_date', ''))}</td>"
-            f"<td>{_fmt_number(candidate.get('tick_size', 'NA'), 4)}</td>"
-            f"<td>{_fmt_number(candidate.get('min_order_size', 'NA'), 5)}</td>"
-            f"<td>{html.escape(str(candidate.get('neg_risk', 'NA')))}</td>"
             f"<td>{html.escape(candidate.get('resolution_source', 'NA'))}</td>"
             "</tr>"
         )
-    candidate_body = "\n".join(candidate_rows) if candidate_rows else "<tr><td colspan='12'>No candidates</td></tr>"
+    candidate_body = "\n".join(candidate_rows) if candidate_rows else "<tr><td colspan='6'>No candidates</td></tr>"
 
     exposure_rows = []
     for position in sorted(positions, key=lambda item: float(item.get("size_usd", 0) or 0), reverse=True)[:10]:
@@ -300,11 +129,37 @@ def render_dashboard(
     preflight = runtime_summary.get("preflight", {}) if isinstance(runtime_summary, dict) else {}
     reconciliation = runtime_summary.get("reconciliation", {}) if isinstance(runtime_summary, dict) else {}
     settlement = runtime_summary.get("settlement", {}) if isinstance(runtime_summary, dict) else {}
+    stop_loss = runtime_summary.get("stop_loss", {}) if isinstance(runtime_summary, dict) else {}
+    if (not isinstance(stop_loss, dict) or not stop_loss or not stop_loss.get("rows")):
+        fallback_stop_loss = trading_state.get("last_stop_loss", {}) if isinstance(trading_state, dict) else {}
+        if isinstance(fallback_stop_loss, dict) and fallback_stop_loss:
+            stop_loss = fallback_stop_loss
     pending_settlements = trading_state.get("pending_settlements", []) if isinstance(trading_state, dict) else []
     recent_fills = trading_state.get("recent_fills", []) if isinstance(trading_state, dict) else []
     now = datetime.now(timezone.utc).isoformat()
     reusable_freed_capital = float(totals.get("available_for_redeploy_usd", 0) or 0)
     blocked_today = totals.get("blocked_by_cap_this_run", 0)
+    stop_rows = stop_loss.get("rows", []) if isinstance(stop_loss, dict) else []
+    stop_review_rows = []
+    for item in stop_rows[:12]:
+        classification = str(item.get("classification", "NA"))
+        confirmed = bool(item.get("confirmed"))
+        color = "#f87171" if confirmed else ("#fbbf24" if classification == "watch" else "#93c5fd")
+        stop_review_rows.append(
+            "<tr>"
+            f"<td style='color:{color}'>{html.escape(classification)}</td>"
+            f"<td>{html.escape(str(confirmed))}</td>"
+            f"<td>{html.escape(str(item.get('consecutive_hits', 'NA')))}</td>"
+            f"<td>{html.escape(item.get('question', ''))}</td>"
+            f"<td>{_fmt_number(item.get('entry_price', 'NA'), 4)}</td>"
+            f"<td>{_fmt_number(item.get('ask_vwap_mark', 'NA'), 4)}</td>"
+            f"<td>{_fmt_number(item.get('bid_vwap_exit', 'NA'), 4)}</td>"
+            f"<td>{_fmt_number(item.get('best_bid', 'NA'), 4)} / {_fmt_number(item.get('best_ask', 'NA'), 4)}</td>"
+            f"<td>{_fmt_number(item.get('spread', 'NA'), 4)}</td>"
+            f"<td>{html.escape(', '.join(item.get('triggered_reasons', [])) or 'NA')}</td>"
+            "</tr>"
+        )
+    stop_review_body = "\n".join(stop_review_rows) if stop_review_rows else "<tr><td colspan='10'>No dry-run stop catches yet</td></tr>"
 
     content = f"""<!doctype html>
 <html><head><meta charset='utf-8'><title>Polymarket Scanner Dashboard</title>
@@ -319,7 +174,6 @@ small {{ color: #9fb0db; }}
 .kpi {{ background: #0d1530; border-radius: 8px; padding: 10px; }}
 .kpi .label {{ color: #9fb0db; font-size: 12px; }}
 .kpi .value {{ font-size: 20px; font-weight: 700; margin-top: 4px; }}
-.kpi .sub {{ color: #9fb0db; font-size: 11px; margin-top: 4px; }}
 .note {{ color: #b9c7ee; margin-top: 8px; font-size: 12px; }}
 .badge {{ display: inline-block; border-radius: 999px; padding: 2px 8px; background: #1d4ed8; color: white; font-size: 12px; }}
 </style></head><body>
@@ -334,10 +188,9 @@ small {{ color: #9fb0db; }}
 <div><strong>Planned orders this run:</strong> {runtime_summary.get('planned_orders', 'NA')}</div>
 <div><strong>Executed orders this run:</strong> {runtime_summary.get('executed_orders', 'NA')}</div>
 <div><strong>Book/price stale skips:</strong> {metrics.get('stale_skips', 'NA')}</div>
-<div><strong>Scanner rules:</strong> shared across paper / shadow / live</div>
-<div><strong>Scanner thresholds:</strong> {_fmt_thresholds(thresholds)}</div>
+<div><strong>Restricted seen:</strong> {metrics.get('restricted_seen', 'NA')}</div>
+<div><strong>Restricted skips:</strong> {metrics.get('restricted_skips', 'NA')}</div>
 <div><strong>Blocked reasons:</strong> {_fmt_pairs(runtime_summary.get('blocked_reasons', {}))}</div>
-<div><strong>Filter skips:</strong> crypto={metrics.get('crypto_skips', 'NA')}, stock={metrics.get('stock_skips', 'NA')}, sports={metrics.get('sports_skips', 'NA')}, commodity={metrics.get('commodity_skips', 'NA')}, narrative={metrics.get('high_randomness_narrative_skips', 'NA')}</div>
 </div>
 <div class='card'>
 <div><strong>Execution readiness:</strong></div>
@@ -354,37 +207,35 @@ small {{ color: #9fb0db; }}
 <div>Live halt reason: {html.escape(str(runtime_summary.get('live_halt_reason', 'NA')))}</div>
 </div>
 <div class='card'>
-<div><strong>Recent performance ({latest_day or 'NA'}):</strong></div>
-<div class='kpi-grid'>
-  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>{_fmt_money(day_data.get('net_pnl_today_usd', totals.get('net_pnl_today_usd', 'NA')))}</div><div class='sub'>realized + open mark-to-market</div></div>
-  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>{_fmt_money(day_data.get('realized_pnl_today_usd', totals.get('realized_pnl_today_usd', 'NA')))}</div><div class='sub'>closed and settled today</div></div>
-  <div class='kpi'><div class='label'>Open unrealized PnL</div><div class='value'>{_fmt_money(totals.get('unrealized_pnl_usd', 'NA'), 4)}</div><div class='sub'>current open-book mark</div></div>
-  <div class='kpi'><div class='label'>Equity now</div><div class='value'>{_fmt_money(totals.get('equity_usd', 'NA'), 4)}</div><div class='sub'>open cost + realized + unrealized</div></div>
-  <div class='kpi'><div class='label'>Orders placed today</div><div class='value'>{day_data.get('orders_placed', trading_state.get('daily_orders', {}).get(latest_day, 'NA') if latest_day else 'NA')}</div><div class='sub'>executed orders in day bucket</div></div>
-  <div class='kpi'><div class='label'>Scans today</div><div class='value'>{day_data.get('scans', 'NA')}</div><div class='sub'>candidate refresh cycles</div></div>
-  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>{_fmt_money(day_data.get('deployed_now_usd', totals.get('deployed_now_usd', 'NA')))}</div><div class='sub'>mark value of open positions</div></div>
-  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>{_fmt_money(day_data.get('open_cost_usd', totals.get('open_cost_usd', 'NA')))}</div><div class='sub'>capital paid into open positions</div></div>
-</div>
-<div class='note'>Daily figures are anchored to the latest trading day with available state data, not just the latest scanner snapshot.</div>
-</div>
-<div class='card'>
-<div><strong>Historical performance:</strong></div>
-<div class='kpi-grid'>
-  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>{_fmt_money(day_data.get('historical_net_pnl_usd', totals.get('historical_net_pnl_usd', 'NA')))}</div><div class='sub'>realized history + current unrealized</div></div>
-  <div class='kpi'><div class='label'>Historical realized gain</div><div class='value'>{_fmt_money(day_data.get('historical_realized_pnl_usd', totals.get('realized_pnl_total_usd', 'NA')))}</div><div class='sub'>closed-position accumulated PnL</div></div>
-  <div class='kpi'><div class='label'>Closed positions</div><div class='value'>{closed_perf.get('closed_count', 0)}</div><div class='sub'>historical settled positions</div></div>
-  <div class='kpi'><div class='label'>Win rate</div><div class='value'>{_fmt_percent(closed_perf.get('win_rate_pct', 'NA'))}</div><div class='sub'>wins / (wins + losses)</div></div>
-  <div class='kpi'><div class='label'>Average closed PnL</div><div class='value'>{_fmt_money(closed_perf.get('avg_realized_pnl_usd', 'NA'), 4)}</div><div class='sub'>per closed position</div></div>
-  <div class='kpi'><div class='label'>Best / worst close</div><div class='value'>{_fmt_money(closed_perf.get('best_close_usd', 'NA'), 4)} / {_fmt_money(closed_perf.get('worst_close_usd', 'NA'), 4)}</div><div class='sub'>largest realized outcomes</div></div>
-  <div class='kpi'><div class='label'>Cumulative buy notional</div><div class='value'>{_fmt_money(totals.get('cumulative_buy_usd', 'NA'))}</div><div class='sub'>historical capital deployed</div></div>
-  <div class='kpi'><div class='label'>Settled cash released</div><div class='value'>{_fmt_money(totals.get('settled_cash_released_usd', 0))}</div><div class='sub'>cash returned from settlements</div></div>
-</div>
-</div>
-<div class='card'>
-<div><strong>Daily performance trend (last {len(daily_trend)} days):</strong></div>
+<div><strong>Dry-run stop review:</strong></div>
+<div>Enabled: {html.escape(str(stop_loss.get('enabled', False)))}</div>
+<div>Dry run: {html.escape(str(stop_loss.get('dry_run', True)))}</div>
+<div>Reviewed open positions: {html.escape(str(stop_loss.get('reviewed_positions', 0)))}</div>
+<div>Confirmed catches: {html.escape(str(stop_loss.get('confirmed_count', 0)))}</div>
+<div>Watchlist hits: {html.escape(str(stop_loss.get('watch_count', 0)))}</div>
+<div>Illiquid-book filtered: {html.escape(str(stop_loss.get('illiquid_count', 0)))}</div>
 <table>
-<thead><tr><th>Day</th><th>Net PnL</th><th>Realized</th><th>Deployed</th><th>Orders</th><th>Scans</th></tr></thead>
-<tbody>{daily_trend_body}</tbody>
+<thead><tr><th>State</th><th>Confirmed</th><th>Hits</th><th>Question</th><th>Entry</th><th>Ask VWAP</th><th>Bid VWAP</th><th>Best Bid / Ask</th><th>Spread</th><th>Reasons</th></tr></thead>
+<tbody>{stop_review_body}</tbody>
+</table>
+</div>
+<div class='card'>
+<div><strong>Capital / PnL view ({latest_day or 'NA'}):</strong></div>
+<div class='kpi-grid'>
+  <div class='kpi'><div class='label'>Daily net PnL</div><div class='value'>{_fmt_money(day_data.get('net_pnl_today_usd', totals.get('net_pnl_today_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Daily realized gain</div><div class='value'>{_fmt_money(day_data.get('realized_pnl_today_usd', totals.get('realized_pnl_today_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Historical accumulated gain</div><div class='value'>{_fmt_money(day_data.get('historical_realized_pnl_usd', totals.get('realized_pnl_total_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Actual deployed now</div><div class='value'>{_fmt_money(day_data.get('deployed_now_usd', totals.get('deployed_now_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Open cost basis</div><div class='value'>{_fmt_money(day_data.get('open_cost_usd', totals.get('open_cost_usd', 'NA')))}</div></div>
+  <div class='kpi'><div class='label'>Historical net PnL</div><div class='value'>{_fmt_money(day_data.get('historical_net_pnl_usd', totals.get('historical_net_pnl_usd', 'NA')))}</div></div>
+</div>
+<div class='note'>Current execution mode is isolated under state/runtime/&lt;mode&gt;. Paper mode still mirrors the old legacy state files for compatibility.</div>
+</div>
+<div class='card'>
+<div><strong>Daily Realized PNL (past 7 days):</strong></div>
+<table>
+<thead><tr><th>Date</th><th>Daily Realized</th><th>Cumulative Realized</th><th>Orders</th></tr></thead>
+<tbody>{pnl_body}</tbody>
 </table>
 </div>
 <div class='card'>
@@ -402,7 +253,7 @@ small {{ color: #9fb0db; }}
 </div>
 </div>
 <div class='card'>
-<div><strong>Daily scanner activity ({latest_day or 'NA'}):</strong></div>
+<div><strong>Daily stats ({latest_day or 'NA'}):</strong></div>
 <div>Scans today: {day_data.get('scans', 'NA')}</div>
 <div>Latest available bets: {day_data.get('latest_candidates_count', 'NA')}</div>
 <div>Total available bets seen today (sum): {day_data.get('total_candidates_seen', 'NA')}</div>
@@ -410,13 +261,6 @@ small {{ color: #9fb0db; }}
 <div>Planned orders today: {day_data.get('planned_orders', 'NA')}</div>
 <div>Orders placed today: {day_data.get('orders_placed', 'NA')}</div>
 <div>Blocked reasons today: {_fmt_pairs(day_data.get('blocked_reasons', {}))}</div>
-</div>
-<div class='card'>
-<div><strong>Recent closed positions:</strong></div>
-<table>
-<thead><tr><th>Link</th><th>Question</th><th>Closed at</th><th>Payout</th><th>Realized PnL</th><th>Reason</th></tr></thead>
-<tbody>{recent_closed_body}</tbody>
-</table>
 </div>
 <div class='card'>
 <div><strong>Current mode status:</strong></div>
@@ -446,7 +290,7 @@ small {{ color: #9fb0db; }}
 </div>
 <div class='card'>
 <table>
-<thead><tr><th>Link</th><th>Question</th><th>Category</th><th>Best Ask</th><th>Volume</th><th>Depth USD</th><th>ETA</th><th>End Date</th><th>Tick</th><th>Min Size</th><th>Neg Risk</th><th>Resolution Source</th></tr></thead>
+<thead><tr><th>Link</th><th>Question</th><th>Best Ask</th><th>Depth USD</th><th>End Date</th><th>Resolution Source</th></tr></thead>
 <tbody>{candidate_body}</tbody>
 </table>
 </div>
